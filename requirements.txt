@@ -1,0 +1,10 @@
+python-docx==0.8.11
+openpyxl==3.1.2
+pypdf==3.16.0
+reportlab==4.0
+# pin deep-translator to the tested version
+deep-translator==1.11.4
+# testing
+pytest==7.4.0
+pdfplumber==0.7.5
+customtkinter>=5.2.0
