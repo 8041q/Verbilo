@@ -12,8 +12,12 @@ def find_project_root() -> Path:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Translate all supported files in origin/ to a target language or launch GUI")
+    parser = argparse.ArgumentParser(
+        description="Translate all supported files in origin/ to a target language or launch GUI",
+    )
     parser.add_argument("lang", nargs="?", help="Target language code (e.g., 'es')")
+    parser.add_argument("--source", "-s", default="auto",
+                        help="Source language code (e.g. 'en'). 'auto' = translate all text (default)")
     parser.add_argument("--gui", action="store_true", help="Launch the GUI instead of running batch CLI")
     args = parser.parse_args()
 
@@ -41,9 +45,14 @@ def main():
         print("Error: target language code is required for batch CLI. Example: python -m src.doc_translator.cli es")
         return
 
+    print(f"Source language: {args.source}  |  Target language: {args.lang}")
     for f in files:
         try:
-            translate_file(str(f), args.lang, str(output))
+            result = translate_file(str(f), args.lang, str(output), source_lang=args.source)
+            if result == "skipped-ocr":
+                print(f"Skipped {f.name} (scanned/image PDF requiring OCR)")
+            else:
+                print(f"Translated {f.name}")
         except Exception as e:
             print(f"Error translating {f.name}: {e}")
 

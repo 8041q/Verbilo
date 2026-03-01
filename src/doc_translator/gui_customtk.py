@@ -1,8 +1,8 @@
 # A small CustomTkinter-based GUI front-end that wraps the existing translate_file API.
 
-# This UI provides file/folder selection, a language dropdown, translator selector, output folder,
-# start/stop controls, a per-file status list, and a simple log area. Translations run in a
-# background thread using `gui_helpers.Worker` and report coarse per-file progress back to the UI.
+# This UI provides file/folder selection, searchable language dropdowns (source + target),
+# translator selector, output folder, start/stop controls, a per-file status list, and a
+# simple log area.  Translations run in a background thread using `gui_helpers.Worker`.
 
 from __future__ import annotations
 
@@ -21,27 +21,62 @@ except Exception:
 from .gui_helpers import Worker, list_supported_files, center_window
 from .gui_config import load_config, save_config
 
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Language list helpers
+# ---------------------------------------------------------------------------
+
+# Cache so we only probe the network once per session
+_cached_language_options: list[tuple[str, str]] | None = None
+
 
 def _get_language_options() -> list[tuple[str, str]]:
-    # Try to probe deep-translator for supported languages, else fallback to a small list
-    logger = logging.getLogger(__name__)
-    # common fallback to use when the probed list is too large or unavailable
-    common_fallback = {
-        "en": "English",
-        "es": "Spanish",
-        "fr": "French",
-        "de": "German",
-        "pt": "Portuguese",
-        "zh": "Chinese",
-        "ja": "Japanese",
-        "ru": "Russian",
-        "it": "Italian",
-        "nl": "Dutch",
+    """Return a list of ``(code, name)`` tuples for every supported language.
+
+    Probes *deep-translator* for the full Google Translate list.  The result
+    is cached for the lifetime of the process.
+    """
+    global _cached_language_options
+    if _cached_language_options is not None:
+        return _cached_language_options
+
+    # Comprehensive fallback (used when deep-translator is unavailable)
+    fallback: dict[str, str] = {
+        "af": "Afrikaans", "sq": "Albanian", "am": "Amharic", "ar": "Arabic",
+        "hy": "Armenian", "az": "Azerbaijani", "eu": "Basque", "be": "Belarusian",
+        "bn": "Bengali", "bs": "Bosnian", "bg": "Bulgarian", "ca": "Catalan",
+        "ceb": "Cebuano", "zh-CN": "Chinese (Simplified)", "zh-TW": "Chinese (Traditional)",
+        "co": "Corsican", "hr": "Croatian", "cs": "Czech", "da": "Danish",
+        "nl": "Dutch", "en": "English", "eo": "Esperanto", "et": "Estonian",
+        "fi": "Finnish", "fr": "French", "fy": "Frisian", "gl": "Galician",
+        "ka": "Georgian", "de": "German", "el": "Greek", "gu": "Gujarati",
+        "ht": "Haitian Creole", "ha": "Hausa", "haw": "Hawaiian", "he": "Hebrew",
+        "hi": "Hindi", "hmn": "Hmong", "hu": "Hungarian", "is": "Icelandic",
+        "ig": "Igbo", "id": "Indonesian", "ga": "Irish", "it": "Italian",
+        "ja": "Japanese", "jw": "Javanese", "kn": "Kannada", "kk": "Kazakh",
+        "km": "Khmer", "rw": "Kinyarwanda", "ko": "Korean", "ku": "Kurdish",
+        "ky": "Kyrgyz", "lo": "Lao", "la": "Latin", "lv": "Latvian",
+        "lt": "Lithuanian", "lb": "Luxembourgish", "mk": "Macedonian",
+        "mg": "Malagasy", "ms": "Malay", "ml": "Malayalam", "mt": "Maltese",
+        "mi": "Maori", "mr": "Marathi", "mn": "Mongolian", "my": "Myanmar (Burmese)",
+        "ne": "Nepali", "no": "Norwegian", "ny": "Nyanja (Chichewa)",
+        "or": "Odia (Oriya)", "ps": "Pashto", "fa": "Persian", "pl": "Polish",
+        "pt": "Portuguese", "pa": "Punjabi", "ro": "Romanian", "ru": "Russian",
+        "sm": "Samoan", "gd": "Scots Gaelic", "sr": "Serbian", "st": "Sesotho",
+        "sn": "Shona", "sd": "Sindhi", "si": "Sinhala (Sinhalese)", "sk": "Slovak",
+        "sl": "Slovenian", "so": "Somali", "es": "Spanish", "su": "Sundanese",
+        "sw": "Swahili", "sv": "Swedish", "tl": "Tagalog (Filipino)", "tg": "Tajik",
+        "ta": "Tamil", "tt": "Tatar", "te": "Telugu", "th": "Thai", "tr": "Turkish",
+        "tk": "Turkmen", "uk": "Ukrainian", "ur": "Urdu", "ug": "Uyghur",
+        "uz": "Uzbek", "vi": "Vietnamese", "cy": "Welsh", "xh": "Xhosa",
+        "yi": "Yiddish", "yo": "Yoruba", "zu": "Zulu",
     }
+
     try:
         from deep_translator import GoogleTranslator
+
         langs = None
-        # Try class method first, then instance method, then SUPPORTED_LANGUAGES
         getlangs = getattr(GoogleTranslator, "get_supported_languages", None)
         if callable(getlangs):
             try:
@@ -55,43 +90,47 @@ def _get_language_options() -> list[tuple[str, str]]:
             langs = getattr(GoogleTranslator, "SUPPORTED_LANGUAGES")
 
         if isinstance(langs, dict):
-            # assume mapping code->name
-            try:
-                return [(str(code), str(name)) for code, name in langs.items()]
-            except Exception:
-                logger.exception("Unexpected dict shape from deep_translator supported languages")
-        if isinstance(langs, (list, tuple)):
-            # list may be codes or names; treat entries as codes
-            # If deep-translator returns a very large list, fallback to a small common subset
-            try:
-                if len(langs) > 40:
-                    logger.warning("Deep-translator returned a large language list; using common subset")
-                    return list(common_fallback.items())
-            except Exception:
-                pass
-            return [(str(c), str(c)) for c in langs]
+            # deep-translator may return {name: code} or {code: name}.
+            # Heuristic: if first key is <=5 chars and lowercase it's probably a code.
+            first_key = next(iter(langs), "")
+            if len(first_key) <= 5 and first_key.isascii() and first_key.islower():
+                # {code: name}
+                result = [(str(k), str(v).title()) for k, v in langs.items()]
+            else:
+                # {name: code}
+                result = [(str(v), str(k).title()) for k, v in langs.items()]
+            result.sort(key=lambda x: x[1].lower())
+            _cached_language_options = result
+            return result
+
+        if isinstance(langs, (list, tuple)) and langs:
+            # deep-translator often returns a list of lowercase language names
+            result = []
+            # Build reverse map: lowercase-name -> code from our fallback
+            name_to_code = {v.lower(): k for k, v in fallback.items()}
+            for entry in langs:
+                entry = str(entry).strip()
+                if not entry:
+                    continue
+                low = entry.lower()
+                if low in name_to_code:
+                    result.append((name_to_code[low], entry.title()))
+                elif entry in fallback:
+                    # entry is already a code
+                    result.append((entry, fallback[entry]))
+                else:
+                    # Unknown — use the entry as both code and name
+                    result.append((low, entry.title()))
+            result.sort(key=lambda x: x[1].lower())
+            _cached_language_options = result
+            return result
+
     except Exception:
         logger.exception("Failed to probe deep_translator for supported languages")
 
-    # Fallback mapping of common languages
-    fallback = {
-        "en": "English",
-        "es": "Spanish",
-        "fr": "French",
-        "de": "German",
-        "pt": "Portuguese",
-        "zh": "Chinese",
-        "ja": "Japanese",
-        "ru": "Russian",
-        "it": "Italian",
-        "nl": "Dutch",
-        "sv": "Swedish",
-        "no": "Norwegian",
-        "da": "Danish",
-        "fi": "Finnish",
-        "pl": "Polish",
-    }
-    return list(fallback.items())
+    result = sorted(fallback.items(), key=lambda x: x[1].lower())
+    _cached_language_options = result
+    return result
 
 
 def _ensure_ctk():
@@ -101,6 +140,48 @@ def _ensure_ctk():
             "customtkinter is required for GUI. Install it via:\n\n    pip install customtkinter",
         )
         raise RuntimeError("customtkinter not installed")
+
+
+# ---------------------------------------------------------------------------
+# Searchable language combo box helper
+# ---------------------------------------------------------------------------
+
+def _make_language_combobox(
+    parent,
+    values: list[str],
+    variable: tk.StringVar,
+    width: int = 26,
+) -> ttk.Combobox:
+    """Return a ``ttk.Combobox`` with a visible dropdown arrow that also
+    filters *values* as the user types.
+
+    - Click the arrow (or Alt+Down) to open the full list.
+    - Type to narrow the list in real-time.
+    - Select an item to confirm; the full list is restored afterwards.
+    """
+    combo = ttk.Combobox(parent, textvariable=variable, values=values, width=width)
+    combo.set(variable.get())
+
+    def _filter(event=None):
+        # Ignore pure navigation keys so they don't interfere with selection
+        if event and event.keysym in (
+            "Return", "Tab", "Escape", "Up", "Down", "Left", "Right"
+        ):
+            return
+        typed = combo.get().lower()
+        filtered = [v for v in values if typed in v.lower()] if typed else values
+        combo["values"] = filtered if filtered else values
+
+    def _on_select(event=None):
+        # Restore the full list so the arrow always shows everything next time
+        combo["values"] = values
+        combo.selection_clear()
+
+    combo.bind("<KeyRelease>", _filter)
+    combo.bind("<<ComboboxSelected>>", _on_select)
+    combo.bind("<Escape>", lambda e: combo.__setitem__("values", values))
+
+    return combo
 
 
 class App:
@@ -167,12 +248,11 @@ class App:
 
         self.root.title("Doc Translator GUI")
         # desired starting size
-        desired_w, desired_h = 900, 600
+        desired_w, desired_h = 900, 650
         try:
-            self.root.minsize(800, 560)
+            self.root.minsize(800, 600)
         except Exception:
             pass
-        # center on screen and prevent manual resize
         self._desired_width = desired_w
         self._desired_height = desired_h
         center_window(self.root, desired_w, desired_h)
@@ -188,8 +268,7 @@ class App:
         Button(top, text="Add Files", command=self._add_files).grid(row=0, column=1, padx=4)
         Button(top, text="Select Folder", command=self._select_folder).grid(row=0, column=2, padx=4)
         Button(top, text="Clear", command=self._clear_files).grid(row=0, column=3, padx=4)
-        # settings cog (kept here)
-        Button(top, text="⚙", command=self._open_settings).grid(row=0, column=4, padx=4)
+        Button(top, text="\u2699", command=self._open_settings).grid(row=0, column=4, padx=4)
 
         mid = Frame(self.root)
         mid.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
@@ -204,24 +283,29 @@ class App:
         self.right = Frame(mid)
         self.right.pack(side=tk.RIGHT, fill=tk.Y)
 
-        Label(self.right, text="Target language:").pack(anchor="w", padx=4, pady=(8, 0))
-        # language dropdown (show "Name (code)")
-        self.lang_frame = Frame(self.right)
-        self.lang_frame.pack(fill=tk.X, padx=4)
-        self.lang_var = tk.StringVar()
+        # --- Language options (shared by source & target) ---
         lang_opts = _get_language_options()
         self._lang_map = {f"{name} ({code})": code for code, name in lang_opts}
-        values = list(self._lang_map.keys())
-        if not values:
-            values = ["English (en)"]
-        self.lang_var.set(values[0])
-        if ctk:
-            self.lang_menu = ctk.CTkOptionMenu(self.lang_frame, values=values, variable=self.lang_var)
-            self.lang_menu.pack(fill=tk.X, padx=4)
-        else:
-            self.lang_menu = tk.OptionMenu(self.lang_frame, self.lang_var, *values)
-            self.lang_menu.pack(fill=tk.X, padx=4)
+        display_values = list(self._lang_map.keys())
+        if not display_values:
+            display_values = ["English (en)"]
 
+        # --- Source language (with "Auto" option) ---
+        Label(self.right, text="Source language:").pack(anchor="w", padx=4, pady=(8, 0))
+        self.source_lang_var = tk.StringVar(value="Auto-detect (translate all)")
+        source_values = ["Auto-detect (translate all)"] + display_values
+        self._source_lang_map = {"Auto-detect (translate all)": "auto"}
+        self._source_lang_map.update(self._lang_map)
+        self.source_lang_box = _make_language_combobox(self.right, source_values, self.source_lang_var)
+        self.source_lang_box.pack(fill=tk.X, padx=4)
+
+        # --- Target language ---
+        Label(self.right, text="Target language:").pack(anchor="w", padx=4, pady=(8, 0))
+        self.lang_var = tk.StringVar(value=display_values[0] if display_values else "English (en)")
+        self.target_lang_box = _make_language_combobox(self.right, display_values, self.lang_var)
+        self.target_lang_box.pack(fill=tk.X, padx=4)
+
+        # --- Translator selector ---
         Label(self.right, text="Translator:").pack(anchor="w", padx=4, pady=(8, 0))
         self.translator_var = tk.StringVar(value="auto")
         if ctk:
@@ -230,14 +314,6 @@ class App:
         else:
             self.translator_menu = tk.OptionMenu(self.right, self.translator_var, "auto", "identity", "deep")
             self.translator_menu.pack(fill=tk.X, padx=4)
-        # repopulate languages when translator changes
-        try:
-            self.translator_var.trace_add("write", lambda *_: self._on_translator_change())
-        except Exception:
-            try:
-                self.translator_var.trace("w", lambda *_: self._on_translator_change())
-            except Exception:
-                pass
 
         Label(self.right, text="Output folder:").pack(anchor="w", padx=4, pady=(8, 0))
         self.output_entry = Entry(self.right)
@@ -250,7 +326,6 @@ class App:
         else:
             self.progress = ttk.Progressbar(self.right, orient="horizontal", mode="determinate")
         self.progress.pack(fill=tk.X, padx=4, pady=(4, 8))
-        # ensure progress shows as empty at startup
         try:
             if hasattr(self.progress, "set"):
                 if ctk and isinstance(self.progress, ctk.CTkProgressBar):
@@ -263,8 +338,6 @@ class App:
                 self.progress['maximum'] = 1
         except Exception:
             pass
-
-        # 'Set Default Input' removed from main page; use settings dialog instead
 
         self.start_btn = Button(self.right, text="Start", command=self._start)
         self.start_btn.pack(fill=tk.X, padx=4, pady=(4, 2))
@@ -372,6 +445,7 @@ class App:
             self.output_entry.insert(0, d)
 
     def _start(self):
+        # --- resolve target language ---
         sel = self.lang_var.get()
         lang = self._lang_map.get(sel)
         if not lang:
@@ -381,6 +455,10 @@ class App:
             messagebox.showwarning("No files", "Please add files or select a folder first.")
             return
 
+        # --- resolve source language ---
+        source_sel = self.source_lang_var.get()
+        source_lang = self._source_lang_map.get(source_sel, "auto")
+
         # determine output folder: UI -> config default -> cwd/output
         output_ui = self.output_entry.get().strip()
         if output_ui:
@@ -389,10 +467,10 @@ class App:
             output = self.cfg.get("default_output")
         else:
             output = str(Path.cwd() / "output")
-        # Ensure output is not None
         if output is None:
             output = str(Path.cwd() / "output")
         Path(str(output)).mkdir(parents=True, exist_ok=True)
+
         # Normalize translator selection: map "auto" (or empty) -> None so factory auto-detects
         sel_trans = (self.translator_var.get() or "").strip()
         norm = sel_trans.lower()
@@ -401,9 +479,8 @@ class App:
         else:
             translator = sel_trans
 
-        # Log selection for easier debugging (safe to ignore failures)
         try:
-            self._log(f"Starting translation: lang={lang!r}, translator={translator!r}, output={output!r}")
+            self._log(f"Starting: source={source_lang!r}, target={lang!r}, translator={translator!r}")
         except Exception:
             pass
 
@@ -414,58 +491,22 @@ class App:
         self._update_listbox_all_status("pending")
         self.total_files = len(self.files)
         self.completed_files = 0
-        # initialize progress
         try:
             if ctk and isinstance(self.progress, ctk.CTkProgressBar):
-                # customtkinter progress
                 self.progress.set(0.0)
             else:
                 self.progress['value'] = 0
                 self.progress['maximum'] = self.total_files
         except Exception:
             pass
-        self.worker.start(self.files, lang, output, translator, self._progress_cb, self._log)
+        self.worker.start(self.files, lang, output, translator, self._progress_cb, self._log,
+                          source_lang=source_lang)
 
     def _stop(self):
         # request cancellation; do not re-enable Start until worker finishes
         self.worker.stop()
         self.stop_btn.configure(state=tk.DISABLED)
         self._log("Cancellation requested")
-
-    
-
-    def _on_translator_change(self):
-        # rebuild language options depending on translator selection
-        t = self.translator_var.get() or "auto"
-        # if deep requested, attempt to probe deep-translator; otherwise use fallback
-        opts = _get_language_options()
-        # rebuild map with friendly labels
-        new_map = {f"{name} ({code})": code for code, name in opts}
-        self._lang_map = new_map
-        vals = list(new_map.keys())
-        if not vals:
-            vals = ["English (en)"]
-        # update option menu
-        try:
-            if ctk:
-                # Destroy the old OptionMenu and create a new one with updated values
-                try:
-                    self.lang_menu.pack_forget()
-                    self.lang_menu.destroy()
-                except Exception:
-                    # ignore errors tearing down old widget
-                    pass
-                # Recreate using stable parent reference
-                self.lang_menu = ctk.CTkOptionMenu(self.lang_frame, values=vals, variable=self.lang_var)
-                self.lang_menu.pack(fill=tk.X, padx=4)
-            else:
-                menu = self.lang_menu["menu"]
-                menu.delete(0, "end")
-                for v in vals:
-                    menu.add_command(label=v, command=lambda value=v: self.lang_var.set(value))
-            self.lang_var.set(vals[0])
-        except Exception as e:
-            logging.exception("Failed to update language menu: %s", e)
 
     def _progress_cb(self, filepath: str, status: str):
         name = os.path.basename(filepath)

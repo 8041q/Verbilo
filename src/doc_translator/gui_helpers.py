@@ -46,26 +46,35 @@ def center_window(window: tk.Tk | tk.Toplevel, width: int, height: int, parent: 
 
 
 class Worker:
-    # Background worker that translates a list of files sequentially.
+    """Background worker that translates a list of files sequentially.
 
-    # Call `start()` to run in a background thread. Provide `progress_cb(file, status)`
-    # and `log_cb(message)` callbacks. Call `stop()` to request cancellation.
+    Call ``start()`` to run in a background thread.  Provide
+    ``progress_cb(file, status)`` and ``log_cb(message)`` callbacks.
+    Call ``stop()`` to request cancellation.
+    """
 
     def __init__(self):
         self._thread = None
         self._stop = threading.Event()
 
-    def start(self, files: Iterable[str], target_lang: str, output_dir: str | None, translator_name: str | None,
-              progress_cb: Callable[[str, str], None], log_cb: Callable[[str], None]):
+    def start(
+        self,
+        files: Iterable[str],
+        target_lang: str,
+        output_dir: str | None,
+        translator_name: str | None,
+        progress_cb: Callable[[str, str], None],
+        log_cb: Callable[[str], None],
+        source_lang: str = "auto",
+    ):
         if self._thread and self._thread.is_alive():
             raise RuntimeError("Worker already running")
-        # Validate target_lang early
         if not target_lang or not isinstance(target_lang, str) or not target_lang.strip():
             raise ValueError("target_lang must be a non-empty language code (e.g. 'en')")
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._run,
-            args=(list(files), target_lang, output_dir, translator_name, progress_cb, log_cb),
+            args=(list(files), target_lang, output_dir, translator_name, progress_cb, log_cb, source_lang),
             daemon=True,
         )
         self._thread.start()
@@ -73,30 +82,32 @@ class Worker:
     def stop(self):
         self._stop.set()
 
-    def _run(self, files, target_lang, output_dir, translator_name, progress_cb, log_cb):
+    def _run(self, files, target_lang, output_dir, translator_name, progress_cb, log_cb, source_lang):
         for f in files:
             if self._stop.is_set():
                 log_cb("Cancelled by user")
                 break
             try:
                 progress_cb(f, "started")
-                # Log only the filename to keep the UI concise
                 from pathlib import Path
                 name = Path(f).name
                 log_cb(f"Translating {name} ...")
-                out = translate_file(f, target_lang, output_dir, translator_name)
-                progress_cb(f, "finished")
-                try:
-                    if out:
-                        log_cb(f"Finished {name} -> {out}")
-                    else:
+                out = translate_file(f, target_lang, output_dir, translator_name, source_lang=source_lang)
+                if out == "skipped-ocr":
+                    progress_cb(f, "finished")
+                    log_cb(f"Skipped {name} (scanned/image PDF requiring OCR)")
+                else:
+                    progress_cb(f, "finished")
+                    try:
+                        if out:
+                            log_cb(f"Finished {name} -> {out}")
+                        else:
+                            log_cb(f"Finished {name}")
+                    except Exception:
                         log_cb(f"Finished {name}")
-                except Exception:
-                    log_cb(f"Finished {name}")
             except Exception as e:
                 progress_cb(f, "error")
                 from pathlib import Path
                 name = Path(f).name
-                # include full traceback in log for debugging
                 tb = traceback.format_exc()
                 log_cb(f"Error translating {name}: {e}\n{tb}")
