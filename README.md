@@ -1,4 +1,4 @@
-# Doc Translator
+# Verbilo
 
 Translate Word documents, Excel spreadsheets, and PDFs into any of 130+ languages while preserving the original formatting — tables, fonts, images, colours, and layout all stay intact.
 
@@ -56,7 +56,7 @@ pip install customtkinter   # for the GUI
 ### 2. Launch the GUI
 
 ```bash
-python -m src.doc_translator.cli --gui
+python -m src.cli --gui
 ```
 
 In the GUI:
@@ -71,13 +71,13 @@ In the GUI:
 Translate all supported files in `origin/` to Spanish:
 
 ```bash
-python -m src.doc_translator.cli es
+python -m src.cli es
 ```
 
 Translate only English text to Portuguese (leaves other languages untouched):
 
 ```bash
-python -m src.doc_translator.cli pt --source en
+python -m src.cli pt --source en
 ```
 
 ---
@@ -85,7 +85,7 @@ python -m src.doc_translator.cli pt --source en
 ## CLI Reference
 
 ```
-python -m src.doc_translator.cli [LANG] [--source CODE] [--gui]
+python -m src.cli [LANG] [--source CODE] [--gui]
 ```
 
 | Argument | Description |
@@ -102,16 +102,15 @@ python -m src.doc_translator.cli [LANG] [--source CODE] [--gui]
 origin/          ← place input files here
 output/          ← translated files are written here
 src/
-  doc_translator/
-    cli.py           — command-line entry point
-    main.py          — translate_file() core API
-    gui_customtk.py  — CustomTkinter GUI
-    converters/
-      docx_converter.py
-      xlsx_converter.py
-      pdf_converter.py
-    translators/
-      dummy.py       — Google Translate wrapper with batching + source filtering
+  cli.py           — command-line entry point
+  main.py          — translate_file() core API
+  gui_customtk.py  — CustomTkinter GUI
+  converters/
+    docx_converter.py
+    xlsx_converter.py
+    pdf_converter.py
+  translators/
+    dummy.py       — Google Translate wrapper with batching + source filtering
 ```
 
 ---
@@ -142,6 +141,15 @@ The full list of 130+ supported codes is shown in the GUI dropdown.
 - The **source language filter** uses local language detection (`langdetect`) — no extra API calls.
 
 ---
+
+---
+
+## Future Implementations
+
+- **Settings:** Add an option in the settings to check for updates and include a GitHub / About info page for easy access to source, release notes and credits.
+- **Language dropdown:** Move the search field into the dropdown box itself (so users can search within the opened list) and set the default target language to English.
+- **Icons:** Refresh and add icons (app, toolbar, file-type) across the UI for a more cohesive visual identity.
+- **Names & titles:** Update UI names and titles throughout the app for clearer, consistent labeling (configurable where appropriate).
 
 ## License
 

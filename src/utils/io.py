@@ -3,12 +3,7 @@ import os
 
 
 def resolve_output_path(input_path: Path | str, out_arg: str | None = None) -> str:
-    # Resolve output path according to rules:
-
-    # 1. If `out_arg` is None: return input.stem + ".translated" + suffix next to input.
-    # 2. If `out_arg` is an existing directory (or ends with a path separator): write file with original filename inside that directory.
-    # 3. Otherwise `out_arg` is treated as a file path and returned as-is (parent directories will be created by the caller if needed).
-    
+    # None → .translated next to input; dir → original name inside it; else use as-is
     p = Path(input_path)
     if out_arg is None:
         return str(p.with_name(p.stem + ".translated" + p.suffix))

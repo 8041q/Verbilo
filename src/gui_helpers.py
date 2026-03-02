@@ -1,10 +1,12 @@
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Iterable
 import tkinter as tk
 import traceback
 
 from .main import translate_file
+from .utils import CancelledError
 
 SUPPORTED_EXTS = (".docx", ".pdf", ".xlsx", ".xls")
 
@@ -22,40 +24,34 @@ def list_supported_files(path: str) -> list[str]:
     return files
 
 
-def center_window(window: tk.Tk | tk.Toplevel, width: int, height: int, parent: tk.Widget | None = None) -> None:
-    # Center a window on screen or over a parent widget.
-
-    # If `parent` is provided, center `window` over the parent widget.
-    # Otherwise center on the primary screen.
-    
+def center_window(window, width, height=None, parent=None):
     window.update_idletasks()
+    if height is None:
+        height = window.winfo_reqheight()
     if parent is not None:
         parent.update_idletasks()
-        px = parent.winfo_rootx()
-        py = parent.winfo_rooty()
-        pw = parent.winfo_width()
-        ph = parent.winfo_height()
-        x = px + (pw - width) // 2
-        y = py + (ph - height) // 2
+        x = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - height) // 2
     else:
-        sw = window.winfo_screenwidth()
-        sh = window.winfo_screenheight()
-        x = (sw - width) // 2
-        y = (sh - height) // 2
+        x = (window.winfo_screenwidth() - width) // 2
+        y = (window.winfo_screenheight() - height) // 2
     window.geometry(f"{width}x{height}+{x}+{y}")
 
 
+# runs translation in a background thread; call start() to begin, stop() to cancel
 class Worker:
-    """Background worker that translates a list of files sequentially.
-
-    Call ``start()`` to run in a background thread.  Provide
-    ``progress_cb(file, status)`` and ``log_cb(message)`` callbacks.
-    Call ``stop()`` to request cancellation.
-    """
 
     def __init__(self):
-        self._thread = None
+        self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._stop.is_set()
+
+    @property
+    def alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
 
     def start(
         self,
@@ -63,7 +59,7 @@ class Worker:
         target_lang: str,
         output_dir: str | None,
         translator_name: str | None,
-        progress_cb: Callable[[str, str], None],
+        progress_cb: Callable[[str, str, float | None], None],
         log_cb: Callable[[str], None],
         source_lang: str = "auto",
     ):
@@ -87,17 +83,29 @@ class Worker:
             if self._stop.is_set():
                 log_cb("Cancelled by user")
                 break
+            name = Path(f).name
+            t0 = time.perf_counter()
             try:
-                progress_cb(f, "started")
-                from pathlib import Path
-                name = Path(f).name
+                progress_cb(f, "started", None)
                 log_cb(f"Translating {name} ...")
-                out = translate_file(f, target_lang, output_dir, translator_name, source_lang=source_lang)
+                out = translate_file(
+                    f, target_lang, output_dir, translator_name,
+                    source_lang=source_lang,
+                    cancel_event=self._stop,
+                )
+                elapsed = time.perf_counter() - t0
+
+                # Check cancellation right after translate_file returns
+                if self._stop.is_set():
+                    progress_cb(f, "cancelled", None)
+                    log_cb(f"Cancelled during {name}")
+                    break
+
                 if out == "skipped-ocr":
-                    progress_cb(f, "finished")
+                    progress_cb(f, "finished", elapsed)
                     log_cb(f"Skipped {name} (scanned/image PDF requiring OCR)")
                 else:
-                    progress_cb(f, "finished")
+                    progress_cb(f, "finished", elapsed)
                     try:
                         if out:
                             log_cb(f"Finished {name} -> {out}")
@@ -105,9 +113,15 @@ class Worker:
                             log_cb(f"Finished {name}")
                     except Exception:
                         log_cb(f"Finished {name}")
+            except CancelledError:
+                progress_cb(f, "cancelled", None)
+                log_cb(f"Cancelled during {name}")
+                break
             except Exception as e:
-                progress_cb(f, "error")
-                from pathlib import Path
-                name = Path(f).name
+                elapsed = time.perf_counter() - t0
+                progress_cb(f, "error", elapsed)
                 tb = traceback.format_exc()
                 log_cb(f"Error translating {name}: {e}\n{tb}")
+
+        # Signal that the worker loop has exited
+        log_cb("__worker_done__")

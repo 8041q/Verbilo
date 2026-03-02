@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "doc-translator"
+name = "verbilo"
 version = "0.1.0"
 description = "Translate .docx, .pdf, .xlsx files while preserving formatting (best-effort)."
 authors = ["crt_"]

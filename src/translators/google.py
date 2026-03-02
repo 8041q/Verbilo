@@ -1,11 +1,12 @@
-"""Google Translate backend via *deep_translator* with batching, caching,
-post-processing, and robust fallback logic."""
+# Google Translate backend via deep_translator — batching, caching, fallback
 
 from __future__ import annotations
 
 import re
+import threading
 from typing import Optional, Dict, Any
 from .base import Translator
+from ..utils import CancelledError
 import logging
 
 logger = logging.getLogger(__name__)
@@ -23,14 +24,7 @@ _SKIP_MIN_CHARS = 20
 # ---------------------------------------------------------------------------
 
 def post_process(text: str) -> str:
-    """Apply lightweight regex-based grammar/spacing fixes to translated text.
-
-    Fixes addressed:
-    * Missing space after punctuation  (e.g. ``"word,word"`` → ``"word, word"``)
-    * Double (or more) spaces collapsed to one
-    * Missing space after sentence-ending punctuation (. ! ?)
-    * Stray spaces before punctuation   (e.g. ``"word ,"`` → ``"word,"``)
-    """
+    # fix spacing around punctuation and collapse multiple spaces
     if not text:
         return text
 
@@ -50,30 +44,47 @@ def post_process(text: str) -> str:
     return text.strip()
 
 
+def _run_cancellable(fn, cancel_event: Optional[threading.Event], poll_interval: float = 0.05):
+    # run fn() in a daemon thread; raises CancelledError if cancel_event fires mid-run
+    result = [None]
+    exc: list = [None]
+
+    def _target():
+        try:
+            result[0] = fn()
+        except Exception as e:
+            exc[0] = e
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    while t.is_alive():
+        t.join(timeout=poll_interval)
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError("Translation cancelled")
+    if exc[0] is not None:
+        raise exc[0]
+    return result[0]
+
+
+# returns text unchanged — for testing
 class IdentityTranslator:
-    """Returns text unchanged — useful for testing."""
 
     def translate_text(self, text: str, target_lang: str) -> str:
         return text
 
-    def translate_batch(self, texts: list[str], target_lang: str) -> list[str]:
+    def translate_batch(
+        self,
+        texts: list[str],
+        target_lang: str,
+        *,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> list[str]:
         return list(texts)
 
 
+# wraps GoogleTranslator with batching, dedup cache, and post-processing
+# always sends source="auto" to the API; source_lang only skips already-target-lang text
 class DeepTranslatorWrapper:
-    """Wraps *deep_translator.GoogleTranslator* with batching, deduplication
-    cache and post-processing.
-
-    Parameters
-    ----------
-    source_lang : str
-        Language code supplied by the user (e.g. ``"en"``).
-        Used only for the **target-language skip**: texts already detected as
-        the *target* language are not re-translated.  The Google Translate API
-        always receives ``source="auto"`` so it can auto-detect each text
-        individually — this avoids confusing the API when a document mixes
-        languages.
-    """
 
     def __init__(self, source_lang: str = "auto"):
         self._source_lang = source_lang
@@ -99,19 +110,13 @@ class DeepTranslatorWrapper:
         if inst is None:
             if self._impl_cls is None:
                 raise RuntimeError("deep_translator is not available")
-            # Always use source="auto" so Google auto-detects each text.
-            # The user's source_lang is only used for target-language skipping.
+            # always source="auto"; source_lang only for the target-skip check
             inst = self._impl_cls(source="auto", target=target_lang)
             self._instances[target_lang] = inst
         return inst
 
     def _is_already_target_lang(self, text: str, target_lang: str) -> bool:
-        """Return *True* if *text* appears to already be in *target_lang*.
-
-        Only applied to longer texts where ``langdetect`` is reliable.
-        Short texts, detection failures, and missing ``langdetect`` always
-        return *False* (i.e. the text **will** be translated).
-        """
+        # True if text is already in target_lang (only when langdetect available and text long enough)
         if self._langdetect is None:
             return False
         if len(text.strip()) < _SKIP_MIN_CHARS:
@@ -144,17 +149,18 @@ class DeepTranslatorWrapper:
 
     # ----- batch (the fast path) ----- #
 
-    def translate_batch(self, texts: list[str], target_lang: str) -> list[str]:
-        """Translate a list of strings, batching HTTP requests for speed.
-
-        Empty / whitespace-only strings are returned unchanged without
-        consuming an API call.
-        """
+    def translate_batch(
+        self,
+        texts: list[str],
+        target_lang: str,
+        *,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> list[str]:
+        # batches requests; empty strings and already-target-lang text pass through
         if not self._impl_cls:
             return list(texts)
 
-        # Start from a *copy* of the originals so any index we never touch
-        # keeps its original text instead of becoming "".
+        # copy originals so untouched indices keep their original text
         results: list[str] = list(texts)
         tgt_cache = self._cache.setdefault(target_lang, {})
 
@@ -186,9 +192,15 @@ class DeepTranslatorWrapper:
         chunks = self._make_chunks(dedup_items)
 
         for chunk in chunks:
+            # Honour cancellation before starting the next HTTP request
+            if cancel_event is not None and cancel_event.is_set():
+                raise CancelledError("Translation cancelled")
             chunk_texts = [t for t, _ in chunk]
             try:
-                translated = translator.translate_batch(chunk_texts)
+                translated = _run_cancellable(
+                    lambda texts=chunk_texts: translator.translate_batch(texts),
+                    cancel_event,
+                )
                 if translated is None:
                     translated = chunk_texts
                 # Pad if Google Translate returned fewer items than sent
@@ -202,9 +214,11 @@ class DeepTranslatorWrapper:
                     tgt_cache[orig_text] = tr_text
                     for idx in indices:
                         results[idx] = tr_text
+            except CancelledError:
+                raise
             except Exception:
                 logger.exception("Batch translation failed; falling back to sub-batches")
-                self._subbatch_fallback(chunk, translator, results, tgt_cache)
+                self._subbatch_fallback(chunk, translator, results, tgt_cache, cancel_event)
 
         return results
 
@@ -214,28 +228,40 @@ class DeepTranslatorWrapper:
         translator,
         results: list[str],
         tgt_cache: dict[str, str],
+        cancel_event: Optional[threading.Event] = None,
     ) -> None:
-        """On batch failure, retry in two halves; fall back to per-item only
-        for the smallest failing sub-batch."""
+        # on batch failure, retry in halves; per-item only for the smallest failing chunk
         if len(chunk) <= 2:
             # Small enough — do per-item
             for orig_text, indices in chunk:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CancelledError("Translation cancelled")
                 try:
-                    r = translator.translate(orig_text)
+                    r = _run_cancellable(
+                        lambda text=orig_text: translator.translate(text),
+                        cancel_event,
+                    )
                     r = r if r is not None else orig_text
                     r = post_process(r)
                     tgt_cache[orig_text] = r
                     for idx in indices:
                         results[idx] = r
+                except CancelledError:
+                    raise
                 except Exception:
                     logger.exception("Per-item fallback also failed")
                     # results already contains the original text
             return
         mid = len(chunk) // 2
         for half in (chunk[:mid], chunk[mid:]):
+            if cancel_event is not None and cancel_event.is_set():
+                raise CancelledError("Translation cancelled")
             half_texts = [t for t, _ in half]
             try:
-                translated = translator.translate_batch(half_texts)
+                translated = _run_cancellable(
+                    lambda texts=half_texts: translator.translate_batch(texts),
+                    cancel_event,
+                )
                 if translated is None:
                     translated = half_texts
                 if len(translated) < len(half):
@@ -248,14 +274,15 @@ class DeepTranslatorWrapper:
                     tgt_cache[orig_text] = tr_text
                     for idx in indices:
                         results[idx] = tr_text
+            except CancelledError:
+                raise
             except Exception:
                 logger.exception("Sub-batch failed; recursing")
-                self._subbatch_fallback(half, translator, results, tgt_cache)
+                self._subbatch_fallback(half, translator, results, tgt_cache, cancel_event)
 
     @staticmethod
     def _make_chunks(items: list[tuple[str, list[int]]]) -> list[list[tuple[str, list[int]]]]:
-        """Split *items* into chunks of at most ``_BATCH_SIZE`` items and
-        ``_BATCH_MAX_CHARS`` total characters."""
+        # split into chunks capped at _BATCH_SIZE items and _BATCH_MAX_CHARS chars
         chunks: list[list[tuple[str, list[int]]]] = []
         current: list[tuple[str, list[int]]] = []
         current_chars = 0

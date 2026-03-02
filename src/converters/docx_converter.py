@@ -1,13 +1,14 @@
 from docx.api import Document
 from typing import Any
 import logging
+import threading
+from ..utils import CancelledError
 
 logger = logging.getLogger(__name__)
 
 
-def translate_docx(input_path: str, output_path: str, translator: Any, target_lang: str):
-    """Translate a DOCX file using batch translation while preserving
-    run-level formatting (bold, italic, font, size, colour, etc.)."""
+def translate_docx(input_path: str, output_path: str, translator: Any, target_lang: str, *, cancel_event: threading.Event | None = None):
+    # batch-translate DOCX while preserving run-level formatting
     doc = Document(input_path)
 
     # --- collect every run that has translatable text ---
@@ -33,7 +34,9 @@ def translate_docx(input_path: str, output_path: str, translator: Any, target_la
     # --- batch-translate all collected texts ---
     if texts:
         try:
-            translated = translator.translate_batch(texts, target_lang)
+            translated = translator.translate_batch(texts, target_lang, cancel_event=cancel_event)
+        except CancelledError:
+            raise
         except Exception:
             logger.exception("Batch translation failed for DOCX; falling back to per-item")
             translated = []
@@ -54,6 +57,10 @@ def translate_docx(input_path: str, output_path: str, translator: Any, target_la
             run.text = tr
     else:
         errors = 0
+
+    # Check for cancellation before saving
+    if cancel_event is not None and cancel_event.is_set():
+        raise CancelledError("Translation cancelled before saving DOCX")
 
     doc.save(output_path)
     if errors:

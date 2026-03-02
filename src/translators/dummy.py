@@ -1,5 +1,6 @@
 from typing import Optional, Dict, Any, List
 from .base import Translator
+import threading
 import logging
 
 logger = logging.getLogger(__name__)
@@ -10,26 +11,24 @@ _BATCH_SIZE = 50
 _BATCH_MAX_CHARS = 4500
 
 
+# returns text unchanged — for testing
 class IdentityTranslator:
-    """Returns text unchanged — useful for testing."""
 
     def translate_text(self, text: str, target_lang: str) -> str:
         return text
 
-    def translate_batch(self, texts: list[str], target_lang: str) -> list[str]:
+    def translate_batch(
+        self,
+        texts: list[str],
+        target_lang: str,
+        *,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> list[str]:
         return list(texts)
 
 
+# wraps deep_translator with batching; source_lang="auto" skips language filtering
 class DeepTranslatorWrapper:
-    """Wraps *deep_translator.GoogleTranslator* with batching and optional
-    source-language filtering via *langdetect*.
-
-    Parameters
-    ----------
-    source_lang : str
-        Language code for the source language (e.g. ``"en"``).
-        ``"auto"`` means translate everything regardless of detected language.
-    """
 
     def __init__(self, source_lang: str = "auto"):
         self._source_lang = source_lang
@@ -52,13 +51,15 @@ class DeepTranslatorWrapper:
     def _get_instance(self, target_lang: str):
         inst = self._instances.get(target_lang)
         if inst is None:
+            if self._impl_cls is None:
+                raise RuntimeError("GoogleTranslator not available")
             src = self._source_lang if self._source_lang != "auto" else "auto"
             inst = self._impl_cls(source=src, target=target_lang)
             self._instances[target_lang] = inst
         return inst
 
     def _should_translate(self, text: str) -> bool:
-        """Return *True* if the text appears to be in the source language."""
+        # True if text looks like it's in source_lang (always True when auto)
         if self._source_lang == "auto" or self._langdetect is None:
             return True
         try:
@@ -86,12 +87,8 @@ class DeepTranslatorWrapper:
 
     # ----- batch (the fast path) ----- #
 
-    def translate_batch(self, texts: list[str], target_lang: str) -> list[str]:
-        """Translate a list of strings, batching HTTP requests for speed.
-
-        Empty / whitespace-only strings and strings not in the source language
-        are returned unchanged without consuming an API call.
-        """
+    def translate_batch(self, texts: list[str], target_lang: str, *, cancel_event: Optional[threading.Event] = None) -> list[str]:
+        # batches HTTP requests; passthrough for empty/non-source strings
         if not self._impl_cls:
             return list(texts)
 
@@ -115,6 +112,10 @@ class DeepTranslatorWrapper:
         chunks = self._make_chunks(to_translate)
 
         for chunk in chunks:
+            # Honour cancellation between HTTP requests
+            if cancel_event is not None and cancel_event.is_set():
+                from ..utils import CancelledError
+                raise CancelledError("Translation cancelled")
             chunk_texts = [t for _, t in chunk]
             try:
                 translated = translator.translate_batch(chunk_texts)
@@ -136,8 +137,7 @@ class DeepTranslatorWrapper:
 
     @staticmethod
     def _make_chunks(items: list[tuple[int, str]]) -> list[list[tuple[int, str]]]:
-        """Split *items* into chunks of at most ``_BATCH_SIZE`` items and
-        ``_BATCH_MAX_CHARS`` total characters."""
+        # split into chunks capped at _BATCH_SIZE items and _BATCH_MAX_CHARS chars
         chunks: list[list[tuple[int, str]]] = []
         current: list[tuple[int, str]] = []
         current_chars = 0

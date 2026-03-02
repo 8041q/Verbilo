@@ -42,7 +42,7 @@ def main():
         return
 
     if not args.lang:
-        print("Error: target language code is required for batch CLI. Example: python -m src.doc_translator.cli es")
+        print("Error: target language code is required for batch CLI. Example: python -m src.cli es")
         return
 
     print(f"Source language: {args.source}  |  Target language: {args.lang}")

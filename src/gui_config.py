@@ -1,7 +1,4 @@
-# Small config helper for GUI defaults.
-
-# Stores per-project GUI defaults in `.doc_translator_gui.json` in the current working directory.
-# Keys: `default_input`, `default_output`.
+# loads/saves GUI defaults from .verbilo_gui.json in cwd
 
 from __future__ import annotations
 
@@ -9,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Dict, Any
 
-CONFIG_FILENAME = ".doc_translator_gui.json"
+CONFIG_FILENAME = ".verbilo_gui.json"
 
 
 def _config_path() -> Path:
@@ -31,5 +28,5 @@ def save_config(cfg: Dict[str, Any]) -> None:
     try:
         p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception:
-        # best-effort, do not crash the GUI
+        # best-effort, don't crash the GUI
         pass

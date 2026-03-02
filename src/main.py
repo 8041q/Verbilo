@@ -1,7 +1,12 @@
 from pathlib import Path
+import threading
 from .translators.google import TranslatorFactory
 from .converters import docx_converter, xlsx_converter, pdf_converter
 from .utils.io import resolve_output_path
+from .utils import CancelledError
+
+# Re-export so that existing callers of ``from .main import CancelledError`` still work.
+__all__ = ["translate_file", "CancelledError"]
 
 
 def translate_file(
@@ -10,15 +15,9 @@ def translate_file(
     output_path: str | None = None,
     translator_name: str | None = None,
     source_lang: str = "auto",
+    cancel_event: threading.Event | None = None,
 ):
-    """Translate a single document file.
-
-    Parameters
-    ----------
-    source_lang : str
-        ISO-639-1 code for the source language (e.g. ``"en"``).
-        ``"auto"`` means translate all text regardless of its detected language.
-    """
+    # source_lang="auto" translates everything; cancel_event raises CancelledError before saving
     p = Path(input_path)
     if not p.exists():
         raise FileNotFoundError(input_path)
@@ -35,11 +34,11 @@ def translate_file(
     output_path = resolve_output_path(p, output_path)
 
     if suffix == ".docx":
-        docx_converter.translate_docx(str(p), str(output_path), translator, target_lang)
+        docx_converter.translate_docx(str(p), str(output_path), translator, target_lang, cancel_event=cancel_event)
     elif suffix in (".xls", ".xlsx"):
-        xlsx_converter.translate_xlsx(str(p), str(output_path), translator, target_lang)
+        xlsx_converter.translate_xlsx(str(p), str(output_path), translator, target_lang, cancel_event=cancel_event)
     elif suffix == ".pdf":
-        result = pdf_converter.translate_pdf(str(p), str(output_path), translator, target_lang)
+        result = pdf_converter.translate_pdf(str(p), str(output_path), translator, target_lang, cancel_event=cancel_event)
         if result == "skipped-ocr":
             return "skipped-ocr"
     else:
