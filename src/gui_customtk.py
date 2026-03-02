@@ -14,12 +14,33 @@ try:
 except Exception:
     ctk = None
 
+import tomllib
+import webbrowser
+
 from . import gui_theme as theme
 from .gui_helpers import Worker, list_supported_files, center_window
 from .gui_config import load_config, save_config
 from .icons import get_icon, get_photo_image, get_app_icon
 
 logger = logging.getLogger(__name__)
+
+# --- version & about constants ---
+
+def _read_version() -> str:
+    """Read the project version from pyproject.toml (stdlib tomllib, Python 3.11+)."""
+    try:
+        toml_path = Path(__file__).parent.parent / "pyproject.toml"
+        with open(toml_path, "rb") as fh:
+            data = tomllib.load(fh)
+        return data["tool"]["poetry"]["version"]
+    except Exception:
+        return "unknown"
+
+APP_VERSION = _read_version()
+
+# Github URLs
+GITHUB_URL = "https://github.com/8041q/Verbilo"
+RELEASES_URL = "https://github.com/8041q/Verbilo/releases"
 
 # --- language helpers ---
 
@@ -118,13 +139,11 @@ def _get_language_options() -> list[tuple[str, str]]:
 
 
 class SearchableComboBox:
-    """Entry + scrollable Toplevel listbox.
-
-    - Click / Tab focus → selects all text, opens dropdown.
-    - Type → filters list live and keeps dropdown open.
-    - Click list item or Enter → confirms, closes.
-    - Click outside, Escape, or focus-out → reverts to last valid, closes.
-    """
+    # Entry + scrollable Toplevel listbox.
+    # - Click/Tab: select-all and open dropdown.
+    # - Type: live filter, keep dropdown open.
+    # - Click item or Enter: confirm and close.
+    # - Click outside/Escape/focus-out: revert to last valid and close.
 
     _POPUP_ROWS = 8  # max visible rows before scrolling
 
@@ -223,21 +242,21 @@ class SearchableComboBox:
     # -- Entry event handlers ------------------------------------------
 
     def _on_focus_in(self, _event=None):
-        """Tab / programmatic focus: select-all and open."""
+        # Tab/programmatic focus: select-all and open.
         if self._suppress_open:
             return
         self._select_all()
         self._open()
 
     def _on_click(self, _event=None):
-        """Mouse click on entry (entry may already have focus)."""
+        # Mouse click on entry (may already have focus).
         if self._suppress_open:
             return
         self._select_all()
         self._open()
 
     def _on_key(self, event=None):
-        """Live filter + open/refresh popup on each keystroke."""
+        # Live filter and open/refresh popup on each keystroke.
         if event and event.keysym in (
             "Shift_L", "Shift_R", "Control_L", "Control_R",
             "Alt_L", "Alt_R", "Caps_Lock", "Return", "Escape",
@@ -253,7 +272,7 @@ class SearchableComboBox:
             self._open(display)
 
     def _on_focus_out(self, _event=None):
-        """Delay so a listbox click can land before we validate."""
+        # Delay so a listbox click can land before validation.
         self._frame.after(150, self._validate_or_revert)
 
     def _on_enter(self, _event=None):
@@ -857,7 +876,7 @@ class App:
         self.file_table.tag_configure("odd",  background=p.bg_row_odd)
 
     def _get_file_icon(self, filepath: str):
-        """Return the appropriate PhotoImage icon for a file extension."""
+        # Return the appropriate PhotoImage icon for a file extension.
         ext = Path(filepath).suffix.lower()
         return self._file_icons.get(ext, self._file_icons.get("_default"))
 
@@ -1001,16 +1020,67 @@ class App:
             level="tiny",
         ).grid(row=4, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 8))
 
+        # --- Updates section ---
+        theme.make_divider(card).grid(row=5, column=0, columnspan=3, sticky="ew", padx=PAD, pady=(4, 8))
+
+        theme.make_label(card, "UPDATES", level="section").grid(
+            row=6, column=0, sticky="w", padx=PAD, pady=(0, 6),
+        )
+
+        auto_updates_var = tk.BooleanVar(value=self.cfg.get("auto_check_updates", True))
+        auto_updates_cb = ctk.CTkCheckBox(
+            card,
+            text="Automatically check for updates",
+            variable=auto_updates_var,
+            onvalue=True,
+            offvalue=False,
+            checkmark_color=p.bg_main,
+            fg_color=p.accent,
+            hover_color=p.accent_hover,
+            border_color=p.border,
+            text_color=p.text_secondary,
+            font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]),
+        )
+        auto_updates_cb.grid(row=6, column=1, columnspan=2, sticky="w", padx=4, pady=(0, 6))
+
+        # --- About section ---
+        theme.make_divider(card).grid(row=7, column=0, columnspan=3, sticky="ew", padx=PAD, pady=(4, 8))
+
+        theme.make_label(card, "ABOUT", level="section").grid(
+            row=8, column=0, sticky="w", padx=PAD, pady=(0, 4),
+        )
+
+        theme.make_label(card, f"Verbilo  v{APP_VERSION}", level="body").grid(
+            row=8, column=1, columnspan=2, sticky="w", padx=4, pady=(0, 4),
+        )
+
+        about_frame = ctk.CTkFrame(card, fg_color="transparent")
+        about_frame.grid(row=9, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 8))
+
+        def _open_github():
+            if GITHUB_URL:
+                webbrowser.open(GITHUB_URL)
+
+        def _open_releases():
+            if RELEASES_URL:
+                webbrowser.open(RELEASES_URL)
+
+        theme.make_button(about_frame, "View on GitHub", command=_open_github, style="ghost",
+                          height=28).pack(side=tk.LEFT, padx=(0, 6))
+        theme.make_button(about_frame, "Release notes", command=_open_releases, style="ghost",
+                          height=28).pack(side=tk.LEFT, padx=(0, 16))
+        theme.make_label(about_frame, "Made by crt_", level="tiny").pack(side=tk.LEFT)
+
         # Inline validation error
         self._settings_error = theme.make_label(
             card, "", level="tiny",
             text_color=p.status_error,
         )
-        self._settings_error.grid(row=5, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 2))
+        self._settings_error.grid(row=10, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 2))
 
         # Button row
         btn_frame = ctk.CTkFrame(card, fg_color="transparent")
-        btn_frame.grid(row=6, column=0, columnspan=3, pady=(4, PAD))
+        btn_frame.grid(row=11, column=0, columnspan=3, pady=(4, PAD))
 
         def _save_and_close():
             inp = in_entry.get().strip()
@@ -1023,6 +1093,7 @@ class App:
             self.cfg["default_output"] = out
             new_mode = "Dark" if mode_switch_var.get() else "Light"
             self.cfg["appearance_mode"] = new_mode
+            self.cfg["auto_check_updates"] = auto_updates_var.get()
             save_config(self.cfg)
             win.destroy()
 

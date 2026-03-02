@@ -16,20 +16,12 @@ if TYPE_CHECKING:
     from customtkinter import CTkFrame, CTkButton, CTkLabel, CTkEntry, CTkFont
 
 
-# ═══════════════════════════════════════════════════════════════════════
 #  DPI / scaling
-# ═══════════════════════════════════════════════════════════════════════
-
 _scale_factor: float = 1.0
 
-
 def init_dpi(root: Any = None) -> float:
-    """Call once after root window creation to detect and apply DPI scaling.
-
-    On Windows this also enables per-monitor DPI awareness so the app looks
-    crisp on high-DPI screens and stays consistent across machines.
-    Returns the computed scale factor (1.0 = 96 dpi baseline).
-    """
+    # Detect and apply DPI scaling. Call once after root window creation.
+    # On Windows this enables per-monitor DPI awareness. Returns scale factor.
     global _scale_factor
 
     # Windows: enable system DPI awareness before any GUI work
@@ -58,7 +50,7 @@ def init_dpi(root: Any = None) -> float:
 
 
 def scale(value: int | float) -> int:
-    """Scale a pixel value by the current DPI factor."""
+    # Scale a pixel value by the current DPI factor.
     return max(1, round(value * _scale_factor))
 
 
@@ -139,7 +131,7 @@ class Palette:
     status_pending: str = "#888888"
 
 
-# ── Dark mode ─────────────────────────────────────────────────────────
+# Dark mode
 
 DARK = Palette(
     bg_main="#181A1F",
@@ -164,7 +156,7 @@ DARK = Palette(
     divider="#2C2F36",
 )
 
-# ── Light mode ────────────────────────────────────────────────────────
+# Light mode
 
 LIGHT = Palette(
     bg_main="#F4F5F7",
@@ -217,7 +209,7 @@ def get() -> Palette:
 # ═══════════════════════════════════════════════════════════════════════
 
 def make_card(parent: Any, **overrides: Any) -> Any:
-    """Themed card frame."""
+    # Themed card frame.
     if ctk is None:
         import tkinter as _tk
         return _tk.Frame(parent)
@@ -240,7 +232,7 @@ def make_button(
     image: Any = None,
     **overrides: Any,
 ) -> Any:
-    """Themed button.  ``style``: ``"primary"`` / ``"secondary"`` / ``"ghost"``."""
+    # Themed button. style: "primary" / "secondary" / "ghost".
     if ctk is None:
         import tkinter as _tk
         return _tk.Button(parent, text=text, command=command)
@@ -288,11 +280,7 @@ def make_button(
 
 
 def make_label(parent: Any, text: str, level: str = "body", **overrides: Any) -> Any:
-    """Themed label.
-
-    Levels: ``heading`` / ``subheading`` / ``section`` / ``body`` /
-    ``small`` / ``tiny`` / ``muted``.
-    """
+    # Themed label. Levels: heading, subheading, section, body, small, tiny, muted.
     if ctk is None:
         import tkinter as _tk
         return _tk.Label(parent, text=text)
@@ -333,7 +321,7 @@ def make_label(parent: Any, text: str, level: str = "body", **overrides: Any) ->
 
 
 def make_entry(parent: Any, **overrides: Any) -> Any:
-    """Themed text entry."""
+    # Themed text entry.
     if ctk is None:
         import tkinter as _tk
         return _tk.Entry(parent)
@@ -353,7 +341,7 @@ def make_entry(parent: Any, **overrides: Any) -> Any:
 
 
 def make_divider(parent: Any, orientation: str = "horizontal") -> Any:
-    """Thin coloured divider line."""
+    # Thin coloured divider line.
     if ctk is None:
         import tkinter as _tk
         return _tk.Frame(parent, height=1, bg="#555555")

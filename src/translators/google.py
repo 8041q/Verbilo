@@ -19,9 +19,7 @@ _BATCH_MAX_CHARS = 4900
 _SKIP_MIN_CHARS = 20
 
 
-# ---------------------------------------------------------------------------
 # Lightweight post-processing: fix common Google Translate artefacts
-# ---------------------------------------------------------------------------
 
 def post_process(text: str) -> str:
     # fix spacing around punctuation and collapse multiple spaces

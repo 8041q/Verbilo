@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover
 if TYPE_CHECKING:
     from customtkinter import CTkImage
 
-# ── Semantic icon map ────────────────────────────────────────────────
+# Semantic icon map
 # Maps human-readable names to OutlineIcon enum members.
 
 _ICON_MAP: dict[str, object] = {}
@@ -62,28 +62,25 @@ if OutlineIcon is not None:
     }
 
 
-# ── Colour tokens for light / dark icons ─────────────────────────────
+# Colour tokens for light / dark icons 
 
 def _icon_colors() -> tuple[str, str]:
-    """Return (light_color, dark_color) for icon rendering.
-
-    ``light_color`` is used on the *light* theme background (so it should
-    be a dark colour), and ``dark_color`` is used on the *dark* theme
-    background (so it should be light).
-    """
+    # Return (light_color, dark_color) for icon rendering.
+    # light_color: used on light theme (choose a dark colour).
+    # dark_color: used on dark theme (choose a light colour).
     return "#3B3F46", "#C8CCD2"
 
 
 def _accent_icon_colors() -> tuple[str, str]:
-    """Colours for icons rendered on the accent-coloured button."""
+    # Colours for icons on accent-coloured buttons (light, dark).
     return "#FFFFFF", "#FFFFFF"
 
 
-# ── Public API ────────────────────────────────────────────────────────
+# Public API 
 
 @lru_cache(maxsize=256)
 def _render(icon_enum: object, size: int, color: str) -> object:
-    """Render a single icon to a PIL Image (cached)."""
+    # Render a single icon to a PIL Image (cached).
     if TablerIcons is None:
         return None
     return TablerIcons.load(icon_enum, size=size, color=color, stroke_width=1.8)
@@ -95,19 +92,8 @@ def get_icon(
     *,
     on_accent: bool = False,
 ) -> "CTkImage | None":
-    """Return a ``CTkImage`` with light + dark variants for *name*.
-
-    Parameters
-    ----------
-    name:
-        A semantic name from ``_ICON_MAP`` (e.g. ``"play"``, ``"settings"``).
-    size:
-        Icon dimensions in pixels (square).
-    on_accent:
-        If ``True``, use white-on-accent colours (for icons on filled buttons).
-
-    Returns ``None`` when pytablericons or CTk is not available.
-    """
+    # Return a CTkImage (light + dark variants) for `name`.
+    # Returns None when required libraries or icon are unavailable.
     if ctk is None or TablerIcons is None:
         return None
 
@@ -130,11 +116,8 @@ def get_icon(
 
 
 def get_photo_image(name: str, size: int = 18, color: str = "#C8CCD2") -> object | None:
-    """Return a tkinter ``PhotoImage`` for use in ttk widgets (Treeview etc.).
-
-    Unlike ``get_icon`` this produces a *single* image — use the colour that
-    matches the current active theme.
-    """
+    # Return a tkinter PhotoImage for use in ttk widgets (single image).
+    # Use the provided colour for the current theme.
     if TablerIcons is None or PILImage is None or ImageTk is None:
         return None
 
@@ -149,7 +132,7 @@ def get_photo_image(name: str, size: int = 18, color: str = "#C8CCD2") -> object
 
 
 def get_app_icon(size: int = 64) -> object | None:
-    """Return a PIL Image suitable for the window icon (taskbar / title bar)."""
+    # Return a PIL Image suitable for the window/taskbar icon.
     if TablerIcons is None or OutlineIcon is None:
         return None
     return TablerIcons.load(OutlineIcon.LANGUAGE, size=size, color="#5B9BD5", stroke_width=1.6)

@@ -1,9 +1,0 @@
-UI: modernize theme, add icons, fix searchable language dropdown
-
-Unified DPI & font tokens, refreshed palette and spacing for a consistent modern look.
-
-Added central icon helper (`src/icons.py`) and integrated Tabler Icons via `pytablericons`.
-
-Rewrote the language selector to a robust searchable Toplevel dropdown (`SearchableComboBox` in `src/gui_customtk.py`) — fixes select-all-on-focus, popup race conditions, and outside-click closing.
-
-Updated README and dependency notes to document the UI changes and icon dependency.

@@ -155,10 +155,7 @@ The full list of 130+ supported codes is shown in the GUI dropdown.
 
 ## Future Implementations
 
-- **Settings:** Add an option in the settings to check for updates and include a GitHub / About info page for easy access to source, release notes and credits.
-
-- **Names & titles:** Update UI names and titles throughout the app for clearer, consistent labeling (configurable where appropriate).
+- **Settings:** Auto Update (check for updates, install, etc)
 
 ## License
-
 MIT
