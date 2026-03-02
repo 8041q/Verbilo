@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import platform
+import sys
+from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING, Literal
 
 try:
@@ -14,61 +16,122 @@ if TYPE_CHECKING:
     from customtkinter import CTkFrame, CTkButton, CTkLabel, CTkEntry, CTkFont
 
 
-# layout
+# ═══════════════════════════════════════════════════════════════════════
+#  DPI / scaling
+# ═══════════════════════════════════════════════════════════════════════
 
-PADDING: int = 20
-CARD_CORNER_RADIUS: int = 12
+_scale_factor: float = 1.0
+
+
+def init_dpi(root: Any = None) -> float:
+    """Call once after root window creation to detect and apply DPI scaling.
+
+    On Windows this also enables per-monitor DPI awareness so the app looks
+    crisp on high-DPI screens and stays consistent across machines.
+    Returns the computed scale factor (1.0 = 96 dpi baseline).
+    """
+    global _scale_factor
+
+    # Windows: enable system DPI awareness before any GUI work
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            try:
+                import ctypes
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+    if root is not None:
+        try:
+            root.update_idletasks()
+            dpi = root.winfo_fpixels("1i")  # pixels per inch
+            _scale_factor = dpi / 96.0
+        except Exception:
+            _scale_factor = 1.0
+    else:
+        _scale_factor = 1.0
+
+    return _scale_factor
+
+
+def scale(value: int | float) -> int:
+    """Scale a pixel value by the current DPI factor."""
+    return max(1, round(value * _scale_factor))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Layout constants (logical pixels — call scale() at usage sites)
+# ═══════════════════════════════════════════════════════════════════════
+
+PADDING: int = 18
+CARD_CORNER_RADIUS: int = 10
 CARD_BORDER_WIDTH: int = 1
-SIDEBAR_WIDTH: int = 250
+SIDEBAR_WIDTH: int = 260
 BUTTON_CORNER_RADIUS: int = 8
 WINDOW_WIDTH: int = 1100
-WINDOW_HEIGHT: int = 700
-WINDOW_MIN_WIDTH: int = 950
-WINDOW_MIN_HEIGHT: int = 650
+WINDOW_HEIGHT: int = 720
+WINDOW_MIN_WIDTH: int = 960
+WINDOW_MIN_HEIGHT: int = 660
 
-# fonts
+# ═══════════════════════════════════════════════════════════════════════
+#  Fonts — proper hierarchy, OS-native family first
+# ═══════════════════════════════════════════════════════════════════════
 
-FONT_FAMILY: str = "Roboto"
+def _detect_font_family() -> str:
+    _sys = platform.system()
+    if _sys == "Windows":
+        return "Segoe UI"
+    if _sys == "Darwin":
+        return "SF Pro Text"
+    return "Roboto"
 
-FONT_HEADING: tuple[str, int, str] = (FONT_FAMILY, 18, "bold")
-FONT_SUBHEADING: tuple[str, int, str] = (FONT_FAMILY, 14, "bold")
-FONT_BODY: tuple[str, int] = (FONT_FAMILY, 13)
-FONT_SMALL: tuple[str, int] = (FONT_FAMILY, 13)
-FONT_TINY: tuple[str, int] = (FONT_FAMILY, 16)
+
+FONT_FAMILY: str = _detect_font_family()
+
+# (family, size, ?weight) — sizes are logical
+FONT_HEADING:    tuple[str, int, str] = (FONT_FAMILY, 20, "bold")
+FONT_SUBHEADING: tuple[str, int, str] = (FONT_FAMILY, 15, "bold")
+FONT_SECTION:    tuple[str, int, str] = (FONT_FAMILY, 11, "bold")  # sidebar sections (uppercased)
+FONT_BODY:       tuple[str, int]      = (FONT_FAMILY, 13)
+FONT_SMALL:      tuple[str, int]      = (FONT_FAMILY, 12)
+FONT_TINY:       tuple[str, int]      = (FONT_FAMILY, 11)
 
 
-# palette
+# ═══════════════════════════════════════════════════════════════════════
+#  Palette — semantic colour tokens
+# ═══════════════════════════════════════════════════════════════════════
 
-# all colours are semantic — bg/text/accent/border/status
 @dataclass(frozen=True)
 class Palette:
-
     # Backgrounds
-    bg_main: str            # root window / main area
-    bg_card: str            # card surfaces (slightly lighter/darker than main)
-    bg_sidebar: str         # sidebar background
-    bg_input: str           # entry / combo-box background
-    bg_popup: str           # popup overlay background
-    bg_row_even: str        # treeview even row
-    bg_row_odd: str         # treeview odd row
-    bg_heading: str         # treeview heading row
+    bg_main: str
+    bg_card: str
+    bg_sidebar: str
+    bg_input: str
+    bg_popup: str
+    bg_row_even: str
+    bg_row_odd: str
+    bg_heading: str
 
     # Text
-    text_primary: str       # headings, important labels
-    text_secondary: str     # body text, descriptions
-    text_muted: str         # placeholders, disabled text
-    text_on_accent: str     # text rendered on accent-coloured surfaces
+    text_primary: str
+    text_secondary: str
+    text_muted: str
+    text_on_accent: str
 
     # Accent / brand
-    accent: str             # primary action colour (buttons, selections)
-    accent_hover: str       # hover state
-    accent_pressed: str     # pressed / active state
+    accent: str
+    accent_hover: str
+    accent_pressed: str
 
     # Borders & dividers
-    border: str             # card / button border
-    divider: str            # thin section dividers
+    border: str
+    divider: str
 
-    # Semantic status (shared across modes)
+    # Semantic status (shared)
     status_success: str = "#4CAF50"
     status_error: str   = "#F44336"
     status_warning: str = "#FF9800"
@@ -76,62 +139,65 @@ class Palette:
     status_pending: str = "#888888"
 
 
-# brand: #4A4A4A dark grey, #CBCBCB silver, #FFFFE3 cream, #6D8196 steel-blue
+# ── Dark mode ─────────────────────────────────────────────────────────
 
 DARK = Palette(
-    bg_main="#1E1E1E",
-    bg_card="#2B2B2B",
-    bg_sidebar="#171717",
-    bg_input="#333333",
-    bg_popup="#2B2B2B",
-    bg_row_even="#2B2B2B",
-    bg_row_odd="#323232",
-    bg_heading="#242424",
+    bg_main="#181A1F",
+    bg_card="#22252B",
+    bg_sidebar="#14161A",
+    bg_input="#2A2D34",
+    bg_popup="#22252B",
+    bg_row_even="#22252B",
+    bg_row_odd="#282B32",
+    bg_heading="#1C1E24",
 
-    text_primary="#FFFFE3",
-    text_secondary="#CBCBCB",
-    text_muted="#6B6B6B",
-    text_on_accent="#FFFFE3",
+    text_primary="#E8EAED",
+    text_secondary="#B0B3B8",
+    text_muted="#6B6F78",
+    text_on_accent="#FFFFFF",
 
-    accent="#6D8196",
-    accent_hover="#7E95AB",
-    accent_pressed="#5A6E80",
+    accent="#5B9BD5",
+    accent_hover="#4A8AC4",
+    accent_pressed="#3A7AB4",
 
-    border="#4A4A4A",
-    divider="#3A3A3A",
+    border="#33363D",
+    divider="#2C2F36",
 )
 
+# ── Light mode ────────────────────────────────────────────────────────
+
 LIGHT = Palette(
-    bg_main="#F5F5F0",
+    bg_main="#F4F5F7",
     bg_card="#FFFFFF",
-    bg_sidebar="#EAEAE5",
+    bg_sidebar="#EBEDF0",
     bg_input="#FFFFFF",
     bg_popup="#FFFFFF",
     bg_row_even="#FFFFFF",
-    bg_row_odd="#F7F7F2",
-    bg_heading="#EAEAE5",
+    bg_row_odd="#F7F8FA",
+    bg_heading="#EBEDF0",
 
-    text_primary="#1E1E1E",
-    text_secondary="#4A4A4A",
-    text_muted="#999999",
-    text_on_accent="#FFFFE3",
+    text_primary="#1D1F24",
+    text_secondary="#4A4E57",
+    text_muted="#9198A1",
+    text_on_accent="#FFFFFF",
 
-    accent="#6D8196",
-    accent_hover="#5A6E80",
-    accent_pressed="#4A5E70",
+    accent="#5B9BD5",
+    accent_hover="#4A8AC4",
+    accent_pressed="#3A7AB4",
 
-    border="#CBCBCB",
-    divider="#E0E0DA",
+    border="#D0D3D9",
+    divider="#E2E4E8",
 )
 
 
-# runtime state
+# ═══════════════════════════════════════════════════════════════════════
+#  Runtime state
+# ═══════════════════════════════════════════════════════════════════════
 
 _current_mode: str = "Dark"
 
 
 def set_mode(mode: str) -> None:
-    # "Dark" or "Light"
     global _current_mode
     _current_mode = mode
     if ctk is not None:
@@ -146,10 +212,12 @@ def get() -> Palette:
     return DARK if _current_mode == "Dark" else LIGHT
 
 
-# widget helpers
+# ═══════════════════════════════════════════════════════════════════════
+#  Widget factory helpers
+# ═══════════════════════════════════════════════════════════════════════
 
 def make_card(parent: Any, **overrides: Any) -> Any:
-    # themed card frame
+    """Themed card frame."""
     if ctk is None:
         import tkinter as _tk
         return _tk.Frame(parent)
@@ -164,24 +232,31 @@ def make_card(parent: Any, **overrides: Any) -> Any:
     )
 
 
-def make_button(parent: Any, text: str, command: Any = None, style: str = "primary",
-                **overrides: Any) -> Any:
-    # style: "primary" (filled), "secondary" (outline), "ghost" (transparent)
+def make_button(
+    parent: Any,
+    text: str,
+    command: Any = None,
+    style: str = "primary",
+    image: Any = None,
+    **overrides: Any,
+) -> Any:
+    """Themed button.  ``style``: ``"primary"`` / ``"secondary"`` / ``"ghost"``."""
     if ctk is None:
         import tkinter as _tk
         return _tk.Button(parent, text=text, command=command)
     p = get()
     _font = ctk.CTkFont(family=FONT_FAMILY, size=FONT_BODY[1])
+
     if style == "primary":
         kw: dict[str, Any] = dict(
             fg_color=p.accent,
             hover_color=p.accent_hover,
             text_color=p.text_on_accent,
-            border_color=p.border,
-            border_width=1,
+            border_color=p.accent_pressed,
+            border_width=0,
         )
     elif style == "secondary":
-        kw: dict[str, Any] = dict(
+        kw = dict(
             fg_color="transparent",
             hover_color=p.bg_card,
             text_color=p.text_secondary,
@@ -189,49 +264,64 @@ def make_button(parent: Any, text: str, command: Any = None, style: str = "prima
             border_width=1,
         )
     else:  # ghost
-        kw: dict[str, Any] = dict(
+        kw = dict(
             fg_color="transparent",
             hover_color=p.bg_card,
             text_color=p.text_secondary,
             border_color=p.bg_sidebar,
             border_width=0,
         )
+
     kw.update(overrides)
-    return ctk.CTkButton(
-        parent, text=text, command=command,
-        corner_radius=kw.pop("corner_radius", BUTTON_CORNER_RADIUS),  # type: ignore[arg-type]
-        font=kw.pop("font", _font),  # type: ignore[arg-type]
-        **kw,  # type: ignore[arg-type]
+
+    btn_args: dict[str, Any] = dict(
+        text=text,
+        command=command,
+        corner_radius=kw.pop("corner_radius", BUTTON_CORNER_RADIUS),
+        font=kw.pop("font", _font),
     )
+    if image is not None:
+        btn_args["image"] = image
+        btn_args["compound"] = "left"
+
+    return ctk.CTkButton(parent, **btn_args, **kw)
 
 
 def make_label(parent: Any, text: str, level: str = "body", **overrides: Any) -> Any:
-    # level: "heading", "subheading", "body", "small", "muted", "section"
+    """Themed label.
+
+    Levels: ``heading`` / ``subheading`` / ``section`` / ``body`` /
+    ``small`` / ``tiny`` / ``muted``.
+    """
     if ctk is None:
         import tkinter as _tk
         return _tk.Label(parent, text=text)
     p = get()
-    font_map = {
-        "heading":    (FONT_HEADING[1],    FONT_HEADING[2] if len(FONT_HEADING) > 2 else "normal"),
-        "subheading": (FONT_SUBHEADING[1], FONT_SUBHEADING[2] if len(FONT_SUBHEADING) > 2 else "normal"),
+
+    font_map: dict[str, tuple[int, str]] = {
+        "heading":    (FONT_HEADING[1],    "bold"),
+        "subheading": (FONT_SUBHEADING[1], "bold"),
+        "section":    (FONT_SECTION[1],    "bold"),
         "body":       (FONT_BODY[1],       "normal"),
         "small":      (FONT_SMALL[1],      "normal"),
+        "tiny":       (FONT_TINY[1],       "normal"),
         "muted":      (FONT_SMALL[1],      "normal"),
-        "section":    (FONT_TINY[1],       "bold"),
     }
     size, weight = font_map.get(level, font_map["body"])
-    color_map = {
+
+    color_map: dict[str, str] = {
         "heading":    p.text_primary,
         "subheading": p.text_primary,
+        "section":    p.text_muted,
         "body":       p.text_secondary,
         "small":      p.text_secondary,
+        "tiny":       p.text_muted,
         "muted":      p.text_muted,
-        "section":    p.text_muted,
     }
     text_color = color_map.get(level, p.text_secondary)
     display_text = text.upper() if level == "section" else text
 
-    _font = ctk.CTkFont(family=FONT_FAMILY, size=size, weight=weight)  # type: ignore[arg-type]
+    _font = ctk.CTkFont(family=FONT_FAMILY, size=size, weight=weight)
     overrides.setdefault("anchor", "w")
     return ctk.CTkLabel(
         parent,
@@ -243,6 +333,7 @@ def make_label(parent: Any, text: str, level: str = "body", **overrides: Any) ->
 
 
 def make_entry(parent: Any, **overrides: Any) -> Any:
+    """Themed text entry."""
     if ctk is None:
         import tkinter as _tk
         return _tk.Entry(parent)
@@ -262,6 +353,7 @@ def make_entry(parent: Any, **overrides: Any) -> Any:
 
 
 def make_divider(parent: Any, orientation: str = "horizontal") -> Any:
+    """Thin coloured divider line."""
     if ctk is None:
         import tkinter as _tk
         return _tk.Frame(parent, height=1, bg="#555555")

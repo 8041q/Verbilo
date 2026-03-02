@@ -15,6 +15,17 @@ Translate Word documents, Excel spreadsheets, and PDFs into any of 130+ language
 - **130+ languages** — full Google Translate language list with a searchable dropdown in the GUI
 - **Fast** — all text is collected and sent in batches rather than one request per word/cell, cutting translation time from ~10 minutes to under a minute for most files
 
+## UI / Visual updates
+
+The GUI has been refreshed for a more consistent, modern appearance.
+Icons are now loaded centrally via the open-source Tabler Icons wrapper `pytablericons`; install it (and Pillow) to render icons in the app:
+
+```bash
+pip install pytablericons Pillow
+```
+
+Credits: Tabler Icons / pytablericons — https://pypi.org/project/pytablericons/
+
 ---
 
 ## Requirements
@@ -142,13 +153,10 @@ The full list of 130+ supported codes is shown in the GUI dropdown.
 
 ---
 
----
-
 ## Future Implementations
 
 - **Settings:** Add an option in the settings to check for updates and include a GitHub / About info page for easy access to source, release notes and credits.
-- **Language dropdown:** Move the search field into the dropdown box itself (so users can search within the opened list) and set the default target language to English.
-- **Icons:** Refresh and add icons (app, toolbar, file-type) across the UI for a more cohesive visual identity.
+
 - **Names & titles:** Update UI names and titles throughout the app for clearer, consistent labeling (configurable where appropriate).
 
 ## License

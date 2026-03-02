@@ -17,6 +17,7 @@ except Exception:
 from . import gui_theme as theme
 from .gui_helpers import Worker, list_supported_files, center_window
 from .gui_config import load_config, save_config
+from .icons import get_icon, get_photo_image, get_app_icon
 
 logger = logging.getLogger(__name__)
 
@@ -115,227 +116,309 @@ def _get_language_options() -> list[tuple[str, str]]:
 
 # --- searchable dropdown ---
 
-_ComboBoxBase = ctk.CTkFrame if ctk else tk.Frame
 
-# themed searchable dropdown — click to open a filtered popup listbox
-class SearchableComboBox(_ComboBoxBase):  # type: ignore[misc]
+class SearchableComboBox:
+    """Entry + scrollable Toplevel listbox.
 
-    def __init__(self, parent, values: list[str], variable: tk.StringVar,
-                 width: int = 28, **kw):
+    - Click / Tab focus → selects all text, opens dropdown.
+    - Type → filters list live and keeps dropdown open.
+    - Click list item or Enter → confirms, closes.
+    - Click outside, Escape, or focus-out → reverts to last valid, closes.
+    """
+
+    _POPUP_ROWS = 8  # max visible rows before scrolling
+
+    def __init__(self, parent, values, variable, **kw):
         p = theme.get()
-        if ctk:
-            super().__init__(parent, fg_color="transparent", **kw)
-        else:
-            super().__init__(parent, **kw)
-
-        self._values = values
+        self._parent = parent
+        self._all_values = list(values)
         self._variable = variable
-        self._popup: tk.Toplevel | None = None
+        self._last_valid = variable.get() or (values[0] if values else "")
+        self._popup = None
+        # Auto-clears after a short delay so a stale True never blocks reopening.
+        self._suppress_open = False
 
-        # --- Display row (looks like a dropdown selector) ---
-        display_font = (theme.FONT_FAMILY, theme.FONT_BODY[1])
-        arrow_font = (theme.FONT_FAMILY, theme.FONT_SMALL[1])
+        # Styled outer frame
+        self._frame = ctk.CTkFrame(
+            parent,
+            fg_color=p.bg_input,
+            corner_radius=theme.BUTTON_CORNER_RADIUS,
+            border_width=1,
+            border_color=p.border,
+        ) if ctk else tk.Frame(parent)
+        self._frame.grid_columnconfigure(0, weight=1)
 
-        self._display = tk.Label(
-            self,
-            text=variable.get() or (values[0] if values else ""),
-            anchor="w", padx=8, pady=5,
-            font=display_font,
-            bg=p.bg_input, fg=p.text_secondary,
-            relief="flat", borderwidth=0,
-            cursor="hand2",
+        _font = ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]) if ctk else None
+
+        # Entry (display + search input)
+        self._var = tk.StringVar(value=self._last_valid)
+        self._entry = ctk.CTkEntry(
+            self._frame,
+            textvariable=self._var,
+            fg_color="transparent",
+            border_width=0,
+            font=_font,
+            text_color=p.text_secondary,
+            height=32,
+        ) if ctk else tk.Entry(self._frame, textvariable=self._var)
+        self._entry.grid(row=0, column=0, sticky="ew", padx=(6, 0))
+
+        # Arrow button
+        arrow_img = get_icon("chevron-down", size=14)
+        btn_kw = dict(
+            master=self._frame, width=28, height=28,
+            fg_color="transparent", hover_color=p.bg_card,
+            corner_radius=4, command=self._on_arrow,
         )
-        self._display.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        if arrow_img and ctk:
+            self._btn = ctk.CTkButton(text="", image=arrow_img, **btn_kw)
+        elif ctk:
+            self._btn = ctk.CTkButton(
+                text="\u25BC",
+                font=ctk.CTkFont(family=theme.FONT_FAMILY, size=10),
+                text_color=p.text_muted, **btn_kw,
+            )
+        else:
+            self._btn = tk.Button(self._frame, text="\u25BC", command=self._on_arrow)
+        self._btn.grid(row=0, column=1, padx=(0, 2), pady=2)
 
-        self._arrow = tk.Label(
-            self,
-            text="\u25bc",
-            font=arrow_font,
-            bg=p.bg_input, fg=p.text_muted,
-            relief="flat", borderwidth=0,
-            padx=6, pady=5,
-            cursor="hand2",
-        )
-        self._arrow.pack(side=tk.RIGHT)
+        # Get the inner tk.Entry for select_range / low-level bindings
+        self._tk_entry = self._entry
+        if ctk and isinstance(self._entry, ctk.CTkEntry):
+            for child in self._entry.winfo_children():
+                if isinstance(child, tk.Entry):
+                    self._tk_entry = child
+                    break
 
-        self._display.bind("<Button-1>", lambda e: self._toggle_popup())
-        self._arrow.bind("<Button-1>", lambda e: self._toggle_popup())
+        self._tk_entry.bind("<FocusIn>",    self._on_focus_in)
+        self._tk_entry.bind("<Button-1>",   self._on_click, "+")
+        self._tk_entry.bind("<KeyRelease>", self._on_key)
+        self._tk_entry.bind("<FocusOut>",   self._on_focus_out)
+        self._tk_entry.bind("<Return>",     self._on_enter)
+        self._tk_entry.bind("<Escape>",     self._on_escape)
+        self._tk_entry.bind("<Down>",       self._focus_list)
 
-    def get(self) -> str:
-        return self._display.cget("text")
+        # Root-level click to close on non-focusable area clicks
+        self._frame.after(200, self._bind_root_click)
 
-    def set(self, value: str):
-        self._display.configure(text=value)
+    # -- Geometry passthrough ------------------------------------------
+
+    def grid(self, **kw):  self._frame.grid(**kw)
+    def pack(self, **kw):  self._frame.pack(**kw)
+    def place(self, **kw): self._frame.place(**kw)
+
+    # -- Public API ----------------------------------------------------
+
+    def get(self):
+        return self._last_valid
+
+    def set(self, value):
+        self._last_valid = value
+        self._var.set(value)
         self._variable.set(value)
 
     def refresh_colors(self):
-        p = theme.get()
-        self._display.configure(bg=p.bg_input, fg=p.text_secondary)
-        self._arrow.configure(bg=p.bg_input, fg=p.text_muted)
+        pass
 
-    def _toggle_popup(self):
+    # -- Entry event handlers ------------------------------------------
+
+    def _on_focus_in(self, _event=None):
+        """Tab / programmatic focus: select-all and open."""
+        if self._suppress_open:
+            return
+        self._select_all()
+        self._open()
+
+    def _on_click(self, _event=None):
+        """Mouse click on entry (entry may already have focus)."""
+        if self._suppress_open:
+            return
+        self._select_all()
+        self._open()
+
+    def _on_key(self, event=None):
+        """Live filter + open/refresh popup on each keystroke."""
+        if event and event.keysym in (
+            "Shift_L", "Shift_R", "Control_L", "Control_R",
+            "Alt_L", "Alt_R", "Caps_Lock", "Return", "Escape",
+            "Up", "Down", "Left", "Right", "Tab",
+        ):
+            return
+        query = self._var.get().lower()
+        filtered = [v for v in self._all_values if query in v.lower()] if query else self._all_values
+        display = filtered if filtered else self._all_values
         if self._popup and self._popup.winfo_exists():
-            self._close_popup()
+            self._populate(display)
         else:
-            self._open_popup()
+            self._open(display)
 
-    def _open_popup(self):
+    def _on_focus_out(self, _event=None):
+        """Delay so a listbox click can land before we validate."""
+        self._frame.after(150, self._validate_or_revert)
+
+    def _on_enter(self, _event=None):
+        if self._popup and self._popup.winfo_exists() and hasattr(self, "_listbox"):
+            sel = self._listbox.curselection()
+            self._confirm(self._listbox.get(sel[0] if sel else 0))
+        else:
+            self._validate_or_revert()
+
+    def _on_escape(self, _event=None):
+        self._revert()
+
+    def _focus_list(self, _event=None):
+        if self._popup and self._popup.winfo_exists() and hasattr(self, "_listbox"):
+            self._listbox.focus_set()
+            if not self._listbox.curselection() and self._listbox.size():
+                self._listbox.selection_set(0)
+                self._listbox.activate(0)
+
+    def _on_arrow(self):
         if self._popup and self._popup.winfo_exists():
-            self._popup.destroy()
+            self._revert()
+        else:
+            self._open()
+            self._select_all()
+
+    # -- Root click detection ------------------------------------------
+
+    def _bind_root_click(self):
+        try:
+            self._frame.winfo_toplevel().bind("<Button-1>", self._root_click, "+")
+        except Exception:
+            pass
+
+    def _root_click(self, event):
+        if not (self._popup and self._popup.winfo_exists()):
+            return
+        # If click is inside our frame OR popup -> leave open
+        for container in (self._frame, self._popup):
+            w = event.widget
+            while w is not None:
+                if w is container:
+                    return
+                w = getattr(w, "master", None)
+        self._revert()
+
+    # -- Popup ---------------------------------------------------------
+
+    def _open(self, items=None):
+        if items is None:
+            items = self._all_values
+        if self._popup and self._popup.winfo_exists():
+            self._populate(items)
+            return
 
         p = theme.get()
-        self._popup = tk.Toplevel(self)
+        self._popup = tk.Toplevel(self._frame)
         self._popup.wm_overrideredirect(True)
         self._popup.wm_attributes("-topmost", True)
 
-        self.update_idletasks()
-        x = self._display.winfo_rootx()
-        y = self._display.winfo_rooty() + self._display.winfo_height()
-        w = self._display.winfo_width() + self._arrow.winfo_width()
-
-        popup_frame = tk.Frame(
+        outer = tk.Frame(
             self._popup, bg=p.bg_popup,
             highlightbackground=p.border, highlightthickness=1,
         )
-        popup_frame.pack(fill=tk.BOTH, expand=True)
+        outer.pack(fill="both", expand=True)
 
-        # --- Search entry ---
-        search_frame = tk.Frame(popup_frame, bg=p.bg_popup)
-        search_frame.pack(fill=tk.X, padx=6, pady=(6, 3))
-
-        tk.Label(
-            search_frame, text="\U0001F50D", bg=p.bg_popup,
-            fg=p.text_muted, font=(theme.FONT_FAMILY, theme.FONT_TINY[1]),
-        ).pack(side=tk.LEFT, padx=(2, 0))
-
-        self._search_var = tk.StringVar()
-        self._search_entry = tk.Entry(
-            search_frame, textvariable=self._search_var,
-            font=(theme.FONT_FAMILY, theme.FONT_BODY[1]),
-            bg=p.bg_input, fg=p.text_secondary,
-            insertbackground=p.text_secondary,
-            relief="flat", borderwidth=2,
-        )
-        self._search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
-
-        # --- Separator ---
-        tk.Frame(popup_frame, height=1, bg=p.divider).pack(fill=tk.X, padx=6)
-
-        # --- Scrollable listbox ---
-        list_frame = tk.Frame(popup_frame, bg=p.bg_popup)
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(3, 6))
-
-        scrollbar = tk.Scrollbar(list_frame, orient=tk.VERTICAL)
+        scrollbar = tk.Scrollbar(outer, orient="vertical")
         self._listbox = tk.Listbox(
-            list_frame,
-            width=0,
-            height=min(10, max(4, len(self._values))),
+            outer,
             yscrollcommand=scrollbar.set,
+            height=self._POPUP_ROWS,
             font=(theme.FONT_FAMILY, theme.FONT_BODY[1]),
             activestyle="none",
             selectbackground=p.accent,
             selectforeground=p.text_on_accent,
             bg=p.bg_popup, fg=p.text_secondary,
-            relief="flat", borderwidth=0,
-            highlightthickness=0,
+            relief="flat", borderwidth=0, highlightthickness=0,
         )
         scrollbar.config(command=self._listbox.yview)
-        self._listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._listbox.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
+        scrollbar.pack(side="right", fill="y", pady=4, padx=(0, 2))
 
-        self._populate_listbox(self._values)
+        self._listbox.bind("<ButtonRelease-1>", self._on_list_select)
+        self._listbox.bind("<Return>",          self._on_list_select)
+        self._listbox.bind("<Escape>",          self._on_escape)
+        self._listbox.bind("<FocusOut>",        self._on_focus_out)
 
-        current = self.get()
-        if current in self._values:
-            idx = self._values.index(current)
-            self._listbox.selection_set(idx)
-            self._listbox.see(idx)
+        self._populate(items)
 
-        # Bindings
-        self._search_var.trace_add("write", self._on_search_changed)
-        self._search_entry.bind("<Return>", self._on_search_enter)
-        self._search_entry.bind("<Escape>", self._close_popup)
-        self._search_entry.bind("<Down>", self._focus_listbox)
-        self._listbox.bind("<ButtonRelease-1>", self._on_select)
-        self._listbox.bind("<Return>", self._on_select)
-        self._listbox.bind("<Escape>", self._close_popup)
-
-        row_h = 22
-        list_rows = min(10, max(4, len(self._values)))
-        popup_h = min(340, list_rows * row_h + 50)
-        self._popup.geometry(f"{w}x{popup_h}+{x}+{y}")
-
-        self._search_entry.focus_set()
-        self._popup.bind("<FocusOut>", self._on_popup_focus_out)
-
-    def _populate_listbox(self, items: list[str]):
+    def _populate(self, items):
         self._listbox.delete(0, tk.END)
         for item in items:
             self._listbox.insert(tk.END, item)
-        self._filtered = items
+        if self._last_valid in items:
+            idx = items.index(self._last_valid)
+            self._listbox.selection_set(idx)
+            self._listbox.see(idx)
+        self._position_popup()
 
-    def _on_search_changed(self, *_args):
-        query = self._search_var.get().lower()
-        if query:
-            filtered = [v for v in self._values if query in v.lower()]
-        else:
-            filtered = self._values
-        self._populate_listbox(filtered if filtered else self._values)
-        if self._listbox.size() > 0:
-            self._listbox.selection_set(0)
-            self._listbox.see(0)
+    def _position_popup(self):
+        self._frame.update_idletasks()
+        x = self._frame.winfo_rootx()
+        y = self._frame.winfo_rooty() + self._frame.winfo_height() + 2
+        w = self._frame.winfo_width()
+        rows = min(self._POPUP_ROWS, max(1, self._listbox.size()))
+        row_px = theme.FONT_BODY[1] + 10
+        h = rows * row_px + 8
+        self._popup.geometry(f"{w}x{h}+{x}+{y}")
 
-    def _focus_listbox(self, event=None):
-        if self._popup and self._popup.winfo_exists() and hasattr(self, "_listbox"):
-            self._listbox.focus_set()
-            if self._listbox.size() > 0 and not self._listbox.curselection():
-                self._listbox.selection_set(0)
-                self._listbox.activate(0)
+    # -- Selection / validation ----------------------------------------
 
-    def _on_search_enter(self, event=None):
-        if hasattr(self, "_listbox") and self._listbox.size() > 0:
+    def _on_list_select(self, _event=None):
+        if hasattr(self, "_listbox"):
             sel = self._listbox.curselection()
-            idx = sel[0] if sel else 0
-            value = self._listbox.get(idx)
-            self.set(value)
-        self._close_popup()
+            if sel:
+                self._confirm(self._listbox.get(sel[0]))
 
-    def _on_select(self, event=None):
-        if not hasattr(self, "_listbox"):
-            return
-        sel = self._listbox.curselection()
-        if sel:
-            value = self._listbox.get(sel[0])
-            self.set(value)
-        self._close_popup()
+    def _confirm(self, value):
+        self._last_valid = value
+        self._var.set(value)
+        self._variable.set(value)
+        self._close(suppress_ms=150)
+        try:
+            self._frame.master.focus_set()
+        except Exception:
+            pass
 
-    def _close_popup(self, event=None):
+    def _validate_or_revert(self):
+        # Don't act if focus moved into the popup
+        try:
+            focused = self._frame.focus_get()
+            if focused and self._popup and self._popup.winfo_exists():
+                if str(focused).startswith(str(self._popup)):
+                    return
+        except Exception:
+            pass
+        current = self._var.get().strip()
+        if current in self._all_values:
+            self._last_valid = current
+            self._variable.set(current)
+            self._close()
+        else:
+            self._revert()
+
+    def _revert(self):
+        self._var.set(self._last_valid)
+        self._variable.set(self._last_valid)
+        self._close(suppress_ms=150)
+
+    def _close(self, suppress_ms=0):
         if self._popup and self._popup.winfo_exists():
             self._popup.destroy()
         self._popup = None
+        if suppress_ms:
+            self._suppress_open = True
+            self._frame.after(suppress_ms, lambda: setattr(self, "_suppress_open", False))
 
-    def _on_popup_focus_out(self, event=None):
-        self.after(150, self._maybe_close)
+    # -- Helpers -------------------------------------------------------
 
-    def _maybe_close(self):
+    def _select_all(self):
         try:
-            focused = self.focus_get()
-            if focused is None:
-                self._close_popup()
-                return
-            if self._popup and self._popup.winfo_exists():
-                try:
-                    if str(focused).startswith(str(self._popup)):
-                        return
-                except Exception:
-                    pass
-                if hasattr(self, "_search_entry") and focused == self._search_entry:
-                    return
-                if hasattr(self, "_listbox") and focused == self._listbox:
-                    return
-            self._close_popup()
+            self._tk_entry.select_range(0, tk.END)
+            self._tk_entry.icursor(tk.END)
         except Exception:
-            self._close_popup()
+            pass
 
 
 # --- main app ---
@@ -442,16 +525,21 @@ class App:
 
         row = 0
 
-        # App title
+        # App title with icon
+        title_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        title_frame.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(PAD, PAD + 8))
+        lang_icon = get_icon("language", size=24)
+        if lang_icon:
+            ctk.CTkLabel(title_frame, text="", image=lang_icon, width=24).pack(side=tk.LEFT, padx=(0, 8))
         theme.make_label(
-            self.sidebar, "Verbilo", level="heading",
-        ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(PAD, PAD * 2))
+            title_frame, "Verbilo", level="heading",
+        ).pack(side=tk.LEFT)
         row += 1
 
         # TRANSLATION section
         theme.make_label(
             self.sidebar, "Translation", level="section",
-        ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(0, 4))
+        ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(0, 6))
         row += 1
 
         # Source language
@@ -474,28 +562,29 @@ class App:
         self.source_lang_box = SearchableComboBox(
             self.sidebar, source_values, self.source_lang_var,
         )
-        self.source_lang_box.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 4))
+        self.source_lang_box.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 6))
         row += 1
 
         # Target language
         theme.make_label(
             self.sidebar, "Target language", level="small",
-        ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(8, 2))
+        ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(6, 2))
         row += 1
 
-        self.lang_var = tk.StringVar(
-            value=display_values[0] if display_values else "English (en)",
-        )
+        default_target = "English (en)"
+        if default_target not in display_values and display_values:
+            default_target = display_values[0]
+        self.lang_var = tk.StringVar(value=default_target)
         self.target_lang_box = SearchableComboBox(
             self.sidebar, display_values, self.lang_var,
         )
-        self.target_lang_box.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 4))
+        self.target_lang_box.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 6))
         row += 1
 
         # Translator
         theme.make_label(
             self.sidebar, "Translator", level="small",
-        ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(8, 2))
+        ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(6, 2))
         row += 1
 
         self.translator_var = tk.StringVar(value="auto")
@@ -513,8 +602,9 @@ class App:
             font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]),
             dropdown_font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]),
             corner_radius=theme.BUTTON_CORNER_RADIUS,
+            height=32,
         )
-        self.translator_menu.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 4))
+        self.translator_menu.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 6))
         row += 1
 
         # Divider
@@ -526,20 +616,22 @@ class App:
         # OUTPUT section
         theme.make_label(
             self.sidebar, "Output", level="section",
-        ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(0, 4))
+        ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(0, 6))
         row += 1
 
         theme.make_label(
             self.sidebar, "Output folder", level="small",
-        ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(4, 2))
+        ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(2, 2))
         row += 1
 
-        self.output_entry = theme.make_entry(self.sidebar)
+        self.output_entry = theme.make_entry(self.sidebar, height=32)
         self.output_entry.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 4))
         row += 1
 
+        browse_icon = get_icon("folder", size=16, on_accent=False)
         theme.make_button(
-            self.sidebar, "Browse\u2026", command=self._select_output, style="secondary",
+            self.sidebar, "Browse", command=self._select_output, style="secondary",
+            image=browse_icon, height=30,
         ).grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 8))
         row += 1
 
@@ -550,16 +642,18 @@ class App:
         row += 1
 
         # Action buttons
+        play_icon = get_icon("play", size=16, on_accent=True)
         self.start_btn = theme.make_button(
-            self.sidebar, "\u25b6  Start Translation", command=self._start, style="primary",
-            height=36,
+            self.sidebar, "Start Translation", command=self._start, style="primary",
+            height=38, image=play_icon,
         )
         self.start_btn.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(8, 4))
         row += 1
 
+        stop_icon = get_icon("stop", size=16)
         self.cancel_btn = theme.make_button(
             self.sidebar, "Cancel", command=self._cancel, style="secondary",
-            height=32, state="disabled",
+            height=32, state="disabled", image=stop_icon,
         )
         self.cancel_btn.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 4))
         row += 1
@@ -574,9 +668,10 @@ class App:
         )
         row += 1
 
+        settings_icon = get_icon("settings", size=16)
         theme.make_button(
-            self.sidebar, "\u2699  Settings", command=self._open_settings, style="ghost",
-            anchor="w",
+            self.sidebar, "Settings", command=self._open_settings, style="ghost",
+            anchor="w", image=settings_icon,
         ).grid(row=row, column=0, sticky="ew", padx=PAD, pady=(4, PAD))
 
     # --- content area ---
@@ -601,19 +696,26 @@ class App:
         toolbar.grid_columnconfigure(0, weight=1)
 
         theme.make_label(toolbar, "Files", level="subheading").grid(
-            row=0, column=0, sticky="w", padx=PAD, pady=6,
+            row=0, column=0, sticky="w", padx=PAD, pady=8,
         )
         btn_frame = ctk.CTkFrame(toolbar, fg_color="transparent")
-        btn_frame.grid(row=0, column=1, sticky="e", padx=PAD, pady=6)
+        btn_frame.grid(row=0, column=1, sticky="e", padx=PAD, pady=8)
+
+        add_icon = get_icon("add-file", size=16, on_accent=True)
+        folder_icon = get_icon("open-folder", size=16, on_accent=True)
+        trash_icon = get_icon("trash", size=16)
 
         theme.make_button(
             btn_frame, "Add Files", command=self._add_files, style="primary",
-        ).pack(side=tk.LEFT, padx=(0, 8))
+            image=add_icon, height=30,
+        ).pack(side=tk.LEFT, padx=(0, 6))
         theme.make_button(
             btn_frame, "Select Folder", command=self._select_folder, style="primary",
-        ).pack(side=tk.LEFT, padx=(0, 8))
+            image=folder_icon, height=30,
+        ).pack(side=tk.LEFT, padx=(0, 6))
         theme.make_button(
             btn_frame, "Clear", command=self._clear_files, style="secondary",
+            image=trash_icon, height=30,
         ).pack(side=tk.LEFT)
 
         # File table card
@@ -627,7 +729,7 @@ class App:
         progress_card.grid_columnconfigure(0, weight=1)
 
         self.progress_label = theme.make_label(
-            progress_card, "Ready", level="body",
+            progress_card, "Ready", level="small",
         )
         self.progress_label.grid(
             row=0, column=0, sticky="w", padx=PAD, pady=(10, 4),
@@ -637,8 +739,8 @@ class App:
             progress_card,
             progress_color=p.accent,
             fg_color=p.bg_main,
-            corner_radius=6,
-            height=10,
+            corner_radius=4,
+            height=8,
         )
         self.progress.grid(row=1, column=0, sticky="ew", padx=PAD, pady=(0, 10))
         self._set_progress(0.0)
@@ -658,7 +760,7 @@ class App:
             fg_color=p.bg_main,
             text_color=p.text_secondary,
             font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_SMALL[1]),
-            corner_radius=8,
+            corner_radius=6,
             border_width=0,
             wrap="word",
             activate_scrollbars=True,
@@ -674,11 +776,11 @@ class App:
         style.theme_use("clam")
 
         body_font = (theme.FONT_FAMILY, theme.FONT_BODY[1])
-        heading_font = (theme.FONT_FAMILY, theme.FONT_BODY[1], "bold")
+        heading_font = (theme.FONT_FAMILY, theme.FONT_SMALL[1], "bold")
 
         style.configure(
             "FileTable.Treeview",
-            rowheight=30,
+            rowheight=32,
             font=body_font,
             background=p.bg_card,
             foreground=p.text_secondary,
@@ -689,9 +791,10 @@ class App:
             "FileTable.Treeview.Heading",
             font=heading_font,
             background=p.bg_heading,
-            foreground=p.text_secondary,
+            foreground=p.text_muted,
             borderwidth=0,
             relief="flat",
+            padding=(8, 6),
         )
         style.map(
             "FileTable.Treeview",
@@ -702,6 +805,19 @@ class App:
             "FileTable.Treeview.Heading",
             background=[("active", p.bg_input)],
         )
+
+        # Load file-type icons for the treeview (PhotoImage for ttk)
+        icon_color = p.text_muted
+        self._file_icons: dict[str, object] = {}
+        for ext, icon_name in ((".docx", "file-docx"), (".pdf", "file-pdf"),
+                                (".xlsx", "file-xls"), (".xls", "file-xls")):
+            img = get_photo_image(icon_name, size=18, color=icon_color)
+            if img:
+                self._file_icons[ext] = img
+        # Fallback icon
+        fallback = get_photo_image("file", size=18, color=icon_color)
+        if fallback:
+            self._file_icons["_default"] = fallback
 
         container = tk.Frame(parent, bg=p.bg_card)
         container.pack(
@@ -740,6 +856,11 @@ class App:
         self.file_table.tag_configure("even", background=p.bg_row_even)
         self.file_table.tag_configure("odd",  background=p.bg_row_odd)
 
+    def _get_file_icon(self, filepath: str):
+        """Return the appropriate PhotoImage icon for a file extension."""
+        ext = Path(filepath).suffix.lower()
+        return self._file_icons.get(ext, self._file_icons.get("_default"))
+
     # --- table helpers ---
 
     def _add_file_to_table(self, filepath: str, status: str = "pending"):
@@ -747,8 +868,12 @@ class App:
         name = os.path.basename(filepath)
         idx = len(self.files) - 1
         row_tag = "even" if idx % 2 == 0 else "odd"
+        icon = self._get_file_icon(filepath)
+        kw: dict[str, object] = {}
+        if icon:
+            kw["image"] = icon
         iid = self.file_table.insert(
-            "", tk.END, text=name, values=(status, ""), tags=(status, row_tag),
+            "", tk.END, text=f"  {name}", values=(status, ""), tags=(status, row_tag), **kw,
         )
         self._tree_ids[iid] = filepath
         self._file_to_iid[filepath] = iid
@@ -796,15 +921,18 @@ class App:
         card.grid(row=0, column=0, sticky="nsew", padx=PAD, pady=PAD)
         card.grid_columnconfigure(1, weight=1)
 
-        theme.make_label(card, "Settings", level="heading").grid(
-            row=0, column=0, columnspan=3, sticky="w", padx=PAD, pady=(PAD, PAD),
-        )
+        settings_icon = get_icon("settings", size=20)
+        title_frame = ctk.CTkFrame(card, fg_color="transparent")
+        title_frame.grid(row=0, column=0, columnspan=3, sticky="w", padx=PAD, pady=(PAD, PAD))
+        if settings_icon:
+            ctk.CTkLabel(title_frame, text="", image=settings_icon, width=20).pack(side=tk.LEFT, padx=(0, 8))
+        theme.make_label(title_frame, "Settings", level="heading").pack(side=tk.LEFT)
 
         # Default input folder
-        theme.make_label(card, "Default input folder:", level="body").grid(
+        theme.make_label(card, "Default input folder", level="small").grid(
             row=1, column=0, sticky="w", padx=PAD, pady=(0, 6),
         )
-        in_entry = theme.make_entry(card)
+        in_entry = theme.make_entry(card, height=32)
         in_entry.grid(row=1, column=1, sticky="ew", padx=4, pady=(0, 6))
         in_entry.insert(0, self.cfg.get("default_input", ""))
 
@@ -815,15 +943,17 @@ class App:
                 in_entry.delete(0, tk.END)
                 in_entry.insert(0, d)
 
-        theme.make_button(card, "Browse", command=_browse_default_input, style="secondary").grid(
+        browse_icon_s = get_icon("folder", size=14)
+        theme.make_button(card, "Browse", command=_browse_default_input, style="secondary",
+                          image=browse_icon_s, height=28).grid(
             row=1, column=2, padx=(4, PAD), pady=(0, 6),
         )
 
         # Default output folder
-        theme.make_label(card, "Default output folder:", level="body").grid(
+        theme.make_label(card, "Default output folder", level="small").grid(
             row=2, column=0, sticky="w", padx=PAD, pady=(0, 6),
         )
-        out_entry = theme.make_entry(card)
+        out_entry = theme.make_entry(card, height=32)
         out_entry.grid(row=2, column=1, sticky="ew", padx=4, pady=(0, 6))
         out_entry.insert(0, self.cfg.get("default_output", ""))
 
@@ -834,12 +964,13 @@ class App:
                 out_entry.delete(0, tk.END)
                 out_entry.insert(0, d)
 
-        theme.make_button(card, "Browse", command=_browse_default_output, style="secondary").grid(
+        theme.make_button(card, "Browse", command=_browse_default_output, style="secondary",
+                          image=browse_icon_s, height=28).grid(
             row=2, column=2, padx=(4, PAD), pady=(0, 6),
         )
 
         # Appearance mode toggle
-        theme.make_label(card, "Appearance:", level="body").grid(
+        theme.make_label(card, "Appearance", level="small").grid(
             row=3, column=0, sticky="w", padx=PAD, pady=(8, 4),
         )
 
@@ -865,25 +996,17 @@ class App:
         mode_switch_var.trace_add("write", _on_mode_switch)
 
         # Restart note
-        tk.Label(
-            card,
-            text="Appearance changes require a restart to take effect.",
-            font=(theme.FONT_FAMILY, theme.FONT_SMALL[1] - 1),
-            fg=p.text_muted,
-            bg=p.bg_card,
-            anchor="w",
+        theme.make_label(
+            card, "Appearance changes require a restart to take effect.",
+            level="tiny",
         ).grid(row=4, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 8))
 
         # Inline validation error
-        error_label = tk.Label(
-            card,
-            text="",
-            font=(theme.FONT_FAMILY, theme.FONT_SMALL[1]),
-            fg=p.status_error,
-            bg=p.bg_card,
-            anchor="w",
+        self._settings_error = theme.make_label(
+            card, "", level="tiny",
+            text_color=p.status_error,
         )
-        error_label.grid(row=5, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 2))
+        self._settings_error.grid(row=5, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 2))
 
         # Button row
         btn_frame = ctk.CTkFrame(card, fg_color="transparent")
@@ -893,9 +1016,9 @@ class App:
             inp = in_entry.get().strip()
             out = out_entry.get().strip()
             if not inp or not out:
-                error_label.configure(text="Input or Output path cannot be empty")
+                self._settings_error.configure(text="Input or Output path cannot be empty")
                 return
-            error_label.configure(text="")
+            self._settings_error.configure(text="")
             self.cfg["default_input"] = inp
             self.cfg["default_output"] = out
             new_mode = "Dark" if mode_switch_var.get() else "Light"
@@ -903,10 +1026,12 @@ class App:
             save_config(self.cfg)
             win.destroy()
 
-        theme.make_button(btn_frame, "Save", command=_save_and_close, style="primary").pack(
+        theme.make_button(btn_frame, "Save", command=_save_and_close, style="primary",
+                          height=32).pack(
             side=tk.LEFT, padx=(0, 8),
         )
-        theme.make_button(btn_frame, "Cancel", command=win.destroy, style="secondary").pack(
+        theme.make_button(btn_frame, "Cancel", command=win.destroy, style="secondary",
+                          height=32).pack(
             side=tk.LEFT,
         )
 
@@ -1139,7 +1264,25 @@ def main():
         )
         return
 
+    # DPI awareness (must be called before creating the root window on Windows)
+    theme.init_dpi()
+
     root = ctk.CTk()
+
+    # Finalize DPI scaling now that root exists
+    theme.init_dpi(root)
+
+    # Set app icon (title bar + taskbar)
+    try:
+        from PIL import ImageTk
+        icon_pil = get_app_icon(size=64)
+        if icon_pil:
+            icon_tk = ImageTk.PhotoImage(icon_pil)
+            root.iconphoto(True, icon_tk)
+            root._app_icon_ref = icon_tk  # prevent garbage collection
+    except Exception:
+        pass
+
     app = App(root)  # noqa: F841
     root.mainloop()
 
