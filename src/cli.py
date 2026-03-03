@@ -33,7 +33,6 @@ def main():
         return
     origin = root / "origin"
     output = root / "output"
-    origin.mkdir(parents=True, exist_ok=True)
     output.mkdir(parents=True, exist_ok=True)
 
     supported_exts = (".docx", ".pdf", ".xlsx", ".xls")
