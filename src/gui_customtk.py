@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import os
+import json
+import threading
+import urllib.request
+import urllib.error
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -26,17 +30,20 @@ logger = logging.getLogger(__name__)
 
 # --- version & about constants ---
 
-def _read_version() -> str:
-    """Read the project version from pyproject.toml (stdlib tomllib, Python 3.11+)."""
+def _read_pyproject_meta() -> tuple[str, str]:
+    """Read version and build_date from pyproject.toml. Returns (version, build_date)."""
     try:
         toml_path = Path(__file__).parent.parent / "pyproject.toml"
         with open(toml_path, "rb") as fh:
             data = tomllib.load(fh)
-        return data["tool"]["poetry"]["version"]
+        poetry = data.get("tool", {}).get("poetry", {})
+        version = poetry.get("version", "unknown")
+        build_date = poetry.get("build_date", "unknown")
+        return version, build_date
     except Exception:
-        return "unknown"
+        return "unknown", "unknown"
 
-APP_VERSION = _read_version()
+APP_VERSION, APP_BUILD_DATE = _read_pyproject_meta()
 
 # Github URLs
 GITHUB_URL = "https://github.com/8041q/Verbilo"
@@ -465,6 +472,11 @@ class App:
 
         self._build_ui()
 
+        # Update check state (populated by background thread on startup)
+        self._update_check_result: dict | None = None
+        if self.cfg.get("auto_check_updates", True):
+            self._run_update_check(startup=True)
+
         # Apply defaults from config
         default_out = self.cfg.get("default_output")
         if default_out:
@@ -691,7 +703,14 @@ class App:
         theme.make_button(
             self.sidebar, "Settings", command=self._open_settings, style="ghost",
             anchor="w", image=settings_icon,
-        ).grid(row=row, column=0, sticky="ew", padx=PAD, pady=(4, PAD))
+        ).grid(row=row, column=0, sticky="ew", padx=PAD, pady=(4, 4))
+        row += 1
+
+        info_icon = get_icon("info", size=16)
+        theme.make_button(
+            self.sidebar, "About", command=self._open_about, style="ghost",
+            anchor="w", image=info_icon,
+        ).grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, PAD))
 
     # --- content area ---
 
@@ -1043,44 +1062,16 @@ class App:
         )
         auto_updates_cb.grid(row=6, column=1, columnspan=2, sticky="w", padx=4, pady=(0, 6))
 
-        # --- About section ---
-        theme.make_divider(card).grid(row=7, column=0, columnspan=3, sticky="ew", padx=PAD, pady=(4, 8))
-
-        theme.make_label(card, "ABOUT", level="section").grid(
-            row=8, column=0, sticky="w", padx=PAD, pady=(0, 4),
-        )
-
-        theme.make_label(card, f"Verbilo  v{APP_VERSION}", level="body").grid(
-            row=8, column=1, columnspan=2, sticky="w", padx=4, pady=(0, 4),
-        )
-
-        about_frame = ctk.CTkFrame(card, fg_color="transparent")
-        about_frame.grid(row=9, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 8))
-
-        def _open_github():
-            if GITHUB_URL:
-                webbrowser.open(GITHUB_URL)
-
-        def _open_releases():
-            if RELEASES_URL:
-                webbrowser.open(RELEASES_URL)
-
-        theme.make_button(about_frame, "View on GitHub", command=_open_github, style="ghost",
-                          height=28).pack(side=tk.LEFT, padx=(0, 6))
-        theme.make_button(about_frame, "Release notes", command=_open_releases, style="ghost",
-                          height=28).pack(side=tk.LEFT, padx=(0, 16))
-        theme.make_label(about_frame, "Made by crt_", level="tiny").pack(side=tk.LEFT)
-
         # Inline validation error
         self._settings_error = theme.make_label(
             card, "", level="tiny",
             text_color=p.status_error,
         )
-        self._settings_error.grid(row=10, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 2))
+        self._settings_error.grid(row=7, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 2))
 
         # Button row
         btn_frame = ctk.CTkFrame(card, fg_color="transparent")
-        btn_frame.grid(row=11, column=0, columnspan=3, pady=(4, PAD))
+        btn_frame.grid(row=8, column=0, columnspan=3, pady=(4, PAD))
 
         def _save_and_close():
             inp = in_entry.get().strip()
@@ -1112,6 +1103,219 @@ class App:
         # Centre the dialog
         win.update_idletasks()
         center_window(win, max(win.winfo_reqwidth(), 520), parent=self.root)
+        try:
+            win.resizable(False, False)
+        except Exception:
+            pass
+
+    # --- update check ---
+
+    def _run_update_check(self, startup: bool = False, callback=None):
+        """Launch a background thread to check for the latest GitHub release."""
+        def _check():
+            result: dict = {"status": "error", "version": None, "url": None}
+            try:
+                api_url = "https://api.github.com/repos/8041q/Verbilo/releases/latest"
+                req = urllib.request.Request(
+                    api_url, headers={"User-Agent": f"Verbilo/{APP_VERSION}"}
+                )
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = json.loads(resp.read().decode())
+                tag = data.get("tag_name", "").lstrip("v")
+                html_url = data.get("html_url", RELEASES_URL)
+                if tag and tag != APP_VERSION:
+                    result = {"status": "update", "version": tag, "url": html_url}
+                else:
+                    result = {"status": "latest", "version": APP_VERSION, "url": None}
+            except Exception:
+                result = {"status": "error", "version": None, "url": None}
+
+            self._update_check_result = result
+            if callback:
+                self.root.after(0, lambda r=result: callback(r))
+            elif not startup and result["status"] == "update":
+                self.root.after(0, lambda r=result: self._show_update_dialog(r))
+
+        threading.Thread(target=_check, daemon=True).start()
+
+    def _show_update_dialog(self, result: dict):
+        """Show a small dialog when a newer release is available."""
+        if result.get("status") != "update":
+            return
+        p = theme.get()
+        PAD = theme.PADDING
+
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title("Update Available")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.configure(fg_color=p.bg_main)
+        dlg.grid_columnconfigure(0, weight=1)
+
+        card = theme.make_card(dlg)
+        card.grid(row=0, column=0, sticky="nsew", padx=PAD, pady=PAD)
+        card.grid_columnconfigure(0, weight=1)
+
+        theme.make_label(
+            card, f"A new version is available: v{result['version']}", level="subheading",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=PAD, pady=(PAD, 4))
+        theme.make_label(
+            card, "Download the latest release from GitHub to update.", level="small",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=PAD, pady=(0, PAD))
+
+        dlg_btn_frame = ctk.CTkFrame(card, fg_color="transparent")
+        dlg_btn_frame.grid(row=2, column=0, columnspan=2, pady=(0, PAD))
+
+        def _download():
+            webbrowser.open(result.get("url") or RELEASES_URL)
+            dlg.destroy()
+
+        theme.make_button(dlg_btn_frame, "Download", command=_download, style="primary",
+                          height=32).pack(side=tk.LEFT, padx=(0, 8))
+        theme.make_button(dlg_btn_frame, "Later", command=dlg.destroy, style="secondary",
+                          height=32).pack(side=tk.LEFT)
+
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        dlg.update_idletasks()
+        center_window(dlg, max(dlg.winfo_reqwidth(), 400), parent=self.root)
+        try:
+            dlg.resizable(False, False)
+        except Exception:
+            pass
+
+    # --- about dialog ---
+
+    def _open_about(self):
+        """Open the standalone About dialog."""
+        p = theme.get()
+        PAD = theme.PADDING
+
+        win = ctk.CTkToplevel(self.root)
+        win.title("About Verbilo")
+        win.transient(self.root)
+        win.grab_set()
+        win.configure(fg_color=p.bg_main)
+        win.grid_columnconfigure(0, weight=1)
+
+        card = theme.make_card(win)
+        card.grid(row=0, column=0, sticky="nsew", padx=PAD, pady=PAD)
+        card.grid_columnconfigure(0, weight=1)
+
+        # --- Brand area ---
+        brand_frame = ctk.CTkFrame(card, fg_color="transparent")
+        brand_frame.grid(row=0, column=0, sticky="ew", padx=PAD, pady=(PAD, 8))
+        brand_frame.grid_columnconfigure(1, weight=1)
+
+        try:
+            pil_img = get_app_icon(size=48)
+            if pil_img is not None and ctk is not None:
+                logo_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(48, 48))
+                ctk.CTkLabel(brand_frame, text="", image=logo_img, width=48).grid(
+                    row=0, column=0, rowspan=2, padx=(0, 12),
+                )
+        except Exception:
+            pass
+
+        theme.make_label(brand_frame, "Verbilo", level="heading").grid(
+            row=0, column=1, sticky="sw",
+        )
+        theme.make_label(brand_frame, "File translation tool", level="small").grid(
+            row=1, column=1, sticky="nw",
+        )
+
+        # --- Version & date ---
+        theme.make_label(card, f"Version   v{APP_VERSION}", level="body").grid(
+            row=1, column=0, sticky="w", padx=PAD, pady=(0, 2),
+        )
+        theme.make_label(card, f"Build date   {APP_BUILD_DATE}", level="body").grid(
+            row=2, column=0, sticky="w", padx=PAD, pady=(0, 2),
+        )
+
+        # --- Copyright ---
+        theme.make_label(
+            card, "\u00a9 2026 crt_  \u2014  Released under the MIT License",
+            level="tiny",
+        ).grid(row=3, column=0, sticky="w", padx=PAD, pady=(0, PAD))
+
+        # --- Divider ---
+        theme.make_divider(card).grid(row=4, column=0, sticky="ew", padx=PAD, pady=(0, 8))
+
+        # --- Check for updates ---
+        check_frame = ctk.CTkFrame(card, fg_color="transparent")
+        check_frame.grid(row=5, column=0, sticky="w", padx=PAD, pady=(0, 4))
+
+        update_status_var = tk.StringVar(value="")
+
+        def _do_check():
+            update_status_var.set("Checking\u2026")
+            check_btn.configure(state="disabled")
+
+            def _on_result(result):
+                check_btn.configure(state="normal")
+                if result["status"] == "update":
+                    update_status_var.set(f"Update available: v{result['version']}")
+                    self._show_update_dialog(result)
+                elif result["status"] == "latest":
+                    update_status_var.set("\u2713  You are up to date")
+                else:
+                    update_status_var.set("Could not check for updates.")
+
+            self._run_update_check(startup=False, callback=_on_result)
+
+        check_btn = theme.make_button(
+            check_frame, "Check for Updates", command=_do_check, style="ghost", height=28,
+        )
+        check_btn.pack(side=tk.LEFT)
+
+        update_status_lbl = theme.make_label(check_frame, "", level="small")
+        update_status_lbl.pack(side=tk.LEFT, padx=(10, 0))
+
+        def _sync_status(*_):
+            val = update_status_var.get()
+            if val.startswith("\u2713"):
+                color = p.status_success
+            elif "Update available" in val:
+                color = p.text_secondary
+            elif "Could not" in val:
+                color = p.status_error
+            else:
+                color = p.text_muted
+            update_status_lbl.configure(text=val, text_color=color)
+
+        update_status_var.trace_add("write", _sync_status)
+
+        # Surface result from an already-completed startup check
+        if self._update_check_result:
+            r = self._update_check_result
+            if r["status"] == "latest":
+                update_status_var.set("\u2713  You are up to date")
+            elif r["status"] == "update":
+                update_status_var.set(f"Update available: v{r['version']}")
+            elif r["status"] == "error":
+                update_status_var.set("Could not check for updates.")
+
+        # --- Divider ---
+        theme.make_divider(card).grid(row=6, column=0, sticky="ew", padx=PAD, pady=(4, 8))
+
+        # --- Links ---
+        links_frame = ctk.CTkFrame(card, fg_color="transparent")
+        links_frame.grid(row=7, column=0, sticky="w", padx=PAD, pady=(0, PAD))
+
+        def _open_github():
+            webbrowser.open(GITHUB_URL)
+
+        def _open_releases():
+            webbrowser.open(RELEASES_URL)
+
+        theme.make_button(links_frame, "View on GitHub", command=_open_github, style="ghost",
+                          height=28).pack(side=tk.LEFT, padx=(0, 6))
+        theme.make_button(links_frame, "Release Notes", command=_open_releases, style="ghost",
+                          height=28).pack(side=tk.LEFT, padx=(0, 16))
+        theme.make_label(links_frame, "Made by crt_", level="tiny").pack(side=tk.LEFT)
+
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        win.update_idletasks()
+        center_window(win, max(win.winfo_reqwidth(), 460), parent=self.root)
         try:
             win.resizable(False, False)
         except Exception:

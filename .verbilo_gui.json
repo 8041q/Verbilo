@@ -1,5 +1,6 @@
 {
   "default_input": "D:/Users/A/Documents/CodeProjects/translator/origin",
   "default_output": "D:/Users/A/Documents/CodeProjects/translator/output",
-  "appearance_mode": "Light"
+  "appearance_mode": "Light",
+  "auto_check_updates": true
 }

@@ -1,4 +1,4 @@
-# Verbilo
+# Verbilo -  Portable
 
 Translate Word documents, Excel spreadsheets, and PDFs into any of 130+ languages while preserving the original formatting — tables, fonts, images, colours, and layout all stay intact.
 

@@ -59,6 +59,9 @@ if OutlineIcon is not None:
         "file-xls":         OutlineIcon.FILE_TYPE_XLS,
         "file-unknown":     OutlineIcon.FILE_UNKNOWN,
         "file":             OutlineIcon.FILE,
+
+        # Info / about
+        "info":             OutlineIcon.INFO_CIRCLE,
     }
 
 
