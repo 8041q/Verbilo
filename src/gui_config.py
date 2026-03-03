@@ -16,7 +16,8 @@ def _config_path() -> Path:
 def load_config() -> Dict[str, Any]:
     p = _config_path()
     if not p.exists():
-        return {}
+        # first-run defaults
+        return {"debug_mode": False}
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception:

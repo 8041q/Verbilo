@@ -1090,7 +1090,7 @@ class App:
             row=7, column=0, sticky="w", padx=PAD, pady=(0, 6),
         )
 
-        debug_var = tk.BooleanVar(value=not bool(self.cfg.get("debug_mode", False)))
+        debug_var = tk.BooleanVar(value=bool(self.cfg.get("debug_mode", False)))
         debug_cb = ctk.CTkCheckBox(
             card,
             text="Debug mode (show debug/info messages)",
@@ -1130,7 +1130,7 @@ class App:
             new_mode = "Dark" if mode_switch_var.get() else "Light"
             self.cfg["appearance_mode"] = new_mode
             self.cfg["auto_check_updates"] = auto_updates_var.get()
-            self.cfg["debug_mode"] = not debug_var.get()
+            self.cfg["debug_mode"] = debug_var.get()
             save_config(self.cfg)
             win.destroy()
 
@@ -1615,9 +1615,6 @@ def main():
 
     app = App(root)  # noqa: F841
 
-    # Install GUI logging handler so Python `logging` and captured `warnings`
-    # are forwarded into the app's log pane. Wrap the app log callable so
-    # debug/info lines can be toggled via the Settings `debug_mode` option.
     try:
         import logging as _logging
         import re

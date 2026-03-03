@@ -5,6 +5,11 @@ Translate Word documents, Excel spreadsheets, and PDFs into any of 130+ language
 
 ---
 
+## Future Implementations
+
+- Change UI/UX framework (Electron, Tauri, Neutralino.js, Wails or Flutter)
+- Create Web version
+
 ## Features
 
 - **Batch translation** — drop files in `origin/`, run one command, get translated files in `output/`

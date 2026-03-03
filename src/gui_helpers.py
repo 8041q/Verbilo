@@ -182,6 +182,8 @@ class GuiLoggingHandler(logging.Handler):
                 debug_enabled = bool(self._debug_getter())
             except Exception:
                 debug_enabled = False
+            if not debug_enabled and record.levelno >= logging.WARNING:
+                return
 
             # Only sanitize warning messages captured from the warnings system
             sanitized = orig_msg
