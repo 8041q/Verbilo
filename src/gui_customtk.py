@@ -22,7 +22,7 @@ import tomllib
 import webbrowser
 
 from . import gui_theme as theme
-from .gui_helpers import Worker, list_supported_files, center_window, GuiLoggingHandler
+from .gui_helpers import Worker, list_supported_files, center_window, GuiLoggingHandler, SUPPORTED_EXTS
 from .gui_config import load_config, save_config
 from .icons import get_icon, get_photo_image, get_app_icon
 
@@ -1121,7 +1121,7 @@ class App:
         def _save_and_close():
             inp = in_entry.get().strip()
             out = out_entry.get().strip()
-            if not inp or not out:
+            if not out:
                 self._settings_error.configure(text="Input or Output path cannot be empty")
                 return
             self._settings_error.configure(text="")
@@ -1132,6 +1132,11 @@ class App:
             self.cfg["auto_check_updates"] = auto_updates_var.get()
             self.cfg["debug_mode"] = debug_var.get()
             save_config(self.cfg)
+            try:
+                # Apply debug changes immediately so logging/filtering reflects the new value
+                self._apply_debug_mode()
+            except Exception:
+                pass
             win.destroy()
 
         theme.make_button(btn_frame, "Save", command=_save_and_close, style="primary",
@@ -1375,10 +1380,39 @@ class App:
 
     def _add_files(self):
         init = self._initialdir_for_input()
-        paths = filedialog.askopenfilenames(title="Select files", initialdir=init)
+        filetypes = [
+            ("All supported", ("*.docx", "*.pdf", "*.xlsx", "*.xls")),
+            ("Excel spreadsheets", ("*.xlsx", "*.xls")),
+            ("Word documents", ("*.docx",)),
+            ("PDF documents", ("*.pdf",)),
+            ("All files", "*.*"),
+        ]
+        paths = filedialog.askopenfilenames(title="Select files", initialdir=init, filetypes=filetypes)
+        if not paths:
+            return
+
+        from pathlib import Path as _Path
+        allowed = {ext.lower() for ext in SUPPORTED_EXTS}
+        # normalize current files to resolved absolute strings to detect duplicates reliably
+        existing = {str(_Path(p).resolve()) for p in self.files}
+        invalid = []
+
         for p in paths:
-            if p not in self.files:
-                self._add_file_to_table(p)
+            suf = _Path(p).suffix.lower()
+            resolved = str(_Path(p).resolve())
+            if suf in allowed:
+                if resolved not in existing:
+                    self._add_file_to_table(resolved)
+                    existing.add(resolved)
+            else:
+                invalid.append(p)
+
+        if invalid:
+            messagebox.showwarning(
+                "Unsupported files",
+                "Some selected files were not supported and were ignored.\n\n"
+                "Supported types: .docx, .pdf, .xlsx, .xls"
+            )
 
     def _select_folder(self):
         init = self._initialdir_for_input()
@@ -1389,9 +1423,14 @@ class App:
         if not found:
             messagebox.showinfo("No files", f"No supported files found in {d}")
             return
+        
+        from pathlib import Path as _Path
+        existing = {str(_Path(p).resolve()) for p in self.files}
         for f in found:
-            if f not in self.files:
-                self._add_file_to_table(f)
+            resolved = str(_Path(f).resolve())
+            if resolved not in existing:
+                self._add_file_to_table(resolved)
+                existing.add(resolved)
 
     def _clear_files(self):
         # removes selected file, or clears all if nothing selected
@@ -1582,6 +1621,50 @@ class App:
                 f"Cancelled \u2014 {self.completed_files} / {self.total_files} files ({int(pct * 100)}%)",
             )
 
+    def _apply_debug_mode(self):
+        # Apply the current debug mode immediately so logging reflects changes
+        try:
+            import logging as _logging
+
+            debug = bool(self.cfg.get("debug_mode", False))
+            root_logger = _logging.getLogger()
+
+            # Set the root logger level so handlers receive DEBUG records when enabled.
+            try:
+                root_logger.setLevel(_logging.DEBUG if debug else _logging.INFO)
+            except Exception:
+                pass
+
+            # Update all root handlers so they accept DEBUG records when enabled
+            for h in list(root_logger.handlers):
+                try:
+                    h.setLevel(_logging.DEBUG if debug else _logging.INFO)
+                except Exception:
+                    pass
+
+            # Suppress noisy third-party DEBUG output by elevating known noisy loggers
+            noisy_loggers = [
+                "PIL", "PIL.PngImagePlugin", "PIL.Image", "PIL.ImageFile",
+                "urllib3", "urllib3.connectionpool", "urllib3.util.retry",
+                "requests", "http.client",
+            ]
+            for name in noisy_loggers:
+                try:
+                    _logging.getLogger(name).setLevel(_logging.WARNING)
+                except Exception:
+                    pass
+
+            try:
+                _logging.captureWarnings(True)
+            except Exception:
+                pass
+
+        except Exception:
+            try:
+                logger.exception("Failed to apply debug mode")
+            except Exception:
+                pass
+
 # --- entry point ---
 
 def main():
@@ -1652,13 +1735,16 @@ def main():
             debug_getter=lambda: bool(app.cfg.get("debug_mode", False)),
         )
         _handler.setFormatter(_logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-        _handler.setLevel(_logging.INFO)
+        # Initialize handler level according to saved config so debug appears immediately
+        _handler.setLevel(_logging.DEBUG if app.cfg.get("debug_mode", False) else _logging.INFO)
         root_logger = _logging.getLogger()
         # Avoid adding duplicate handlers on repeated starts
         if not any(isinstance(h, GuiLoggingHandler) for h in root_logger.handlers):
             root_logger.addHandler(_handler)
-        root_logger.setLevel(_logging.INFO)
+        # Apply full debug mode setup at startup: sets root/handler levels,
+        # suppresses noisy third-party loggers, and captures warnings.
         _logging.captureWarnings(True)
+        app._apply_debug_mode()
 
         # Replace app._log so GUI's own log calls go through the same filter
         app._log = _filtered_log

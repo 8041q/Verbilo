@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import logging
 from pathlib import Path
 from typing import Dict, Any
 
@@ -27,7 +29,19 @@ def load_config() -> Dict[str, Any]:
 def save_config(cfg: Dict[str, Any]) -> None:
     p = _config_path()
     try:
-        p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+        text = json.dumps(cfg, indent=2, ensure_ascii=False)
+        # write via explicit open so we can fsync to ensure the file appears on disk
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except Exception:
+                # fsync may not be available on some platforms or filesystems; ignore
+                pass
     except Exception:
-        # best-effort, don't crash the GUI
-        pass
+        # best-effort, don't crash the GUI; log for visibility during development
+        try:
+            logging.exception("Failed to write GUI config %s", p)
+        except Exception:
+            pass

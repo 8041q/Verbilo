@@ -1,8 +1,8 @@
 [tool.poetry]
 name = "verbilo"
-version = "1.3.1"
+version = "1.4.0"
 build_date = "2026-03-03"
-description = "Translate .docx, .pdf, .xlsx files while preserving formatting."
+description = "Translate .docx, .pdf, .xlsx, .xls files while preserving formatting."
 authors = ["crt_"]
 
 [tool.poetry.dependencies]

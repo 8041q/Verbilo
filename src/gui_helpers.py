@@ -139,16 +139,10 @@ class GuiLoggingHandler(logging.Handler):
         # debug mode is enabled in the GUI. If not provided, debug is False.
         self._debug_getter = debug_getter or (lambda: False)
 
-    def _sanitize_warning_text(self, text: str, debug: bool) -> str:
-        # Return a sanitized, single-line warning message when debug is False.
-
-        #If debug is True the original text is returned unchanged. When debug is
-        #False we attempt to extract the human-facing warning text (the part
-        #after 'UserWarning:') and drop subsequent indented source-code lines.
-        
-        if debug:
-            return text
-
+    def _sanitize_warning_text(self, text: str) -> str:
+        # Always extract the human-facing warning text and drop source-code lines.
+        # Strips the filename/lineno prefix and the indented source-code line that
+        # Python's warnings module appends, leaving a single clean message.
         try:
             # If the captured text contains 'UserWarning:', take the content
             # after it. This avoids keeping filename/lineno prefixes.
@@ -176,19 +170,23 @@ class GuiLoggingHandler(logging.Handler):
             if record.levelno == logging.INFO and re.search(r"collected \d+ translatable string cells", orig_msg, re.IGNORECASE):
                 return
 
-            # Decide whether to sanitize the message (based on debug mode)
+            # Determine current debug mode
             debug_enabled = False
             try:
                 debug_enabled = bool(self._debug_getter())
             except Exception:
                 debug_enabled = False
-            if not debug_enabled and record.levelno >= logging.WARNING:
+
+            # In non-debug mode, suppress DEBUG and INFO records — but always
+            # let WARNING+ through so the user sees sanitized warnings.
+            if not debug_enabled and record.levelno < logging.WARNING:
                 return
 
-            # Only sanitize warning messages captured from the warnings system
+            # Sanitize warning messages (captured from the warnings system) to a
+            # single clean line — always, regardless of debug mode.
             sanitized = orig_msg
             if record.name == "py.warnings" or "UserWarning:" in orig_msg:
-                sanitized = self._sanitize_warning_text(orig_msg, debug_enabled)
+                sanitized = self._sanitize_warning_text(orig_msg)
 
             # Prefer the handler formatter for timestamp/level; replace the original
             # message part with the sanitized message when possible.
