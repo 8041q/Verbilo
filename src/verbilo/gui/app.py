@@ -24,7 +24,7 @@ import webbrowser
 from . import theme
 from .helpers import Worker, list_supported_files, center_window, GuiLoggingHandler, SUPPORTED_EXTS
 from .config import load_config, save_config
-from .icons import get_icon, get_photo_image, get_app_icon
+from .icons import get_icon, get_photo_image, get_app_icon, apply_window_icon
 
 logger = logging.getLogger(__name__)
 
@@ -486,24 +486,13 @@ class App:
 
         def _reapply_icon():
             try:
-                from PIL import ImageTk
-                icon_pil = get_app_icon(size=64)
-                if icon_pil:
-                    # Windows: set .ico directly (more reliable for taskbar)
-                    try:
-                        asset = Path(__file__).resolve().parents[3] / "assets" / "favicon.ico"
-                        if asset.exists():
-                            self.root.iconbitmap(str(asset))
-                    except Exception:
-                        pass
-                    icon_tk = ImageTk.PhotoImage(icon_pil)
-                    self.root.iconphoto(True, icon_tk)
-                    self.root._app_icon_ref = icon_tk
+                apply_window_icon(self.root, size=64)
             except Exception:
                 pass
 
-        # schedule after a short delay so CTk finishes applying its own changes
+        # Schedule at multiple points to beat any late CTk icon re-application
         self.root.after(100, _reapply_icon)
+        self.root.after(500, _reapply_icon)
 
         # Update check state (populated by background thread on startup)
         self._update_check_result: dict | None = None
@@ -989,6 +978,7 @@ class App:
         PAD = theme.PADDING
 
         win = ctk.CTkToplevel(self.root)
+        apply_window_icon(win)
         win.title("Settings")
         win.transient(self.root)
         win.grab_set()
@@ -1218,6 +1208,7 @@ class App:
         PAD = theme.PADDING
 
         dlg = ctk.CTkToplevel(self.root)
+        apply_window_icon(dlg)
         dlg.title("Update Available")
         dlg.transient(self.root)
         dlg.grab_set()
@@ -1263,6 +1254,7 @@ class App:
         PAD = theme.PADDING
 
         win = ctk.CTkToplevel(self.root)
+        apply_window_icon(win)
         win.title("About Verbilo")
         win.transient(self.root)
         win.grab_set()
@@ -1710,12 +1702,7 @@ def main():
 
     # Set app icon (title bar + taskbar + about)
     try:
-        from PIL import ImageTk
-        icon_pil = get_app_icon(size=64)
-        if icon_pil:
-            icon_tk = ImageTk.PhotoImage(icon_pil)
-            root.iconphoto(True, icon_tk)
-            root._app_icon_ref = icon_tk  # prevent garbage collection
+        apply_window_icon(root, size=64)
     except Exception:
         pass
 

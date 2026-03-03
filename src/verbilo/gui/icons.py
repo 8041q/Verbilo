@@ -156,3 +156,71 @@ def get_app_icon(size: int = 64) -> object | None:
     if TablerIcons is None or OutlineIcon is None:
         return None
     return TablerIcons.load(OutlineIcon.LANGUAGE, size=size, color="#5B9BD5", stroke_width=1.6)
+
+
+def apply_window_icon(root: object, size: int = 64) -> bool:
+    """Apply the app icon to a Tk/Toplevel window.
+
+    Tries to set a .ico file on Windows (via `iconbitmap`) and then sets
+    a `PhotoImage` via `iconphoto` so the icon appears in titlebar and
+    taskbar. Stores a reference on the window as `_app_icon_ref` to prevent
+    garbage collection.
+
+    After successfully setting the icon, monkey-patches `root.iconbitmap` on
+    the instance level so CustomTkinter cannot overwrite it with its own logo
+    in any subsequent scheduled `after()` calls.
+
+    Returns True on success, False otherwise.
+    """
+    try:
+        # Lazy import so icons module stays importable without tkinter/Pillow
+        from PIL import ImageTk
+    except Exception:
+        ImageTk = None  # type: ignore[assignment]
+
+    try:
+        icon_pil = get_app_icon(size=size)
+        if icon_pil is None:
+            return False
+
+        asset = Path(__file__).resolve().parents[3] / "assets" / "favicon.ico"
+        asset_str = str(asset) if asset.exists() else None
+
+        def _set_ico():
+            if asset_str:
+                try:
+                    # Low-level call bypasses CTk's Python-level iconbitmap override
+                    root.tk.call("wm", "iconbitmap", root._w, asset_str)
+                except Exception:
+                    pass
+
+        _set_ico()
+
+        if ImageTk is not None:
+            try:
+                icon_tk = ImageTk.PhotoImage(icon_pil)
+                try:
+                    root.tk.call("wm", "iconphoto", root._w, "-default", icon_tk._PhotoImage__photo)
+                except Exception:
+                    try:
+                        root.iconphoto(True, icon_tk)
+                    except Exception:
+                        pass
+                setattr(root, "_app_icon_ref", icon_tk)
+            except Exception:
+                return False
+
+        # Monkey-patch iconbitmap on the *instance* so CTk's scheduled calls
+        # (e.g. root.after(200, _windows_set_titlebar_icon)) become no-ops.
+        # We still re-apply our own .ico each time so nothing can dislodge it.
+        def _locked_iconbitmap(*args, **kwargs):
+            _set_ico()
+
+        try:
+            root.iconbitmap = _locked_iconbitmap  # type: ignore[method-assign]
+        except Exception:
+            pass
+
+        return True
+    except Exception:
+        return False

@@ -148,9 +148,9 @@ DARK = Palette(
     text_muted="#6B6F78",
     text_on_accent="#FFFFFF",
 
-    accent="#5B9BD5",
-    accent_hover="#4A8AC4",
-    accent_pressed="#3A7AB4",
+    accent="#A4CBB4",
+    accent_hover="#97B9A5",
+    accent_pressed="#8DAC9A",
 
     border="#33363D",
     divider="#2C2F36",
@@ -173,9 +173,9 @@ LIGHT = Palette(
     text_muted="#9198A1",
     text_on_accent="#FFFFFF",
 
-    accent="#5B9BD5",
-    accent_hover="#4A8AC4",
-    accent_pressed="#3A7AB4",
+    accent="#A4CBB4",
+    accent_hover="#97B9A5",
+    accent_pressed="#8DAC9A",
 
     border="#D0D3D9",
     divider="#E2E4E8",
