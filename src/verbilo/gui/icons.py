@@ -5,11 +5,11 @@
 # Results are cached to avoid re-rendering the same SVG multiple times.
 
 from __future__ import annotations
-
+import io
 from functools import lru_cache
 from typing import TYPE_CHECKING
-
 from pathlib import Path
+from importlib import resources
 
 try:
     import customtkinter as ctk
@@ -137,41 +137,45 @@ def get_photo_image(name: str, size: int = 18, color: str = "#C8CCD2") -> object
 
 
 def get_app_icon(size: int = 64) -> object | None:
-    asset_path = Path(__file__).resolve().parents[3] / "assets" / "favicon.ico"
+    # Load favicon from package resources (verbilo/assets/favicon.ico)
+    if PILImage is not None:
+        # Strategy 1: __file__-relative path (reliable in editable installs & Nuitka)
+        try:
+            _favicon = Path(__file__).resolve().parent.parent / "assets" / "favicon.ico"
+            if _favicon.exists():
+                pil = PILImage.open(_favicon).convert("RGBA")
+                if pil.size != (size, size):
+                    try:
+                        resample = PILImage.Resampling.LANCZOS
+                    except AttributeError:
+                        resample = PILImage.LANCZOS  # type: ignore[attr-defined]
+                    pil = pil.resize((size, size), resample)
+                return pil
+        except Exception:
+            pass
 
-    try:
-        if asset_path.exists() and PILImage is not None:
-            pil = PILImage.open(asset_path).convert("RGBA")
+        # Strategy 2: importlib.resources (wheel installs)
+        try:
+            asset_trav = resources.files("verbilo.assets").joinpath("favicon.ico")
+            data = asset_trav.read_bytes()
+            pil = PILImage.open(io.BytesIO(data)).convert("RGBA")
             if pil.size != (size, size):
                 try:
                     resample = PILImage.Resampling.LANCZOS
                 except AttributeError:
-                    resample = PILImage.LANCZOS
+                    resample = PILImage.LANCZOS  # type: ignore[attr-defined]
                 pil = pil.resize((size, size), resample)
             return pil
-    except Exception:
-        return None
+        except Exception:
+            pass
 
-    # Fallback to existing logic
+    # Fallback to SVG icon
     if TablerIcons is None or OutlineIcon is None:
         return None
     return TablerIcons.load(OutlineIcon.LANGUAGE, size=size, color="#5B9BD5", stroke_width=1.6)
 
-
 def apply_window_icon(root: object, size: int = 64) -> bool:
-    """Apply the app icon to a Tk/Toplevel window.
-
-    Tries to set a .ico file on Windows (via `iconbitmap`) and then sets
-    a `PhotoImage` via `iconphoto` so the icon appears in titlebar and
-    taskbar. Stores a reference on the window as `_app_icon_ref` to prevent
-    garbage collection.
-
-    After successfully setting the icon, monkey-patches `root.iconbitmap` on
-    the instance level so CustomTkinter cannot overwrite it with its own logo
-    in any subsequent scheduled `after()` calls.
-
-    Returns True on success, False otherwise.
-    """
+    # Apply the app icon using in-memory PhotoImage. Avoids requiring a filesystem path
     try:
         # Lazy import so icons module stays importable without tkinter/Pillow
         from PIL import ImageTk
@@ -183,38 +187,37 @@ def apply_window_icon(root: object, size: int = 64) -> bool:
         if icon_pil is None:
             return False
 
-        asset = Path(__file__).resolve().parents[3] / "assets" / "favicon.ico"
-        asset_str = str(asset) if asset.exists() else None
-
-        def _set_ico():
-            if asset_str:
-                try:
-                    # Low-level call bypasses CTk's Python-level iconbitmap override
-                    root.tk.call("wm", "iconbitmap", root._w, asset_str)
-                except Exception:
-                    pass
-
-        _set_ico()
-
+            # Create an in-memory PhotoImage and set with iconphoto.
         if ImageTk is not None:
             try:
                 icon_tk = ImageTk.PhotoImage(icon_pil)
                 try:
+                    # Prefer low-level call so it works even if CTk monkey-patches things
                     root.tk.call("wm", "iconphoto", root._w, "-default", icon_tk._PhotoImage__photo)
                 except Exception:
                     try:
                         root.iconphoto(True, icon_tk)
                     except Exception:
                         pass
+                # Keep a reference so the image isn't garbage-collected
                 setattr(root, "_app_icon_ref", icon_tk)
             except Exception:
                 return False
 
-        # Monkey-patch iconbitmap on the *instance* so CTk's scheduled calls
-        # (e.g. root.after(200, _windows_set_titlebar_icon)) become no-ops.
-        # We still re-apply our own .ico each time so nothing can dislodge it.
         def _locked_iconbitmap(*args, **kwargs):
-            _set_ico()
+            # No disk-based ico; we re-apply the in-memory icon if needed.
+            try:
+                if ImageTk is not None and getattr(root, "_app_icon_ref", None) is not None:
+                    # Re-apply in-memory icon
+                    try:
+                        root.tk.call("wm", "iconphoto", root._w, "-default", root._app_icon_ref._PhotoImage__photo)
+                    except Exception:
+                        try:
+                            root.iconphoto(True, root._app_icon_ref)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
         try:
             root.iconbitmap = _locked_iconbitmap  # type: ignore[method-assign]
@@ -224,3 +227,4 @@ def apply_window_icon(root: object, size: int = 64) -> bool:
         return True
     except Exception:
         return False
+    

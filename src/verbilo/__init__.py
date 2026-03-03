@@ -8,8 +8,8 @@ except Exception:
         class PackageNotFoundError(Exception):
             pass
 
-# Development fallback value (kept so importing from source still shows something)
-__version__ = "0.1.0"
+# Development fallback value (kept so if it shows, then there is a issue)
+__version__ = "0.0.1"
 
 # Prefer installed distribution metadata when available
 if version:
