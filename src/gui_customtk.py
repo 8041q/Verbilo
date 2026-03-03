@@ -22,7 +22,7 @@ import tomllib
 import webbrowser
 
 from . import gui_theme as theme
-from .gui_helpers import Worker, list_supported_files, center_window
+from .gui_helpers import Worker, list_supported_files, center_window, GuiLoggingHandler
 from .gui_config import load_config, save_config
 from .icons import get_icon, get_photo_image, get_app_icon
 
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # --- version & about constants ---
 
 def _read_pyproject_meta() -> tuple[str, str]:
-    """Read version and build_date from pyproject.toml. Returns (version, build_date)."""
+    # Read version and build_date from pyproject.toml. Returns (version, build_date).
     try:
         toml_path = Path(__file__).parent.parent / "pyproject.toml"
         with open(toml_path, "rb") as fh:
@@ -54,7 +54,7 @@ DEFAULT_OUTPUT_FOLDER = "Output"
 
 
 def _try_make_relative(absolute_path: str) -> str:
-    """Return a path relative to cwd if possible, otherwise return the original."""
+    # Return a path relative to cwd if possible, otherwise return the original.
     try:
         return str(Path(absolute_path).relative_to(Path.cwd()))
     except ValueError:
@@ -717,10 +717,19 @@ class App:
         row += 1
 
         info_icon = get_icon("info", size=16)
+        # About row: keep the main button text as 'About' and show a small
+        # muted '(beta)' badge to the right so the clickable area remains
+        # the same and the badge is visually distinct.
+        about_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        about_frame.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, PAD))
+        about_frame.grid_columnconfigure(0, weight=1)
         theme.make_button(
-            self.sidebar, "About", command=self._open_about, style="ghost",
+            about_frame, "About", command=self._open_about, style="ghost",
             anchor="w", image=info_icon,
-        ).grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, PAD))
+        ).grid(row=0, column=0, sticky="ew")
+        theme.make_label(
+            about_frame, "(beta)", level="tiny", text_color=p.text_muted,
+        ).grid(row=0, column=1, sticky="e", padx=(8, 0))
 
     # --- content area ---
 
@@ -1074,16 +1083,34 @@ class App:
         )
         auto_updates_cb.grid(row=6, column=1, columnspan=2, sticky="w", padx=4, pady=(0, 6))
 
+        # Debug mode (show extra informational messages)
+        debug_var = tk.BooleanVar(value=self.cfg.get("debug_mode", True))
+        debug_cb = ctk.CTkCheckBox(
+            card,
+            text="Debug mode (show debug/info messages)",
+            variable=debug_var,
+            onvalue=True,
+            offvalue=False,
+            checkmark_color=p.bg_main,
+            fg_color=p.accent,
+            hover_color=p.accent_hover,
+            border_color=p.border,
+            text_color=p.text_secondary,
+            font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]),
+        )
+        # Place on its own row so it doesn't overlap the updates checkbox
+        debug_cb.grid(row=7, column=1, columnspan=2, sticky="w", padx=4, pady=(8, 6))
+
         # Inline validation error
         self._settings_error = theme.make_label(
             card, "", level="tiny",
             text_color=p.status_error,
         )
-        self._settings_error.grid(row=7, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 2))
+        self._settings_error.grid(row=8, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 2))
 
         # Button row
         btn_frame = ctk.CTkFrame(card, fg_color="transparent")
-        btn_frame.grid(row=8, column=0, columnspan=3, pady=(4, PAD))
+        btn_frame.grid(row=9, column=0, columnspan=3, pady=(4, PAD))
 
         def _save_and_close():
             inp = in_entry.get().strip()
@@ -1097,6 +1124,7 @@ class App:
             new_mode = "Dark" if mode_switch_var.get() else "Light"
             self.cfg["appearance_mode"] = new_mode
             self.cfg["auto_check_updates"] = auto_updates_var.get()
+            self.cfg["debug_mode"] = debug_var.get()
             save_config(self.cfg)
             win.destroy()
 
@@ -1123,7 +1151,7 @@ class App:
     # --- update check ---
 
     def _run_update_check(self, startup: bool = False, callback=None):
-        """Launch a background thread to check for the latest GitHub release."""
+        # Launch a background thread to check for the latest GitHub release.
         def _check():
             result: dict = {"status": "error", "version": None, "url": None}
             try:
@@ -1151,7 +1179,7 @@ class App:
         threading.Thread(target=_check, daemon=True).start()
 
     def _show_update_dialog(self, result: dict):
-        """Show a small dialog when a newer release is available."""
+        # Show a small dialog when a newer release is available.
         if result.get("status") != "update":
             return
         p = theme.get()
@@ -1198,7 +1226,7 @@ class App:
     # --- about dialog ---
 
     def _open_about(self):
-        """Open the standalone About dialog."""
+        # Open the standalone About dialog.
         p = theme.get()
         PAD = theme.PADDING
 
@@ -1231,6 +1259,10 @@ class App:
         theme.make_label(brand_frame, "Verbilo", level="heading").grid(
             row=0, column=1, sticky="sw",
         )
+        # Small muted beta badge beside the product heading
+        theme.make_label(
+            brand_frame, "(beta)", level="tiny", text_color=p.text_muted,
+        ).grid(row=0, column=2, sticky="sw", padx=(6, 0))
         theme.make_label(brand_frame, "File translation tool", level="small").grid(
             row=1, column=1, sticky="nw",
         )
@@ -1576,6 +1608,60 @@ def main():
         pass
 
     app = App(root)  # noqa: F841
+
+    # Install GUI logging handler so Python `logging` and captured `warnings`
+    # are forwarded into the app's log pane. Wrap the app log callable so
+    # debug/info lines can be toggled via the Settings `debug_mode` option.
+    try:
+        import logging as _logging
+        import re
+
+        raw_log = app._log
+
+        def _filtered_log(msg: str):
+            try:
+                # Always pass through the worker-done sentinel
+                if msg == "__worker_done__":
+                    raw_log(msg)
+                    return
+
+                # If debug mode is disabled, skip noisy collected-info lines
+                try:
+                    debug_enabled = bool(app.cfg.get("debug_mode", False))
+                except Exception:
+                    debug_enabled = False
+
+                if not debug_enabled and re.search(r"collected \d+ translatable string cells", msg, re.I):
+                    return
+
+                # Forward the (possibly filtered) message to the raw GUI logger.
+                # Content sanitization for warnings is handled centrally by the
+                # GuiLoggingHandler so we don't mutate message text here.
+                raw_log(msg)
+            except Exception:
+                try:
+                    raw_log(msg)
+                except Exception:
+                    pass
+
+        _handler = GuiLoggingHandler(
+            _filtered_log,
+            debug_getter=lambda: bool(app.cfg.get("debug_mode", False)),
+        )
+        _handler.setFormatter(_logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+        _handler.setLevel(_logging.INFO)
+        root_logger = _logging.getLogger()
+        # Avoid adding duplicate handlers on repeated starts
+        if not any(isinstance(h, GuiLoggingHandler) for h in root_logger.handlers):
+            root_logger.addHandler(_handler)
+        root_logger.setLevel(_logging.INFO)
+        _logging.captureWarnings(True)
+
+        # Replace app._log so GUI's own log calls go through the same filter
+        app._log = _filtered_log
+    except Exception:
+        logger.exception("Failed to install GUI logging handler")
+
     root.mainloop()
 
 

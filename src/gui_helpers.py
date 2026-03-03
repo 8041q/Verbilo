@@ -1,7 +1,9 @@
 import threading
 import time
+import logging
+import re
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Union, Optional, Any
 import tkinter as tk
 import traceback
 
@@ -42,7 +44,7 @@ def center_window(window, width, height=None, parent=None):
 class Worker:
 
     def __init__(self):
-        self._thread: threading.Thread | None = None
+        self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
 
     @property
@@ -57,9 +59,9 @@ class Worker:
         self,
         files: Iterable[str],
         target_lang: str,
-        output_dir: str | None,
-        translator_name: str | None,
-        progress_cb: Callable[[str, str, float | None], None],
+        output_dir: Optional[str],
+        translator_name: Optional[str],
+        progress_cb: Callable[[str, str, Optional[float]], None],
         log_cb: Callable[[str], None],
         source_lang: str = "auto",
     ):
@@ -125,3 +127,90 @@ class Worker:
 
         # Signal that the worker loop has exited
         log_cb("__worker_done__")
+
+
+class GuiLoggingHandler(logging.Handler):
+    # Logging handler that forwards formatted log records to a GUI log callback.
+
+    def __init__(self, log_cb: Callable, debug_getter: Optional[Callable] = None):
+        super().__init__()
+        self.log_cb = log_cb
+        # debug_getter is a callable that returns a bool indicating whether
+        # debug mode is enabled in the GUI. If not provided, debug is False.
+        self._debug_getter = debug_getter or (lambda: False)
+
+    def _sanitize_warning_text(self, text: str, debug: bool) -> str:
+        # Return a sanitized, single-line warning message when debug is False.
+
+        #If debug is True the original text is returned unchanged. When debug is
+        #False we attempt to extract the human-facing warning text (the part
+        #after 'UserWarning:') and drop subsequent indented source-code lines.
+        
+        if debug:
+            return text
+
+        try:
+            # If the captured text contains 'UserWarning:', take the content
+            # after it. This avoids keeping filename/lineno prefixes.
+            if "UserWarning:" in text:
+                idx = text.find("UserWarning:")
+                after = text[idx + len("UserWarning:"):]
+            else:
+                after = text
+
+            # Split into lines and pick the first non-empty line. This removes
+            # the following source-code line(s) that are typically indented.
+            for line in after.splitlines():
+                s = line.strip()
+                if s:
+                    return s
+            return after.strip()
+        except Exception:
+            return text
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            orig_msg = record.getMessage()
+
+            # Skip noisy informational messages about collected cells
+            if record.levelno == logging.INFO and re.search(r"collected \d+ translatable string cells", orig_msg, re.IGNORECASE):
+                return
+
+            # Decide whether to sanitize the message (based on debug mode)
+            debug_enabled = False
+            try:
+                debug_enabled = bool(self._debug_getter())
+            except Exception:
+                debug_enabled = False
+
+            # Only sanitize warning messages captured from the warnings system
+            sanitized = orig_msg
+            if record.name == "py.warnings" or "UserWarning:" in orig_msg:
+                sanitized = self._sanitize_warning_text(orig_msg, debug_enabled)
+
+            # Prefer the handler formatter for timestamp/level; replace the original
+            # message part with the sanitized message when possible.
+            final = None
+            if self.formatter is not None:
+                try:
+                    formatted = self.format(record)
+                    if orig_msg:
+                        final = formatted.replace(orig_msg, sanitized, 1)
+                    else:
+                        final = f"{formatted} {sanitized}"
+                except Exception:
+                    final = sanitized
+            else:
+                final = sanitized
+
+            if final:
+                try:
+                    self.log_cb(final)
+                except Exception:
+                    # Swallow GUI callback errors to avoid breaking logging
+                    pass
+        except Exception:
+            try:
+                self.log_cb(f"Logging error: {record.getMessage()}")
+            except Exception:
+                pass

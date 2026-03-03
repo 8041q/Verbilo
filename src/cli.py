@@ -26,7 +26,8 @@ def main():
         try:
             from .gui_customtk import main as gui_main
         except Exception:
-            print("Failed to import GUI module. Ensure `customtkinter` is installed and the GUI files exist.")
+            import traceback
+            traceback.print_exc()
             return
         gui_main()
         return

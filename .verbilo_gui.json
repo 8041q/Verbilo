@@ -1,6 +1,7 @@
 {
-  "default_input": "",
+  "default_input": "Input",
   "default_output": "Output",
   "appearance_mode": "Light",
-  "auto_check_updates": true
+  "auto_check_updates": true,
+  "debug_mode": false
 }
