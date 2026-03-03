@@ -1,6 +1,7 @@
 # Custom
 origin
 output
+.verbilo_gui.json
 
 # OS
 .DS_Store

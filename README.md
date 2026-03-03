@@ -73,7 +73,7 @@ pip install customtkinter   # for the GUI
 ### 2. Launch the GUI
 
 ```bash
-python -m src.cli --gui
+python -m src.verbilo.cli --gui
 ```
 
 In the GUI:
@@ -88,13 +88,13 @@ In the GUI:
 Translate all supported files in `origin/` to Spanish:
 
 ```bash
-python -m src.cli es
+python -m src.verbilo.cli es
 ```
 
 Translate only English text to Portuguese (leaves other languages untouched):
 
 ```bash
-python -m src.cli pt --source en
+python -m src.verbilo.cli pt --source en
 ```
 
 ---
@@ -102,7 +102,7 @@ python -m src.cli pt --source en
 ## CLI Reference
 
 ```
-python -m src.cli [LANG] [--source CODE] [--gui]
+python -m src.verbilo.cli [LANG] [--source CODE] [--gui]
 ```
 
 | Argument | Description |
@@ -119,15 +119,23 @@ python -m src.cli [LANG] [--source CODE] [--gui]
 origin/          ← place input files here
 output/          ← translated files are written here
 src/
-  cli.py           — command-line entry point
-  main.py          — translate_file() core API
-  gui_customtk.py  — CustomTkinter GUI
-  converters/
-    docx_converter.py
-    xlsx_converter.py
-    pdf_converter.py
-  translators/
-    dummy.py       — Google Translate wrapper with batching + source filtering
+  verbilo/
+    __init__.py
+    cli.py           — command-line entry point (or run installed `verbilo`)
+    main.py          — `translate_file()` core API
+    gui/
+      __init__.py
+      app.py         — CustomTkinter GUI
+      config.py
+      helpers.py
+      theme.py
+      icons.py
+    converters/
+      docx_converter.py
+      xlsx_converter.py
+      pdf_converter.py
+    translators/
+      dummy.py       — Google Translate wrapper with batching + source filtering
 ```
 
 ---

@@ -1,12 +1,9 @@
 python-docx==0.8.11
 openpyxl==3.1.2
-# pin deep-translator to the tested version
 deep-translator==1.11.4
 # PDF: in-place text replacement preserving images/layout
 PyMuPDF>=1.24.0
 # source language detection for filtering
 langdetect>=1.0.9
-# testing
-pytest==7.4.0
 customtkinter>=5.2.0
 pytablericons>=1.0.1
