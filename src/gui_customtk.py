@@ -49,6 +49,17 @@ APP_VERSION, APP_BUILD_DATE = _read_pyproject_meta()
 GITHUB_URL = "https://github.com/8041q/Verbilo"
 RELEASES_URL = "https://github.com/8041q/Verbilo/releases"
 
+# Default output folder name (relative to cwd)
+DEFAULT_OUTPUT_FOLDER = "Output"
+
+
+def _try_make_relative(absolute_path: str) -> str:
+    """Return a path relative to cwd if possible, otherwise return the original."""
+    try:
+        return str(Path(absolute_path).relative_to(Path.cwd()))
+    except ValueError:
+        return absolute_path
+
 # --- language helpers ---
 
 _cached_language_options: list[tuple[str, str]] | None = None
@@ -478,9 +489,8 @@ class App:
             self._run_update_check(startup=True)
 
         # Apply defaults from config
-        default_out = self.cfg.get("default_output")
-        if default_out:
-            self.output_entry.insert(0, default_out)
+        default_out = self.cfg.get("default_output") or DEFAULT_OUTPUT_FOLDER
+        self.output_entry.insert(0, default_out)
         default_in = self.cfg.get("default_input")
         if default_in:
             found = list_supported_files(default_in)
@@ -493,11 +503,11 @@ class App:
     def _initialdir_for_input(self) -> str:
         try:
             if self.files:
-                return str(Path(self.files[0]).parent)
+                return str(Path(self.files[0]).parent.resolve())
         except Exception:
             pass
         if self.cfg.get("default_input"):
-            return self.cfg.get("default_input") or ""
+            return str((Path.cwd() / self.cfg["default_input"]).resolve())
         return str(Path.cwd())
 
     def _initialdir_for_output(self) -> str:
@@ -505,11 +515,11 @@ class App:
             if hasattr(self, "output_entry"):
                 val = self.output_entry.get().strip()
                 if val:
-                    return val
+                    return str((Path.cwd() / val).resolve())
         except Exception:
             pass
         if self.cfg.get("default_output"):
-            return str(self.cfg.get("default_output") or "")
+            return str((Path.cwd() / self.cfg["default_output"]).resolve())
         return str(Path.cwd())
 
     # --- UI construction ---
@@ -975,11 +985,12 @@ class App:
         in_entry.insert(0, self.cfg.get("default_input", ""))
 
         def _browse_default_input():
-            init = in_entry.get().strip() or self.cfg.get("default_input") or str(Path.cwd())
+            raw = in_entry.get().strip() or self.cfg.get("default_input") or ""
+            init = str((Path.cwd() / raw).resolve()) if raw else str(Path.cwd())
             d = filedialog.askdirectory(title="Select default input folder", initialdir=init)
             if d:
                 in_entry.delete(0, tk.END)
-                in_entry.insert(0, d)
+                in_entry.insert(0, _try_make_relative(d))
 
         browse_icon_s = get_icon("folder", size=14)
         theme.make_button(card, "Browse", command=_browse_default_input, style="secondary",
@@ -993,14 +1004,15 @@ class App:
         )
         out_entry = theme.make_entry(card, height=32)
         out_entry.grid(row=2, column=1, sticky="ew", padx=4, pady=(0, 6))
-        out_entry.insert(0, self.cfg.get("default_output", ""))
+        out_entry.insert(0, self.cfg.get("default_output", DEFAULT_OUTPUT_FOLDER))
 
         def _browse_default_output():
-            init = out_entry.get().strip() or self.cfg.get("default_output") or str(Path.cwd())
+            raw = out_entry.get().strip() or self.cfg.get("default_output") or DEFAULT_OUTPUT_FOLDER
+            init = str((Path.cwd() / raw).resolve()) if raw else str(Path.cwd())
             d = filedialog.askdirectory(title="Select default output folder", initialdir=init)
             if d:
                 out_entry.delete(0, tk.END)
-                out_entry.insert(0, d)
+                out_entry.insert(0, _try_make_relative(d))
 
         theme.make_button(card, "Browse", command=_browse_default_output, style="secondary",
                           image=browse_icon_s, height=28).grid(
@@ -1378,7 +1390,7 @@ class App:
         d = filedialog.askdirectory(title="Select output folder", initialdir=init)
         if d:
             self.output_entry.delete(0, tk.END)
-            self.output_entry.insert(0, d)
+            self.output_entry.insert(0, _try_make_relative(d))
 
     # --- progress helpers ---
 
@@ -1424,14 +1436,19 @@ class App:
             typed = self.source_lang_box.get()
             source_lang = self._source_lang_map.get(typed, "auto")
 
-        # use typed path if present; else fall back to config default
-        output = self.output_entry.get().strip()
-        if not output:
-            output = self.cfg.get("default_output") or str(Path.cwd() / "output")
-            Path(str(output)).mkdir(parents=True, exist_ok=True)
-        elif not Path(str(output)).is_dir():
-            self._log(f"Error: Output path \u201c{output}\u201d does not exist \u2014 translation cancelled.")
-            return
+        # Resolve output path; relative paths are resolved against cwd and auto-created
+        output = self.output_entry.get().strip() or DEFAULT_OUTPUT_FOLDER
+        out_path = Path(output)
+        is_relative = not out_path.is_absolute()
+        if is_relative:
+            out_path = Path.cwd() / out_path
+        if not out_path.exists():
+            if is_relative:
+                out_path.mkdir(parents=True, exist_ok=True)
+            else:
+                self._log(f"Error: Output path \u201c{output}\u201d does not exist \u2014 translation cancelled.")
+                return
+        output = str(out_path)
 
         # Normalize translator selection
         sel_trans = (self.translator_var.get() or "").strip()
