@@ -485,7 +485,6 @@ class App:
         # Schedule at multiple points to beat any late CTk icon re-application
         self.root.after(100, _reapply_icon)
         self.root.after(500, _reapply_icon)
-        self.root.after(750, lambda: center_window(self.root))
 
         # Update check state (populated by background thread on startup)
         self._update_check_result: dict | None = None
@@ -1674,8 +1673,9 @@ def main():
         )
         return
 
-    theme.init_dpi()
+
     root = ctk.CTk()
+    root.withdraw()  # hide until centered to avoid visible position jump
     theme.init_dpi(root)
     app = App(root)
 
@@ -1731,8 +1731,15 @@ def main():
     except Exception:
         logger.exception("Failed to install GUI logging handler")
 
-    root.mainloop()
+    def _show():
+        try:
+            center_window(root)
+        except Exception:
+            pass
+        root.deiconify()
 
+    root.after(10, _show)
+    root.mainloop()
 
 if __name__ == "__main__":
     main()
