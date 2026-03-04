@@ -20,21 +20,8 @@ if TYPE_CHECKING:
 _scale_factor: float = 1.0
 
 def init_dpi(root: Any = None) -> float:
-    # Detect and apply DPI scaling. Call once after root window creation.
-    # On Windows this enables per-monitor DPI awareness. Returns scale factor.
+    # Detect and apply DPI scaling.
     global _scale_factor
-
-    # Windows: enable system DPI awareness before any GUI work
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
-        except Exception:
-            try:
-                import ctypes
-                ctypes.windll.user32.SetProcessDPIAware()
-            except Exception:
-                pass
 
     if root is not None:
         try:
@@ -54,10 +41,7 @@ def scale(value: int | float) -> int:
     return max(1, round(value * _scale_factor))
 
 
-# ═══════════════════════════════════════════════════════════════════════
 #  Layout constants (logical pixels — call scale() at usage sites)
-# ═══════════════════════════════════════════════════════════════════════
-
 PADDING: int = 18
 CARD_CORNER_RADIUS: int = 10
 CARD_BORDER_WIDTH: int = 1
@@ -68,10 +52,7 @@ WINDOW_HEIGHT: int = 720
 WINDOW_MIN_WIDTH: int = 960
 WINDOW_MIN_HEIGHT: int = 660
 
-# ═══════════════════════════════════════════════════════════════════════
 #  Fonts — proper hierarchy, OS-native family first
-# ═══════════════════════════════════════════════════════════════════════
-
 def _detect_font_family() -> str:
     _sys = platform.system()
     if _sys == "Windows":
@@ -92,9 +73,7 @@ FONT_SMALL:      tuple[str, int]      = (FONT_FAMILY, 12)
 FONT_TINY:       tuple[str, int]      = (FONT_FAMILY, 11)
 
 
-# ═══════════════════════════════════════════════════════════════════════
 #  Palette — semantic colour tokens
-# ═══════════════════════════════════════════════════════════════════════
 
 @dataclass(frozen=True)
 class Palette:
@@ -182,9 +161,7 @@ LIGHT = Palette(
 )
 
 
-# ═══════════════════════════════════════════════════════════════════════
 #  Runtime state
-# ═══════════════════════════════════════════════════════════════════════
 
 _current_mode: str = "Dark"
 
@@ -204,10 +181,7 @@ def get() -> Palette:
     return DARK if _current_mode == "Dark" else LIGHT
 
 
-# ═══════════════════════════════════════════════════════════════════════
 #  Widget factory helpers
-# ═══════════════════════════════════════════════════════════════════════
-
 def make_card(parent: Any, **overrides: Any) -> Any:
     # Themed card frame.
     if ctk is None:

@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 # --- version & about constants ---
 
 def _read_pyproject_meta() -> tuple[str, str]:
-    # Read version and build_date from pyproject.toml. Returns (version, build_date).
     try:
         toml_path = Path(__file__).parent.parent.parent.parent / "pyproject.toml"
         with open(toml_path, "rb") as fh:
@@ -49,7 +48,7 @@ APP_VERSION, APP_BUILD_DATE = _read_pyproject_meta()
 GITHUB_URL = "https://github.com/8041q/Verbilo"
 RELEASES_URL = "https://github.com/8041q/Verbilo/releases"
 
-# Default folder name (relative to cwd)
+# Default folder name
 DEFAULT_OUTPUT_FOLDER = "Output"
 DEFAULT_INPUT_FOLDER = "Input"
 
@@ -158,12 +157,6 @@ def _get_language_options() -> list[tuple[str, str]]:
 
 
 class SearchableComboBox:
-    # Entry + scrollable Toplevel listbox.
-    # - Click/Tab: select-all and open dropdown.
-    # - Type: live filter, keep dropdown open.
-    # - Click item or Enter: confirm and close.
-    # - Click outside/Escape/focus-out: revert to last valid and close.
-
     _POPUP_ROWS = 8  # max visible rows before scrolling
 
     def __init__(self, parent, values, variable, **kw):
@@ -173,7 +166,6 @@ class SearchableComboBox:
         self._variable = variable
         self._last_valid = variable.get() or (values[0] if values else "")
         self._popup = None
-        # Auto-clears after a short delay so a stale True never blocks reopening.
         self._suppress_open = False
 
         # Styled outer frame
@@ -397,7 +389,7 @@ class SearchableComboBox:
         y = self._frame.winfo_rooty() + self._frame.winfo_height() + 2
         w = self._frame.winfo_width()
         rows = min(self._POPUP_ROWS, max(1, self._listbox.size()))
-        row_px = theme.FONT_BODY[1] + 10
+        row_px = theme.scale(theme.FONT_BODY[1] + 10)
         h = rows * row_px + 8
         self._popup.geometry(f"{w}x{h}+{x}+{y}")
 
@@ -493,6 +485,7 @@ class App:
         # Schedule at multiple points to beat any late CTk icon re-application
         self.root.after(100, _reapply_icon)
         self.root.after(500, _reapply_icon)
+        self.root.after(750, lambda: center_window(self.root))
 
         # Update check state (populated by background thread on startup)
         self._update_check_result: dict | None = None
@@ -544,15 +537,14 @@ class App:
             self.root.configure(fg_color=p.bg_main)
         else:
             self.root.configure(bg=p.bg_main)
-        center_window(self.root, theme.WINDOW_WIDTH, theme.WINDOW_HEIGHT)
+        self.root.geometry(f"{theme.WINDOW_WIDTH}x{theme.WINDOW_HEIGHT}")
         try:
             self.root.minsize(theme.WINDOW_MIN_WIDTH, theme.WINDOW_MIN_HEIGHT)
             self.root.resizable(True, True)
         except Exception:
             pass
 
-        # Root grid: sidebar (col 0, fixed)  |  content (col 1, expands)
-        self.root.grid_columnconfigure(0, weight=0, minsize=theme.SIDEBAR_WIDTH)
+        self.root.grid_columnconfigure(0, weight=0, minsize=theme.scale(theme.SIDEBAR_WIDTH))
         self.root.grid_columnconfigure(1, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
 
@@ -565,7 +557,7 @@ class App:
     # --- sidebar ---
 
     def _build_sidebar(self):
-        PAD = theme.PADDING
+        PAD = theme.PADDING  # CTk widgets self-scale padx/pady — do NOT pre-scale
         p = theme.get()
 
         self.sidebar = ctk.CTkFrame(
@@ -729,9 +721,6 @@ class App:
         row += 1
 
         info_icon = get_icon("info", size=16)
-        # About row: keep the main button text as 'About' and show a small
-        # muted '(beta)' badge to the right so the clickable area remains
-        # the same and the badge is visually distinct.
         about_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         about_frame.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, PAD))
         about_frame.grid_columnconfigure(0, weight=1)
@@ -746,7 +735,7 @@ class App:
     # --- content area ---
 
     def _build_content(self):
-        PAD = theme.PADDING
+        PAD = theme.PADDING  # CTk widgets self-scale padx/pady — do NOT pre-scale
         p = theme.get()
 
         content = ctk.CTkFrame(self.root, fg_color=p.bg_main, corner_radius=0)
@@ -891,7 +880,8 @@ class App:
         container = tk.Frame(parent, bg=p.bg_card)
         container.pack(
             fill=tk.BOTH, expand=True,
-            padx=theme.PADDING, pady=theme.PADDING,
+            # raw tk.Frame does NOT self-scale — must use scale() explicitly
+            padx=theme.scale(theme.PADDING), pady=theme.scale(theme.PADDING),
         )
 
         self.file_table = ttk.Treeview(
@@ -975,7 +965,7 @@ class App:
 
     def _open_settings(self):
         p = theme.get()
-        PAD = theme.PADDING
+        PAD = theme.PADDING  # CTk widgets self-scale padx/pady — do NOT pre-scale
 
         win = ctk.CTkToplevel(self.root)
         apply_window_icon(win)
@@ -1144,7 +1134,6 @@ class App:
             self.cfg["debug_mode"] = debug_var.get()
             save_config(self.cfg)
             try:
-                # Apply debug changes immediately so logging/filtering reflects the new value
                 self._apply_debug_mode()
             except Exception:
                 pass
@@ -1161,10 +1150,8 @@ class App:
 
         # Title-bar X acts as Cancel (discard changes)
         win.protocol("WM_DELETE_WINDOW", win.destroy)
-
-        # Centre the dialog
         win.update_idletasks()
-        center_window(win, max(win.winfo_reqwidth(), 520), parent=self.root)
+        win.after(20, lambda: center_window(win, parent=self.root))
         try:
             win.resizable(False, False)
         except Exception:
@@ -1205,7 +1192,7 @@ class App:
         if result.get("status") != "update":
             return
         p = theme.get()
-        PAD = theme.PADDING
+        PAD = theme.PADDING  # CTk widgets self-scale padx/pady — do NOT pre-scale
 
         dlg = ctk.CTkToplevel(self.root)
         apply_window_icon(dlg)
@@ -1240,7 +1227,7 @@ class App:
 
         dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
         dlg.update_idletasks()
-        center_window(dlg, max(dlg.winfo_reqwidth(), 400), parent=self.root)
+        dlg.after(20, lambda: center_window(dlg, parent=self.root))
         try:
             dlg.resizable(False, False)
         except Exception:
@@ -1251,7 +1238,7 @@ class App:
     def _open_about(self):
         # Open the standalone About dialog.
         p = theme.get()
-        PAD = theme.PADDING
+        PAD = theme.PADDING  # CTk widgets self-scale padx/pady — do NOT pre-scale
 
         win = ctk.CTkToplevel(self.root)
         apply_window_icon(win)
@@ -1383,7 +1370,7 @@ class App:
 
         win.protocol("WM_DELETE_WINDOW", win.destroy)
         win.update_idletasks()
-        center_window(win, max(win.winfo_reqwidth(), 460), parent=self.root)
+        win.after(20, lambda: center_window(win, parent=self.root))
         try:
             win.resizable(False, False)
         except Exception:
@@ -1642,20 +1629,17 @@ class App:
             debug = bool(self.cfg.get("debug_mode", False))
             root_logger = _logging.getLogger()
 
-            # Set the root logger level so handlers receive DEBUG records when enabled.
             try:
                 root_logger.setLevel(_logging.DEBUG if debug else _logging.INFO)
             except Exception:
                 pass
 
-            # Update all root handlers so they accept DEBUG records when enabled
             for h in list(root_logger.handlers):
                 try:
                     h.setLevel(_logging.DEBUG if debug else _logging.INFO)
                 except Exception:
                     pass
 
-            # Suppress noisy third-party DEBUG output by elevating known noisy loggers
             noisy_loggers = [
                 "PIL", "PIL.PngImagePlugin", "PIL.Image", "PIL.ImageFile",
                 "urllib3", "urllib3.connectionpool", "urllib3.util.retry",
@@ -1690,17 +1674,11 @@ def main():
         )
         return
 
-    # DPI awareness (must be called before creating the root window on Windows)
     theme.init_dpi()
-
     root = ctk.CTk()
-
-    # Finalize DPI scaling now that root exists
     theme.init_dpi(root)
-
     app = App(root)
 
-    # Set app icon (title bar + taskbar + about)
     try:
         apply_window_icon(root, size=64)
     except Exception:
@@ -1711,10 +1689,8 @@ def main():
         import re
 
         raw_log = app._log
-
         def _filtered_log(msg: str):
             try:
-                # Always pass through the worker-done sentinel
                 if msg == "__worker_done__":
                     raw_log(msg)
                     return
@@ -1728,9 +1704,6 @@ def main():
                 if not debug_enabled and re.search(r"collected \d+ translatable string cells", msg, re.I):
                     return
 
-                # Forward the (possibly filtered) message to the raw GUI logger.
-                # Content sanitization for warnings is handled centrally by the
-                # GuiLoggingHandler so we don't mutate message text here.
                 raw_log(msg)
             except Exception:
                 try:
@@ -1743,14 +1716,13 @@ def main():
             debug_getter=lambda: bool(app.cfg.get("debug_mode", False)),
         )
         _handler.setFormatter(_logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-        # Initialize handler level according to saved config so debug appears immediately
+
         _handler.setLevel(_logging.DEBUG if app.cfg.get("debug_mode", False) else _logging.INFO)
         root_logger = _logging.getLogger()
-        # Avoid adding duplicate handlers on repeated starts
+
         if not any(isinstance(h, GuiLoggingHandler) for h in root_logger.handlers):
             root_logger.addHandler(_handler)
-        # Apply full debug mode setup at startup: sets root/handler levels,
-        # suppresses noisy third-party loggers, and captures warnings.
+
         _logging.captureWarnings(True)
         app._apply_debug_mode()
 

@@ -13,37 +13,28 @@ logger = logging.getLogger(__name__)
 
 # Maximum texts per Google Translate batch request.
 _BATCH_SIZE = 50
+
 # Maximum total characters per batch – just under Google's ~5 000 char limit.
 _BATCH_MAX_CHARS = 4900
+
 # Minimum text length (chars) for target-language detection to be trusted.
 _SKIP_MIN_CHARS = 20
 
 
 # Lightweight post-processing: fix common Google Translate artefacts
-
 def post_process(text: str) -> str:
     # fix spacing around punctuation and collapse multiple spaces
     if not text:
         return text
-
-    # Space before comma / period / colon / semicolon / closing paren
     text = re.sub(r'\s+([,.:;!?\)}\]])', r'\1', text)
-
-    # Missing space after comma, semicolon, colon (but not inside numbers like "1,000" or "12:30")
     text = re.sub(r'([,;])(?=[^\s\d])', r'\1 ', text)
     text = re.sub(r'(:)(?=[^\s\d/\\])', r'\1 ', text)
-
-    # Missing space after sentence-ending punctuation followed by a letter
     text = re.sub(r'([.!?])(?=[A-Za-z\u00C0-\u024F\u0400-\u04FF\u4e00-\u9fff])', r'\1 ', text)
-
-    # Collapse multiple spaces into one
     text = re.sub(r'  +', ' ', text)
-
     return text.strip()
 
 
 def _run_cancellable(fn, cancel_event: Optional[threading.Event], poll_interval: float = 0.05):
-    # run fn() in a daemon thread; raises CancelledError if cancel_event fires mid-run
     result = [None]
     exc: list = [None]
 
@@ -80,21 +71,18 @@ class IdentityTranslator:
         return list(texts)
 
 
-# wraps GoogleTranslator with batching, dedup cache, and post-processing
-# always sends source="auto" to the API; source_lang only skips already-target-lang text
 class DeepTranslatorWrapper:
 
     def __init__(self, source_lang: str = "auto"):
         self._source_lang = source_lang
         try:
-            from deep_translator import GoogleTranslator  # type: ignore
+            from deep_translator import GoogleTranslator
             self._impl_cls = GoogleTranslator
         except Exception:
             self._impl_cls = None
         self._instances: Dict[str, Any] = {}
-        # Per-target translation cache   text -> translated text
         self._cache: Dict[str, Dict[str, str]] = {}
-        # Optional langdetect for target-language skip
+
         self._langdetect = None
         try:
             import langdetect as _ld
@@ -130,7 +118,6 @@ class DeepTranslatorWrapper:
     def translate_text(self, text: str, target_lang: str) -> str:
         if not self._impl_cls or not text or not text.strip():
             return text
-        # Check cache
         tgt_cache = self._cache.setdefault(target_lang, {})
         if text in tgt_cache:
             return tgt_cache[text]
@@ -163,12 +150,12 @@ class DeepTranslatorWrapper:
         tgt_cache = self._cache.setdefault(target_lang, {})
 
         # Separate translatable vs pass-through, resolving cache hits inline.
-        to_translate: list[tuple[int, str]] = []  # (original_index, text)
+        to_translate: list[tuple[int, str]] = [] 
         for i, t in enumerate(texts):
             if not t or not t.strip():
-                continue  # results[i] already == t
+                continue
             if self._is_already_target_lang(t, target_lang):
-                continue  # already in the target language
+                continue
             if t in tgt_cache:
                 results[i] = tgt_cache[t]
             else:
@@ -190,7 +177,6 @@ class DeepTranslatorWrapper:
         chunks = self._make_chunks(dedup_items)
 
         for chunk in chunks:
-            # Honour cancellation before starting the next HTTP request
             if cancel_event is not None and cancel_event.is_set():
                 raise CancelledError("Translation cancelled")
             chunk_texts = [t for t, _ in chunk]
@@ -201,7 +187,6 @@ class DeepTranslatorWrapper:
                 )
                 if translated is None:
                     translated = chunk_texts
-                # Pad if Google Translate returned fewer items than sent
                 if len(translated) < len(chunk):
                     translated.extend(
                         chunk_texts[i] for i in range(len(translated), len(chunk))
@@ -228,9 +213,7 @@ class DeepTranslatorWrapper:
         tgt_cache: dict[str, str],
         cancel_event: Optional[threading.Event] = None,
     ) -> None:
-        # on batch failure, retry in halves; per-item only for the smallest failing chunk
         if len(chunk) <= 2:
-            # Small enough — do per-item
             for orig_text, indices in chunk:
                 if cancel_event is not None and cancel_event.is_set():
                     raise CancelledError("Translation cancelled")
@@ -248,7 +231,6 @@ class DeepTranslatorWrapper:
                     raise
                 except Exception:
                     logger.exception("Per-item fallback also failed")
-                    # results already contains the original text
             return
         mid = len(chunk) // 2
         for half in (chunk[:mid], chunk[mid:]):
@@ -280,7 +262,6 @@ class DeepTranslatorWrapper:
 
     @staticmethod
     def _make_chunks(items: list[tuple[str, list[int]]]) -> list[list[tuple[str, list[int]]]]:
-        # split into chunks capped at _BATCH_SIZE items and _BATCH_MAX_CHARS chars
         chunks: list[list[tuple[str, list[int]]]] = []
         current: list[tuple[str, list[int]]] = []
         current_chars = 0

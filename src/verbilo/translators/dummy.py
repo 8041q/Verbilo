@@ -33,17 +33,16 @@ class DeepTranslatorWrapper:
     def __init__(self, source_lang: str = "auto"):
         self._source_lang = source_lang
         try:
-            from deep_translator import GoogleTranslator  # type: ignore
+            from deep_translator import GoogleTranslator 
             self._impl_cls = GoogleTranslator
         except Exception:
             self._impl_cls = None
         self._instances: Dict[str, Any] = {}
-        # Lazy-init langdetect
         self._langdetect = None
         if source_lang and source_lang != "auto":
             try:
                 import langdetect as _ld
-                _ld.DetectorFactory.seed = 0  # deterministic
+                _ld.DetectorFactory.seed = 0
                 self._langdetect = _ld
             except ImportError:
                 logger.warning("langdetect not installed; source-language filtering disabled")
@@ -64,10 +63,8 @@ class DeepTranslatorWrapper:
             return True
         try:
             detected = self._langdetect.detect(text)
-            # langdetect returns ISO-639-1 codes, e.g. "en", "zh-cn"
             return detected.lower().startswith(self._source_lang.lower())
         except Exception:
-            # If detection fails (very short text, etc.) translate it anyway
             return True
 
     # ----- single-item convenience ----- #

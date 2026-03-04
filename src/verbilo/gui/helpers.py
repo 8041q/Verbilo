@@ -25,19 +25,39 @@ def list_supported_files(path: str) -> list[str]:
             files.append(str(f))
     return files
 
-
-def center_window(window, width, height=None, parent=None):
+def center_window(window, width=None, height=None, parent=None):
+    # Center `window` on screen (parent=None) or over `parent`
     window.update_idletasks()
-    if height is None:
-        height = window.winfo_reqheight()
+
+    if width is not None and height is not None:
+        # logical -> physical for centering math only
+        try:
+            sf = window._get_window_scaling()
+        except AttributeError:
+            sf = 1.0
+        sf = sf if sf > 0 else 1.0
+        phys_w = round(width * sf)
+        phys_h = round(height * sf)
+    else:
+        phys_w = window.winfo_width()
+        phys_h = window.winfo_height()
+
     if parent is not None:
         parent.update_idletasks()
-        x = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
-        y = parent.winfo_rooty() + (parent.winfo_height() - height) // 2
+        x = parent.winfo_rootx() + (parent.winfo_width()  - phys_w) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - phys_h) // 2
     else:
-        x = (window.winfo_screenwidth() - width) // 2
-        y = (window.winfo_screenheight() - height) // 2
-    window.geometry(f"{width}x{height}+{x}+{y}")
+        x = (window.winfo_screenwidth()  - phys_w) // 2
+        y = (window.winfo_screenheight() - phys_h) // 2
+
+    x = max(0, x)
+    y = max(0, y)
+
+    if width is not None and height is not None:
+        window.geometry(f"{width}x{height}+{x}+{y}")
+    else:
+        # position-only: CTk._apply_geometry_scaling passes +x+y unchanged
+        window.geometry(f"+{x}+{y}")
 
 
 # runs translation in a background thread; call start() to begin, stop() to cancel
@@ -135,25 +155,18 @@ class GuiLoggingHandler(logging.Handler):
     def __init__(self, log_cb: Callable, debug_getter: Optional[Callable] = None):
         super().__init__()
         self.log_cb = log_cb
-        # debug_getter is a callable that returns a bool indicating whether
-        # debug mode is enabled in the GUI. If not provided, debug is False.
         self._debug_getter = debug_getter or (lambda: False)
 
     def _sanitize_warning_text(self, text: str) -> str:
-        # Always extract the human-facing warning text and drop source-code lines.
-        # Strips the filename/lineno prefix and the indented source-code line that
-        # Python's warnings module appends, leaving a single clean message.
         try:
-            # If the captured text contains 'UserWarning:', take the content
-            # after it. This avoids keeping filename/lineno prefixes.
+            # If the captured text contains 'UserWarning:'
             if "UserWarning:" in text:
                 idx = text.find("UserWarning:")
                 after = text[idx + len("UserWarning:"):]
             else:
                 after = text
 
-            # Split into lines and pick the first non-empty line. This removes
-            # the following source-code line(s) that are typically indented.
+            # Split into lines and pick the first non-empty line
             for line in after.splitlines():
                 s = line.strip()
                 if s:
@@ -177,19 +190,14 @@ class GuiLoggingHandler(logging.Handler):
             except Exception:
                 debug_enabled = False
 
-            # In non-debug mode, suppress DEBUG and INFO records — but always
-            # let WARNING+ through so the user sees sanitized warnings.
             if not debug_enabled and record.levelno < logging.WARNING:
                 return
 
-            # Sanitize warning messages (captured from the warnings system) to a
-            # single clean line — always, regardless of debug mode.
+            # Sanitize warning messages
             sanitized = orig_msg
             if record.name == "py.warnings" or "UserWarning:" in orig_msg:
                 sanitized = self._sanitize_warning_text(orig_msg)
 
-            # Prefer the handler formatter for timestamp/level; replace the original
-            # message part with the sanitized message when possible.
             final = None
             if self.formatter is not None:
                 try:

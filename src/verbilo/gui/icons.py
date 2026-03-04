@@ -1,8 +1,4 @@
 # icons.py — centralised icon loading via pytablericons (Tabler Icons, MIT)
-#
-# Every icon used in the app is loaded through get_icon().  It returns a CTkImage
-# with separate light/dark variants so icons adapt to the active theme.
-# Results are cached to avoid re-rendering the same SVG multiple times.
 
 from __future__ import annotations
 import io
@@ -21,7 +17,7 @@ try:
     from PIL import Image as PILImage, ImageTk  # type: ignore[import-untyped]
 
     _HAS_ICONS = True
-except Exception:  # pragma: no cover
+except Exception:  
     TablerIcons = None  # type: ignore[assignment,misc]
     OutlineIcon = None  # type: ignore[assignment]
     FilledIcon = None  # type: ignore[assignment]
@@ -31,9 +27,6 @@ except Exception:  # pragma: no cover
 
 if TYPE_CHECKING:
     from customtkinter import CTkImage
-
-# Semantic icon map
-# Maps human-readable names to OutlineIcon enum members.
 
 _ICON_MAP: dict[str, object] = {}
 
@@ -67,12 +60,8 @@ if OutlineIcon is not None:
     }
 
 
-# Colour tokens for light / dark icons 
-
 def _icon_colors() -> tuple[str, str]:
-    # Return (light_color, dark_color) for icon rendering.
-    # light_color: used on light theme (choose a dark colour).
-    # dark_color: used on dark theme (choose a light colour).
+    # Return (light_color, dark_color) for icon rendering
     return "#3B3F46", "#C8CCD2"
 
 
@@ -97,8 +86,7 @@ def get_icon(
     *,
     on_accent: bool = False,
 ) -> "CTkImage | None":
-    # Return a CTkImage (light + dark variants) for `name`.
-    # Returns None when required libraries or icon are unavailable.
+
     if ctk is None or TablerIcons is None:
         return None
 
@@ -121,8 +109,7 @@ def get_icon(
 
 
 def get_photo_image(name: str, size: int = 18, color: str = "#C8CCD2") -> object | None:
-    # Return a tkinter PhotoImage for use in ttk widgets (single image).
-    # Use the provided colour for the current theme.
+    # Return a tkinter PhotoImage for use in ttk widgets (single image)
     if TablerIcons is None or PILImage is None or ImageTk is None:
         return None
 

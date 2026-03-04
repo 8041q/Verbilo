@@ -5,9 +5,7 @@ from .converters import docx_converter, xlsx_converter, pdf_converter
 from .utils.io import resolve_output_path
 from .utils import CancelledError
 
-# Re-export so that existing callers of ``from .main import CancelledError`` still work.
 __all__ = ["translate_file", "CancelledError"]
-
 
 def translate_file(
     input_path: str,
@@ -43,7 +41,6 @@ def translate_file(
             return "skipped-ocr"
     else:
         raise ValueError(f"Unsupported file type: {suffix}")
-    # return the final output path for callers that want to log or inspect it
     return output_path
 
 
