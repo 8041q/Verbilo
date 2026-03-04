@@ -214,12 +214,19 @@ def is_source_language(
     text: str,
     source_lang: str,
     detector: str = "auto",
+    strict: bool = False,
 ) -> bool:
     """Return ``True`` if *text* appears to be written in *source_lang*.
 
     When *source_lang* is ``"auto"`` this always returns ``True`` (translate
-    everything).  For very short text (< ``_MIN_DETECT_CHARS`` letters) this
-    also returns ``True`` to avoid false negatives.
+    everything).  For very short text (< ``_MIN_DETECT_CHARS`` letters) the
+    result depends on *strict*: in lenient mode (default) returns ``True`` to
+    avoid missing cells; in strict mode returns ``False`` to avoid wrongly
+    translating unknown segments inside mixed-language cells.
+
+    *strict=True* should only be used when evaluating individual segments of
+    a mixed-language cell, where the safe default is to preserve rather than
+    translate.
     """
     if source_lang == "auto":
         return True
@@ -228,21 +235,24 @@ def is_source_language(
 
     cleaned = _clean_for_detection(text)
     if len(cleaned) < _MIN_DETECT_CHARS:
-        # Too short to detect reliably — assume it should be translated.
-        return True
+        # Too short to detect reliably.
+        # Lenient: translate (avoid missing cells).
+        # Strict: preserve (avoid translating ambiguous segments).
+        return not strict
 
     detected_code, confidence = detect_language(text, detector=detector)
 
     if detected_code == "und":
-        # Detection failed entirely — safer to translate than to skip.
-        return True
+        # Detection failed entirely.
+        # Lenient: translate to be safe.  Strict: preserve to be safe.
+        return not strict
 
     match = detected_code == src
 
-    # In auto (multi-engine) mode, require decent confidence to *reject*.
-    # i.e. only skip translation if we're confident it's NOT the source lang.
+    # Require decent confidence to *reject* a match.
+    # Lenient: low-confidence non-match → translate (avoid skipping cells).
+    # Strict:  low-confidence non-match → preserve (avoid clobbering segments).
     if not match and confidence < _CONFIDENCE_THRESHOLD:
-        # Low confidence non-match — translate it to be safe.
-        return True
+        return not strict
 
     return match

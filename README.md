@@ -32,7 +32,7 @@ pip install pytablericons Pillow
 
 Credits: Tabler Icons / pytablericons: https://pypi.org/project/pytablericons/
 
----
+
 
 ## Requirements
 
@@ -49,25 +49,24 @@ For the GUI, also install (comes included):
 pip install customtkinter
 ```
 
----
+
 
 ## How it Works
 
-Verbilo handles translation differently based on your Source Language setting:
+- Verbilo handles translation differently based on your Source Language setting:
 
-Source = Auto-detect: Every text segment is sent to Google Translate unconditionally.
+- Source = Auto-detect: Every text segment is sent to Google Translate unconditionally.
 
-Source = Specific Language (e.g., English):
+- Source = Specific Language (e.g., English):
 
-The app splits text into segments (using / and \n as delimiters).
+- The app splits text into segments (using / and \n as delimiters).
 
-Each segment is checked by your chosen Detector.
+- Each segment is checked by your chosen Detector.
 
-Only segments matching the source language are translated.
+- Only segments matching the source language are translated.
 
-Auto Detector Mode: All three engines (Lingua, FastText, LangDetect) vote. If 2+ agree it's the source language, it's translated.
+- Auto Detector Mode: All three engines (Lingua, FastText, LangDetect) vote. If 2+ agree it's the source language, it's translated.
 
----
 
 ## Quick Start
 
@@ -106,7 +105,7 @@ Translate only English text to Portuguese (leaves other languages untouched):
 python -m src.verbilo.cli pt --source en
 ```
 
----
+
 
 ## CLI Reference
 
@@ -148,7 +147,6 @@ src/
       lang_detect.py
 ```
 
----
 
 
 ## Notes

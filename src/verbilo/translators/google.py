@@ -115,6 +115,7 @@ class DeepTranslatorWrapper:
         that are in the source language, and reassemble with the original
         separators.  Only used when ``source_lang != 'auto'``.
         """
+        from .lang_detect import is_source_language
         parts = self._SEGMENT_RE.split(text)
         changed = False
         result_parts: list[str] = []
@@ -127,7 +128,7 @@ class DeepTranslatorWrapper:
             if not stripped:
                 result_parts.append(part)
                 continue
-            if self._should_translate(stripped):
+            if is_source_language(stripped, self._source_lang, detector=self._detector, strict=True):
                 translated = self._translate_single(stripped, target_lang)
                 # Preserve leading/trailing whitespace from the original part
                 leading = part[:len(part) - len(part.lstrip())]
