@@ -41,7 +41,7 @@ _LANG_ALIASES: dict[str, str] = {
 
 
 def _norm_code(code: str) -> str:
-    """Normalise a language code to lowercase ISO 639-1 (2 letters)."""
+    # Normalise a language code to lowercase ISO 639-1 (2 letters)
     code = code.strip().lower()
     code = _LANG_ALIASES.get(code, code)
     # strip region suffix  e.g. "pt-br" -> "pt"
@@ -62,7 +62,7 @@ _NON_LETTER_RE = re.compile(r"[^a-zA-Z\u00C0-\u024F\u0400-\u04FF"
 
 
 def _clean_for_detection(text: str) -> str:
-    """Strip numbers, punctuation, URLs, emails — keep only 'letter' content."""
+    # Strip numbers, punctuation, URLs, emails — keep only 'letter' content
     text = unicodedata.normalize("NFC", text)
     # remove URLs
     text = re.sub(r"https?://\S+", " ", text)
@@ -78,7 +78,7 @@ def _clean_for_detection(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _detect_fasttext(text: str) -> Optional[tuple[str, float]]:
-    """Detect language using fasttext-langdetect.  Returns (code, conf) or None."""
+    # Detect language using fasttext-langdetect.  Returns (code, conf) or None
     try:
         from ftlangdetect import detect as ft_detect  # type: ignore
         result = ft_detect(text)
@@ -92,7 +92,7 @@ def _detect_fasttext(text: str) -> Optional[tuple[str, float]]:
 
 
 def _detect_lingua(text: str) -> Optional[tuple[str, float]]:
-    """Detect language using lingua-language-detector.  Returns (code, conf) or None."""
+    # Detect language using lingua-language-detector.  Returns (code, conf) or None
     try:
         from lingua import LanguageDetectorBuilder  # type: ignore
         # Build a lightweight detector — cached at module level after first call.
@@ -127,7 +127,7 @@ def _get_lingua_detector():
 
 
 def _detect_langdetect(text: str) -> Optional[tuple[str, float]]:
-    """Detect language using langdetect.  Returns (code, conf) or None."""
+    # Detect language using langdetect.  Returns (code, conf) or None
     try:
         import langdetect  # type: ignore
         langdetect.DetectorFactory.seed = 0
@@ -163,14 +163,7 @@ _AUTO_ORDER = ["fasttext", "lingua", "langdetect"]
 # ---------------------------------------------------------------------------
 
 def detect_language(text: str, detector: str = "auto") -> tuple[str, float]:
-    """Return (language_code, confidence) for *text*.
-
-    *detector* can be ``"auto"``, ``"fasttext"``, ``"lingua"`` or
-    ``"langdetect"``.  ``"auto"`` queries all available engines and returns
-    the majority vote (or the highest-confidence single result).
-
-    Returns ``("und", 0.0)`` when detection fails entirely.
-    """
+    # Return (language_code, confidence) for *text*
     cleaned = _clean_for_detection(text)
     if len(cleaned) < _MIN_DETECT_CHARS:
         return "und", 0.0
@@ -216,18 +209,7 @@ def is_source_language(
     detector: str = "auto",
     strict: bool = False,
 ) -> bool:
-    """Return ``True`` if *text* appears to be written in *source_lang*.
-
-    When *source_lang* is ``"auto"`` this always returns ``True`` (translate
-    everything).  For very short text (< ``_MIN_DETECT_CHARS`` letters) the
-    result depends on *strict*: in lenient mode (default) returns ``True`` to
-    avoid missing cells; in strict mode returns ``False`` to avoid wrongly
-    translating unknown segments inside mixed-language cells.
-
-    *strict=True* should only be used when evaluating individual segments of
-    a mixed-language cell, where the safe default is to preserve rather than
-    translate.
-    """
+    # Return ``True`` if *text* appears to be written in *source_lang*.
     if source_lang == "auto":
         return True
 

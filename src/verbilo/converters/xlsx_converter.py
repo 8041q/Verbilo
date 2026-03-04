@@ -16,7 +16,7 @@ _CONTROL_CHAR_RE = re.compile(
 
 
 def _sanitize_text(text: str) -> str:
-    """Normalize Unicode and strip problematic control characters."""
+    # Normalize Unicode and strip problematic control characters
     text = unicodedata.normalize("NFC", text)
     text = _CONTROL_CHAR_RE.sub("", text)
     return text

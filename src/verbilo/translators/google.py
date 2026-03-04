@@ -26,12 +26,18 @@ def post_process(text: str) -> str:
     # fix spacing around punctuation and collapse multiple spaces
     if not text:
         return text
-    text = re.sub(r'\s+([,.:;!?\)}\]])', r'\1', text)
-    text = re.sub(r'([,;])(?=[^\s\d])', r'\1 ', text)
-    text = re.sub(r'(:)(?=[^\s\d/\\])', r'\1 ', text)
-    text = re.sub(r'([.!?])(?=[A-Za-z\u00C0-\u024F\u0400-\u04FF\u4e00-\u9fff])', r'\1 ', text)
-    text = re.sub(r'  +', ' ', text)
-    return text.strip()
+    # Preserve leading/trailing whitespace (meaningful for DOCX runs)
+    leading = text[:len(text) - len(text.lstrip())]
+    trailing = text[len(text.rstrip()):]
+    inner = text.strip()
+    if not inner:
+        return text
+    inner = re.sub(r'\s+([,.:;!?\)}\]])', r'\1', inner)
+    inner = re.sub(r'([,;])(?=[^\s\d])', r'\1 ', inner)
+    inner = re.sub(r'(:)(?=[^\s\d/\\])', r'\1 ', inner)
+    inner = re.sub(r'([.!?])(?=[A-Za-z\u00C0-\u024F\u0400-\u04FF\u4e00-\u9fff])', r'\1 ', inner)
+    inner = re.sub(r'  +', ' ', inner)
+    return leading + inner + trailing
 
 
 def _run_cancellable(fn, cancel_event: Optional[threading.Event], poll_interval: float = 0.05):
@@ -96,12 +102,7 @@ class DeepTranslatorWrapper:
         return inst
 
     def _should_translate(self, text: str) -> bool:
-        """Return True if *text* should be sent to the translator.
-
-        When source_lang == "auto" every cell is translated.  Otherwise the
-        multi-engine detector decides whether the text is in the source
-        language.
-        """
+        # Return True if *text* should be sent to the translator.
         if self._source_lang == "auto":
             return True
         from .lang_detect import is_source_language
@@ -111,10 +112,7 @@ class DeepTranslatorWrapper:
     _SEGMENT_RE = re.compile(r'(\n|\r\n|\r|/)')
 
     def _translate_segments(self, text: str, target_lang: str) -> str:
-        """Split *text* on ``/`` and newlines, translate only the segments
-        that are in the source language, and reassemble with the original
-        separators.  Only used when ``source_lang != 'auto'``.
-        """
+        # Split *text* on ``/`` and newlines, translate only the segments
         from .lang_detect import is_source_language
         parts = self._SEGMENT_RE.split(text)
         changed = False
@@ -140,7 +138,7 @@ class DeepTranslatorWrapper:
         return "".join(result_parts) if changed else text
 
     def _translate_single(self, text: str, target_lang: str) -> str:
-        """Translate a single piece of text (no segment splitting)."""
+        # Translate a single piece of text (no segment splitting)
         tgt_cache = self._cache.setdefault(target_lang, {})
         if text in tgt_cache:
             return tgt_cache[text]

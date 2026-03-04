@@ -1257,9 +1257,9 @@ class App:
         brand_frame.grid_columnconfigure(1, weight=1)
 
         try:
-            pil_img = get_app_icon(size=48)
+            pil_img = get_app_icon(size=256)
             if pil_img is not None and ctk is not None:
-                logo_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(48, 48))
+                logo_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(65, 65))
                 ctk.CTkLabel(brand_frame, text="", image=logo_img, width=48).grid(
                     row=0, column=0, rowspan=2, padx=(0, 12),
                 )
@@ -1287,7 +1287,7 @@ class App:
 
         # --- Copyright ---
         theme.make_label(
-            card, "\u00a9 2026 crt_  \u2014  Released under the MIT License",
+            card, "\u00a9 2026 crt_ (8041q) \u2014  Released under the MIT License",
             level="tiny",
         ).grid(row=3, column=0, sticky="w", padx=PAD, pady=(0, PAD))
 
@@ -1365,7 +1365,7 @@ class App:
                           height=28).pack(side=tk.LEFT, padx=(0, 6))
         theme.make_button(links_frame, "Release Notes", command=_open_releases, style="ghost",
                           height=28).pack(side=tk.LEFT, padx=(0, 16))
-        theme.make_label(links_frame, "Made by crt_", level="tiny").pack(side=tk.LEFT)
+        theme.make_label(links_frame, "Made by crt_ (8041q)", level="tiny").pack(side=tk.LEFT)
 
         win.protocol("WM_DELETE_WINDOW", win.destroy)
         win.update_idletasks()

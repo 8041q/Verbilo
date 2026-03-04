@@ -65,12 +65,12 @@ def _detect_font_family() -> str:
 FONT_FAMILY: str = _detect_font_family()
 
 # (family, size, ?weight) — sizes are logical
-FONT_HEADING:    tuple[str, int, str] = (FONT_FAMILY, 20, "bold")
-FONT_SUBHEADING: tuple[str, int, str] = (FONT_FAMILY, 15, "bold")
+FONT_HEADING:    tuple[str, int, str] = (FONT_FAMILY, 23, "bold") # app title
+FONT_SUBHEADING: tuple[str, int, str] = (FONT_FAMILY, 15, "bold") # headers titles
 FONT_SECTION:    tuple[str, int, str] = (FONT_FAMILY, 11, "bold")  # sidebar sections (uppercased)
-FONT_BODY:       tuple[str, int]      = (FONT_FAMILY, 13)
-FONT_SMALL:      tuple[str, int]      = (FONT_FAMILY, 12)
-FONT_TINY:       tuple[str, int]      = (FONT_FAMILY, 11)
+FONT_BODY:       tuple[str, int]      = (FONT_FAMILY, 12) # dropdown list
+FONT_SMALL:      tuple[str, int]      = (FONT_FAMILY, 12) # identification (table headers, settings option)
+FONT_TINY:       tuple[str, int]      = (FONT_FAMILY, 11) # info and notes
 
 
 #  Palette — semantic colour tokens
@@ -127,7 +127,7 @@ DARK = Palette(
     text_muted="#6B6F78",
     text_on_accent="#FFFFFF",
 
-    accent="#A4CBB4",
+    accent="#6C8878",
     accent_hover="#97B9A5",
     accent_pressed="#8DAC9A",
 
@@ -152,7 +152,7 @@ LIGHT = Palette(
     text_muted="#9198A1",
     text_on_accent="#FFFFFF",
 
-    accent="#A4CBB4",
+    accent="#82AD95",
     accent_hover="#97B9A5",
     accent_pressed="#8DAC9A",
 
