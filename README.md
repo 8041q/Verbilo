@@ -1,7 +1,7 @@
 # Verbilo - Portable
 <sub>- beta</sub>
 
-Translate Word documents, Excel spreadsheets, and PDFs into any of 130+ languages while preserving the original formatting — tables, fonts, images, colours, and layout all stay intact.
+Translate Excel spreadsheets, Word documents, and PDFs into any of 130+ languages while preserving the original formatting, tables, fonts, images, colours, and layout.
 
 ---
 
@@ -9,28 +9,28 @@ Translate Word documents, Excel spreadsheets, and PDFs into any of 130+ language
 
 - Change UI/UX framework (Electron, Tauri, Neutralino.js, Wails or Flutter)
 - Create Web version
+- Add AI translating capabilities and/or detection (via API) 
 
 ## Features
 
-- **Batch translation** — drop files in `origin/`, run one command, get translated files in `output/`
-- **GUI** — interactive interface with file picker, progress tracking, and log output
-- **Formatting preserved** — DOCX run-level styles (bold, italic, font, size) and XLSX cell styles survive translation unchanged
-- **PDFs edited in-place** — text is replaced inside the original PDF using PyMuPDF, so images, graphics, and page layout are kept
-- **Scanned PDF detection** — PDFs that require OCR are automatically detected and skipped with a log message instead of producing broken output
-- **Source language filter** — specify a source language (e.g. English) so only text in that language is translated; columns or cells already in other languages are left untouched
-- **130+ languages** — full Google Translate language list with a searchable dropdown in the GUI
-- **Fast** — all text is collected and sent in batches rather than one request per word/cell, cutting translation time from ~10 minutes to under a minute for most files
+- **Multi-Engine Language Detection**: Use Lingua, FastText, or LangDetect to filter what gets translated. Use Auto mode for a majority-vote system between all three for maximum accuracy
+- **GUI**: interactive interface with file picker, progress tracking, and log output
+- **Formatting preserved**: DOCX run-level styles (bold, italic, font, size) and XLSX cell styles survive translation
+- **PDFs edited in-place**: text is replaced inside the original PDF using PyMuPDF, so images, graphics, and page layout are kept
+- **Scanned PDF detection**: PDFs that require OCR are automatically detected and skipped with a log message instead of producing broken output
+- **Source language filter**: specify a source language so only text in that language is translated
+- **130+ languages**: full Google Translate language list with a searchable dropdown
+- **Segment-Aware Translation**: Smart splitting logic detects languages within sub-segments of cells (separated by / or \n), ensuring only the intended text is translated while keeping technical strings or other languages untouched
 
-## UI / Visual updates
+## UI / UX
 
-The GUI has been refreshed for a more consistent, modern appearance.
-Icons are now loaded centrally via the open-source Tabler Icons wrapper `pytablericons`; install it (and Pillow) to render icons in the app:
+The GUI are loaded centrally via the open-source Tabler Icons wrapper `pytablericons`; install it (and Pillow) to render icons in the app:
 
 ```bash
 pip install pytablericons Pillow
 ```
 
-Credits: Tabler Icons / pytablericons — https://pypi.org/project/pytablericons/
+Credits: Tabler Icons / pytablericons: https://pypi.org/project/pytablericons/
 
 ---
 
@@ -43,7 +43,7 @@ Credits: Tabler Icons / pytablericons — https://pypi.org/project/pytablericons
 pip install -r requirements.txt
 ```
 
-For the GUI, also install:
+For the GUI, also install (comes included):
 
 ```bash
 pip install customtkinter
@@ -51,13 +51,21 @@ pip install customtkinter
 
 ---
 
-## Supported File Types
+## How it Works
 
-| Format | Extension | Notes |
-|---|---|---|
-| Word document | `.docx` | Run-level formatting preserved |
-| Excel spreadsheet | `.xlsx`, `.xls` | Cell styles, merged cells, formulas preserved |
-| PDF | `.pdf` | Text replaced in-place; images/graphics untouched. Scanned/image-only PDFs are skipped. |
+Verbilo handles translation differently based on your Source Language setting:
+
+Source = Auto-detect: Every text segment is sent to Google Translate unconditionally.
+
+Source = Specific Language (e.g., English):
+
+The app splits text into segments (using / and \n as delimiters).
+
+Each segment is checked by your chosen Detector.
+
+Only segments matching the source language are translated.
+
+Auto Detector Mode: All three engines (Lingua, FastText, LangDetect) vote. If 2+ agree it's the source language, it's translated.
 
 ---
 
@@ -67,7 +75,7 @@ pip install customtkinter
 
 ```bash
 pip install -r requirements.txt
-pip install customtkinter   # for the GUI
+pip install customtkinter   # if it says not installed, otherwise ignore this command
 ```
 
 ### 2. Launch the GUI
@@ -78,10 +86,11 @@ python -m src.verbilo.cli --gui
 
 In the GUI:
 1. Click **Add Files** or **Select Folder** to load documents
-2. Set **Source language** — pick the language your documents are written in, or leave on *Auto-detect* to translate everything
-3. Set **Target language** — the language to translate into (type to filter the list)
-4. Choose an **Output folder** (defaults to `output/`)
-5. Click **Start**
+2. Set **Source language**: pick the language to translate only that or leave on *Auto-detect* to translate everything
+3. Set **Target language**: pick the destination language to translate into (type to filter the list)
+4. **Language detector**: select your preferred engine (use auto for best results)
+5. Choose an **Output folder**: (defaults to `output/`, creates the folder on root)
+6. Click **Start**
 
 ### 3. Or use the CLI
 
@@ -107,25 +116,23 @@ python -m src.verbilo.cli [LANG] [--source CODE] [--gui]
 
 | Argument | Description |
 |---|---|
-| `LANG` | Target language code, e.g. `es`, `pt`, `fr` |
-| `--source CODE` | Source language code (default: `auto` — translate all text) |
-| `--gui` | Launch the graphical interface instead of batch mode |
+| `LANG` | Target language code (e.g.,`es`, `pt`) |
+| `--source CODE` | Source language code (default: `auto`) |
+| `--detector` | Detection engine: auto (default), lingua, fasttext, or langdetect |
+| `--gui` | Launch the graphical interface |
 
 ---
 
 ## Project Structure
 
 ```
-origin/          ← place input files here
-output/          ← translated files are written here
+output/          ← translated files, auto creates if no folder selected
 src/
   verbilo/
-    __init__.py
-    cli.py           — command-line entry point (or run installed `verbilo`)
-    main.py          — `translate_file()` core API
+    cli.py
+    main.py         - `translate_file()` core API
     gui/
-      __init__.py
-      app.py         — CustomTkinter GUI
+      app.py        - CustomTkinter GUI
       config.py
       helpers.py
       theme.py
@@ -135,41 +142,21 @@ src/
       xlsx_converter.py
       pdf_converter.py
     translators/
-      dummy.py       — Google Translate wrapper with batching + source filtering
+      base.py
+      dummy.py
+      google.py
+      lang_detect.py
 ```
 
 ---
 
-## Language Codes
-
-Standard ISO 639-1 codes are used. Common examples:
-
-| Code | Language | Code | Language |
-|---|---|---|---|
-| `en` | English | `ar` | Arabic |
-| `es` | Spanish | `hi` | Hindi |
-| `fr` | French | `ja` | Japanese |
-| `de` | German | `ko` | Korean |
-| `it` | Italian | `ru` | Russian |
-| `pt` | Portuguese | `zh-CN` | Chinese (Simplified) |
-| `nl` | Dutch | `tr` | Turkish |
-| `pl` | Polish | `sv` | Swedish |
-
-The full list of 130+ supported codes is shown in the GUI dropdown.
-
----
 
 ## Notes
 
-- Translation uses the **free Google Translate API** via `deep-translator`. No API key is required, but very large batches may occasionally hit rate limits.
-- **Scanned PDFs** (image-only, no embedded text) are automatically detected and skipped — a message is logged so you know which files were not translated.
-- The **source language filter** uses local language detection (`langdetect`) — no extra API calls.
+- **API Usage**: To avoid rate limits, Verbilo batches segments. When a specific source language is set, detection happens locally, saving API overhead on non-target text
+- **Scanned PDFs** (image-only, no embedded text) are automatically detected and skipped: a message is logged so you know which files were not translated
+- **Detection Performance**: Lingua is highly accurate for short strings but heavier; FastText is extremely fast. The auto (vote system) mode provides the best balance
 
----
-
-## Future Implementations
-
-- **Settings:** Auto Update (check for updates, install, etc)
 
 ## License
 MIT

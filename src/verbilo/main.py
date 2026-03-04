@@ -14,13 +14,14 @@ def translate_file(
     translator_name: str | None = None,
     source_lang: str = "auto",
     cancel_event: threading.Event | None = None,
+    detector: str = "auto",
 ):
     # source_lang="auto" translates everything; cancel_event raises CancelledError before saving
     p = Path(input_path)
     if not p.exists():
         raise FileNotFoundError(input_path)
 
-    translator = TranslatorFactory.get(translator_name, source_lang=source_lang or "auto")
+    translator = TranslatorFactory.get(translator_name, source_lang=source_lang or "auto", detector=detector)
 
     # Validate target language early to avoid silent no-ops downstream
     if not target_lang or not isinstance(target_lang, str) or not target_lang.strip():

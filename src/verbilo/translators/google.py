@@ -17,8 +17,8 @@ _BATCH_SIZE = 50
 # Maximum total characters per batch – just under Google's ~5 000 char limit.
 _BATCH_MAX_CHARS = 4900
 
-# Minimum text length (chars) for target-language detection to be trusted.
-_SKIP_MIN_CHARS = 20
+# Valid detector names for the language-detection subsystem.
+VALID_DETECTORS = ("auto", "fasttext", "lingua", "langdetect")
 
 
 # Lightweight post-processing: fix common Google Translate artefacts
@@ -73,8 +73,9 @@ class IdentityTranslator:
 
 class DeepTranslatorWrapper:
 
-    def __init__(self, source_lang: str = "auto"):
+    def __init__(self, source_lang: str = "auto", detector: str = "auto"):
         self._source_lang = source_lang
+        self._detector = detector
         try:
             from deep_translator import GoogleTranslator
             self._impl_cls = GoogleTranslator
@@ -83,41 +84,88 @@ class DeepTranslatorWrapper:
         self._instances: Dict[str, Any] = {}
         self._cache: Dict[str, Dict[str, str]] = {}
 
-        self._langdetect = None
-        try:
-            import langdetect as _ld
-            _ld.DetectorFactory.seed = 0  # deterministic
-            self._langdetect = _ld
-        except ImportError:
-            pass
-
     def _get_instance(self, target_lang: str):
         inst = self._instances.get(target_lang)
         if inst is None:
             if self._impl_cls is None:
                 raise RuntimeError("deep_translator is not available")
-            # always source="auto"; source_lang only for the target-skip check
+            # Always let Google auto-detect the source; pre-filtering handles
+            # source-language selection so we never feed the wrong lang code.
             inst = self._impl_cls(source="auto", target=target_lang)
             self._instances[target_lang] = inst
         return inst
 
-    def _is_already_target_lang(self, text: str, target_lang: str) -> bool:
-        # True if text is already in target_lang (only when langdetect available and text long enough)
-        if self._langdetect is None:
-            return False
-        if len(text.strip()) < _SKIP_MIN_CHARS:
-            return False
+    def _should_translate(self, text: str) -> bool:
+        """Return True if *text* should be sent to the translator.
+
+        When source_lang == "auto" every cell is translated.  Otherwise the
+        multi-engine detector decides whether the text is in the source
+        language.
+        """
+        if self._source_lang == "auto":
+            return True
+        from .lang_detect import is_source_language
+        return is_source_language(text, self._source_lang, detector=self._detector)
+
+    # Pattern for splitting mixed-language cells exactly.
+    _SEGMENT_RE = re.compile(r'(\n|\r\n|\r|/)')
+
+    def _translate_segments(self, text: str, target_lang: str) -> str:
+        """Split *text* on ``/`` and newlines, translate only the segments
+        that are in the source language, and reassemble with the original
+        separators.  Only used when ``source_lang != 'auto'``.
+        """
+        parts = self._SEGMENT_RE.split(text)
+        changed = False
+        result_parts: list[str] = []
+        for i, part in enumerate(parts):
+            if i % 2 == 1:
+                # separator — keep as-is
+                result_parts.append(part)
+                continue
+            stripped = part.strip()
+            if not stripped:
+                result_parts.append(part)
+                continue
+            if self._should_translate(stripped):
+                translated = self._translate_single(stripped, target_lang)
+                # Preserve leading/trailing whitespace from the original part
+                leading = part[:len(part) - len(part.lstrip())]
+                trailing = part[len(part.rstrip()):]
+                result_parts.append(leading + translated + trailing)
+                changed = True
+            else:
+                result_parts.append(part)
+        return "".join(result_parts) if changed else text
+
+    def _translate_single(self, text: str, target_lang: str) -> str:
+        """Translate a single piece of text (no segment splitting)."""
+        tgt_cache = self._cache.setdefault(target_lang, {})
+        if text in tgt_cache:
+            return tgt_cache[text]
         try:
-            detected = self._langdetect.detect(text)
-            return detected.lower().startswith(target_lang.lower())
+            translator = self._get_instance(target_lang)
+            result = translator.translate(text)
+            result = result if result is not None else text
+            result = post_process(result)
+            tgt_cache[text] = result
+            return result
         except Exception:
-            return False
+            logger.exception("DeepTranslator segment failed for target '%s'", target_lang)
+            return text
 
     # ----- single-item convenience ----- #
 
     def translate_text(self, text: str, target_lang: str) -> str:
         if not self._impl_cls or not text or not text.strip():
             return text
+        # When a specific source language is set, handle mixed-language cells
+        # by splitting on / and newlines and translating only matching segments.
+        if self._source_lang != "auto":
+            if self._SEGMENT_RE.search(text):
+                return self._translate_segments(text, target_lang)
+            if not self._should_translate(text):
+                return text
         tgt_cache = self._cache.setdefault(target_lang, {})
         if text in tgt_cache:
             return tgt_cache[text]
@@ -150,11 +198,15 @@ class DeepTranslatorWrapper:
         tgt_cache = self._cache.setdefault(target_lang, {})
 
         # Separate translatable vs pass-through, resolving cache hits inline.
-        to_translate: list[tuple[int, str]] = [] 
+        to_translate: list[tuple[int, str]] = []
         for i, t in enumerate(texts):
             if not t or not t.strip():
                 continue
-            if self._is_already_target_lang(t, target_lang):
+            # Mixed-language cell: handle per-segment (not batchable)
+            if self._source_lang != "auto" and self._SEGMENT_RE.search(t):
+                results[i] = self._translate_segments(t, target_lang)
+                continue
+            if not self._should_translate(t):
                 continue
             if t in tgt_cache:
                 results[i] = tgt_cache[t]
@@ -280,11 +332,11 @@ class DeepTranslatorWrapper:
 
 class TranslatorFactory:
     @staticmethod
-    def get(name: Optional[str] = None, source_lang: str = "auto") -> Translator:
+    def get(name: Optional[str] = None, source_lang: str = "auto", detector: str = "auto") -> Translator:
         if name is None:
             try:
                 from deep_translator import GoogleTranslator  # type: ignore  # noqa: F401
-                return DeepTranslatorWrapper(source_lang=source_lang)
+                return DeepTranslatorWrapper(source_lang=source_lang, detector=detector)
             except Exception:
                 logger.warning(
                     "deep_translator is not available — returning IdentityTranslator "
@@ -294,5 +346,5 @@ class TranslatorFactory:
         if name.lower() == "identity":
             return IdentityTranslator()
         if name.lower() in ("deep", "deep-translator", "google"):
-            return DeepTranslatorWrapper(source_lang=source_lang)
+            return DeepTranslatorWrapper(source_lang=source_lang, detector=detector)
         return IdentityTranslator()

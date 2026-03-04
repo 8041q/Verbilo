@@ -18,6 +18,9 @@ def main():
     parser.add_argument("lang", nargs="?", help="Target language code (e.g., 'es')")
     parser.add_argument("--source", "-s", default="auto",
                         help="Source language code (e.g. 'en'). 'auto' = translate all text (default)")
+    parser.add_argument("--detector", "-d", default="auto",
+                        choices=["auto", "fasttext", "lingua", "langdetect"],
+                        help="Language detector engine (default: auto = multi-engine vote)")
     parser.add_argument("--gui", action="store_true", help="Launch the GUI instead of running batch CLI")
     args = parser.parse_args()
 
@@ -48,7 +51,7 @@ def main():
     print(f"Source language: {args.source}  |  Target language: {args.lang}")
     for f in files:
         try:
-            result = translate_file(str(f), args.lang, str(output), source_lang=args.source)
+            result = translate_file(str(f), args.lang, str(output), source_lang=args.source, detector=args.detector)
             if result == "skipped-ocr":
                 print(f"Skipped {f.name} (scanned/image PDF requiring OCR)")
             else:

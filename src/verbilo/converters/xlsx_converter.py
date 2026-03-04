@@ -3,9 +3,23 @@ from openpyxl.cell.cell import MergedCell
 from typing import Any
 import logging
 import threading
+import unicodedata
+import re
 from ..utils import CancelledError
 
 logger = logging.getLogger(__name__)
+
+# Control-character pattern: matches C0/C1 control chars except tab, newline, carriage return
+_CONTROL_CHAR_RE = re.compile(
+    r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]'
+)
+
+
+def _sanitize_text(text: str) -> str:
+    """Normalize Unicode and strip problematic control characters."""
+    text = unicodedata.normalize("NFC", text)
+    text = _CONTROL_CHAR_RE.sub("", text)
+    return text
 
 
 def translate_xlsx(input_path: str, output_path: str, translator: Any, target_lang: str, *, cancel_event: threading.Event | None = None):
@@ -28,16 +42,19 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
 
     logger.info("XLSX '%s': collected %d translatable string cells", input_path, len(texts))
 
+    # --- sanitize texts before translation ---
+    sanitized = [_sanitize_text(t) for t in texts]
+
     # --- batch-translate ---
-    if texts:
+    if sanitized:
         try:
-            translated = translator.translate_batch(texts, target_lang, cancel_event=cancel_event)
+            translated = translator.translate_batch(sanitized, target_lang, cancel_event=cancel_event)
         except CancelledError:
             raise
         except Exception:
             logger.exception("Batch translation failed for XLSX; falling back to per-item")
             translated = []
-            for t in texts:
+            for t in sanitized:
                 try:
                     r = translator.translate_text(t, target_lang)
                     translated.append(r if r is not None else t)

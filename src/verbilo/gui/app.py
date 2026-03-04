@@ -625,17 +625,17 @@ class App:
         self.target_lang_box.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 6))
         row += 1
 
-        # Translator
+        # Language detector
         theme.make_label(
-            self.sidebar, "Translator", level="small",
+            self.sidebar, "Language detector", level="small",
         ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(6, 2))
         row += 1
 
-        self.translator_var = tk.StringVar(value="auto")
-        self.translator_menu = ctk.CTkOptionMenu(
+        self.detector_var = tk.StringVar(value="auto")
+        self.detector_menu = ctk.CTkOptionMenu(
             self.sidebar,
-            values=["auto", "identity", "deep"],
-            variable=self.translator_var,
+            values=["auto", "lingua", "fasttext", "langdetect"],
+            variable=self.detector_var,
             fg_color=p.bg_input,
             button_color=p.accent,
             button_hover_color=p.accent_hover,
@@ -648,7 +648,7 @@ class App:
             corner_radius=theme.BUTTON_CORNER_RADIUS,
             height=32,
         )
-        self.translator_menu.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 6))
+        self.detector_menu.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 6))
         row += 1
 
         # Divider
@@ -1526,16 +1526,13 @@ class App:
                 return
         output = str(out_path)
 
-        # Normalize translator selection
-        sel_trans = (self.translator_var.get() or "").strip()
-        norm = sel_trans.lower()
-        if not sel_trans or norm in ("auto", "none"):
-            translator = None
-        else:
-            translator = sel_trans
+        # Resolve language detector selection
+        detector = (self.detector_var.get() or "auto").strip().lower()
+        if detector not in ("auto", "lingua", "fasttext", "langdetect"):
+            detector = "auto"
 
         try:
-            self._log(f"Starting: source={source_lang!r}, target={lang!r}, translator={translator!r}")
+            self._log(f"Starting: source={source_lang!r}, target={lang!r}, detector={detector!r}")
         except Exception:
             pass
 
@@ -1552,9 +1549,10 @@ class App:
         self._update_progress_label(f"0 / {self.total_files} files (0%)")
 
         self.worker.start(
-            self.files, lang, output, translator,
+            self.files, lang, output, None,
             self._progress_cb, self._log,
             source_lang=source_lang,
+            detector=detector,
         )
 
     def _cancel(self):

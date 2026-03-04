@@ -84,6 +84,7 @@ class Worker:
         progress_cb: Callable[[str, str, Optional[float]], None],
         log_cb: Callable[[str], None],
         source_lang: str = "auto",
+        detector: str = "auto",
     ):
         if self._thread and self._thread.is_alive():
             raise RuntimeError("Worker already running")
@@ -92,7 +93,7 @@ class Worker:
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._run,
-            args=(list(files), target_lang, output_dir, translator_name, progress_cb, log_cb, source_lang),
+            args=(list(files), target_lang, output_dir, translator_name, progress_cb, log_cb, source_lang, detector),
             daemon=True,
         )
         self._thread.start()
@@ -100,7 +101,7 @@ class Worker:
     def stop(self):
         self._stop.set()
 
-    def _run(self, files, target_lang, output_dir, translator_name, progress_cb, log_cb, source_lang):
+    def _run(self, files, target_lang, output_dir, translator_name, progress_cb, log_cb, source_lang, detector):
         for f in files:
             if self._stop.is_set():
                 log_cb("Cancelled by user")
@@ -114,6 +115,7 @@ class Worker:
                     f, target_lang, output_dir, translator_name,
                     source_lang=source_lang,
                     cancel_event=self._stop,
+                    detector=detector,
                 )
                 elapsed = time.perf_counter() - t0
 
