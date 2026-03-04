@@ -2,26 +2,16 @@
   <img src=".\src\verbilo\assets/favicon.jpg" alt="Verbilo logo" width="220" />
 </p>
 
-<p align="center">
-  <a href="https://github.com/8041q/Verbilo/releases">
-    <img alt="Releases" src="https://img.shields.io/github/v/release/8041q/Verbilo">
-  </a>
-  <a href="https://github.com/8041q/Verbilo/releases">
-    <img alt="Release Notes" src="https://img.shields.io/badge/release-notes-blue">
-  </a>
-  <a href="https://www.python.org/downloads/">
-    <img alt="Python" src="https://img.shields.io/badge/python-3.12%2B-brightgreen">
-  </a>
-  <a href="https://opensource.org/licenses/MIT">
-    <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg">
-  </a>
-  <a href="https://github.com/8041q/Verbilo/stargazers">
-    <img alt="Stars" src="https://img.shields.io/github/stars/8041q/Verbilo?style=social">
-  </a>
-  <a href="https://github.com/8041q/Verbilo/issues">
-    <img alt="Issues" src="https://img.shields.io/github/issues/8041q/Verbilo">
-  </a>
-</p>
+<div align="center">
+
+[![Releases](https://img.shields.io/github/v/release/8041q/Verbilo)](https://github.com/8041q/Verbilo/releases)
+[![Release Notes](https://img.shields.io/badge/release-notes-blue)](https://github.com/8041q/Verbilo/releases)
+[![Python](https://img.shields.io/badge/python-3.12%2B-brightgreen)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Stars](https://img.shields.io/github/stars/8041q/Verbilo?style=flat)](https://github.com/8041q/Verbilo/stargazers)
+[![Issues](https://img.shields.io/github/issues/8041q/Verbilo)](https://github.com/8041q/Verbilo/issues)
+
+</div>
 
 ### Verbilo — Portable
 <p align="center"><em>Translate DOCX, XLSX and PDF into 130+ languages while preserving layout, styles, and images.</em></p>
