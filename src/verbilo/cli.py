@@ -18,9 +18,9 @@ def main():
     parser.add_argument("lang", nargs="?", help="Target language code (e.g., 'es')")
     parser.add_argument("--source", "-s", default="auto",
                         help="Source language code (e.g. 'en'). 'auto' = translate all text (default)")
-    parser.add_argument("--detector", "-d", default="auto",
-                        choices=["auto", "fasttext", "lingua", "langdetect"],
-                        help="Language detector engine (default: auto = multi-engine vote)")
+    parser.add_argument("--detector", "-d", default="fasttext",
+                        choices=["fasttext", "lingua"],
+                        help="Language detector engine (default: fasttext)")
     parser.add_argument("--gui", action="store_true", help="Launch the GUI instead of running batch CLI")
     args = parser.parse_args()
 

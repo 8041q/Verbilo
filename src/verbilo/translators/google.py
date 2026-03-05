@@ -18,7 +18,7 @@ _BATCH_SIZE = 50
 _BATCH_MAX_CHARS = 4900
 
 # Valid detector names for the language-detection subsystem.
-VALID_DETECTORS = ("auto", "fasttext", "lingua", "langdetect")
+VALID_DETECTORS = ("fasttext", "lingua")
 
 
 # Lightweight post-processing: fix common Google Translate artefacts
@@ -79,7 +79,7 @@ class IdentityTranslator:
 
 class DeepTranslatorWrapper:
 
-    def __init__(self, source_lang: str = "auto", detector: str = "auto"):
+    def __init__(self, source_lang: str = "auto", detector: str = "fasttext"):
         self._source_lang = source_lang
         self._detector = detector
         try:
@@ -331,7 +331,7 @@ class DeepTranslatorWrapper:
 
 class TranslatorFactory:
     @staticmethod
-    def get(name: Optional[str] = None, source_lang: str = "auto", detector: str = "auto") -> Translator:
+    def get(name: Optional[str] = None, source_lang: str = "auto", detector: str = "fasttext") -> Translator:
         if name is None:
             try:
                 from deep_translator import GoogleTranslator  # type: ignore  # noqa: F401

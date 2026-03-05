@@ -14,7 +14,7 @@ def translate_file(
     translator_name: str | None = None,
     source_lang: str = "auto",
     cancel_event: threading.Event | None = None,
-    detector: str = "auto",
+    detector: str = "fasttext",
 ):
     # source_lang="auto" translates everything; cancel_event raises CancelledError before saving
     p = Path(input_path)

@@ -515,16 +515,24 @@ class App:
         return str(Path.cwd())
 
     def _initialdir_for_output(self) -> str:
+        candidate = None
         try:
             if hasattr(self, "output_entry"):
                 val = self.output_entry.get().strip()
                 if val:
-                    return str((Path.cwd() / val).resolve())
+                    p = Path(val)
+                    candidate = p.resolve() if p.is_absolute() else (Path.cwd() / p).resolve()
         except Exception:
             pass
-        if self.cfg.get("default_output"):
-            return str((Path.cwd() / self.cfg["default_output"]).resolve())
-        return str(Path.cwd())
+        if candidate is None and self.cfg.get("default_output"):
+            candidate = (Path.cwd() / self.cfg["default_output"]).resolve()
+        if candidate is None:
+            candidate = Path.cwd()
+        # Walk up to the nearest existing ancestor so Windows doesn't fall back
+        # to the last-used directory (which may be the input file's directory).
+        while not candidate.exists() and candidate.parent != candidate:
+            candidate = candidate.parent
+        return str(candidate)
 
     # --- UI construction ---
 
@@ -631,10 +639,10 @@ class App:
         ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(6, 2))
         row += 1
 
-        self.detector_var = tk.StringVar(value="auto")
+        self.detector_var = tk.StringVar(value="fasttext")
         self.detector_menu = ctk.CTkOptionMenu(
             self.sidebar,
-            values=["auto", "lingua", "fasttext", "langdetect"],
+            values=["fasttext", "lingua"],
             variable=self.detector_var,
             fg_color=p.bg_input,
             button_color=p.accent,
@@ -997,8 +1005,10 @@ class App:
 
         def _browse_default_input():
             raw = in_entry.get().strip() or self.cfg.get("default_input") or ""
-            init = str((Path.cwd() / raw).resolve()) if raw else str(Path.cwd())
-            d = filedialog.askdirectory(title="Select default input folder", initialdir=init)
+            candidate = (Path.cwd() / raw).resolve() if raw else Path.cwd()
+            while not candidate.exists() and candidate.parent != candidate:
+                candidate = candidate.parent
+            d = filedialog.askdirectory(title="Select default input folder", parent=win, initialdir=str(candidate))
             if d:
                 in_entry.delete(0, tk.END)
                 in_entry.insert(0, _try_make_relative(d))
@@ -1019,8 +1029,10 @@ class App:
 
         def _browse_default_output():
             raw = out_entry.get().strip() or self.cfg.get("default_output") or DEFAULT_OUTPUT_FOLDER
-            init = str((Path.cwd() / raw).resolve()) if raw else str(Path.cwd())
-            d = filedialog.askdirectory(title="Select default output folder", initialdir=init)
+            candidate = (Path.cwd() / raw).resolve() if raw else Path.cwd()
+            while not candidate.exists() and candidate.parent != candidate:
+                candidate = candidate.parent
+            d = filedialog.askdirectory(title="Select default output folder", parent=win, initialdir=str(candidate))
             if d:
                 out_entry.delete(0, tk.END)
                 out_entry.insert(0, _try_make_relative(d))
@@ -1386,7 +1398,7 @@ class App:
             ("PDF documents", ("*.pdf",)),
             ("All files", "*.*"),
         ]
-        paths = filedialog.askopenfilenames(title="Select files", initialdir=init, filetypes=filetypes)
+        paths = filedialog.askopenfilenames(title="Select files", parent=self.root, initialdir=init, filetypes=filetypes)
         if not paths:
             return
 
@@ -1415,7 +1427,7 @@ class App:
 
     def _select_folder(self):
         init = self._initialdir_for_input()
-        d = filedialog.askdirectory(title="Select folder containing files", initialdir=init)
+        d = filedialog.askdirectory(title="Select folder containing files", parent=self.root, initialdir=init)
         if not d:
             return
         found = list_supported_files(d)
@@ -1463,7 +1475,7 @@ class App:
 
     def _select_output(self):
         init = self._initialdir_for_output()
-        d = filedialog.askdirectory(title="Select output folder", initialdir=init)
+        d = filedialog.askdirectory(title="Select output folder", parent=self.root, initialdir=init)
         if d:
             self.output_entry.delete(0, tk.END)
             self.output_entry.insert(0, _try_make_relative(d))
@@ -1527,9 +1539,9 @@ class App:
         output = str(out_path)
 
         # Resolve language detector selection
-        detector = (self.detector_var.get() or "auto").strip().lower()
-        if detector not in ("auto", "lingua", "fasttext", "langdetect"):
-            detector = "auto"
+        detector = (self.detector_var.get() or "fasttext").strip().lower()
+        if detector not in ("fasttext", "lingua"):
+            detector = "fasttext"
 
         try:
             self._log(f"Starting: source={source_lang!r}, target={lang!r}, detector={detector!r}")

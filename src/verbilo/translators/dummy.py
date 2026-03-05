@@ -38,14 +38,6 @@ class DeepTranslatorWrapper:
         except Exception:
             self._impl_cls = None
         self._instances: Dict[str, Any] = {}
-        self._langdetect = None
-        if source_lang and source_lang != "auto":
-            try:
-                import langdetect as _ld
-                _ld.DetectorFactory.seed = 0
-                self._langdetect = _ld
-            except ImportError:
-                logger.warning("langdetect not installed; source-language filtering disabled")
 
     def _get_instance(self, target_lang: str):
         inst = self._instances.get(target_lang)
@@ -59,13 +51,7 @@ class DeepTranslatorWrapper:
 
     def _should_translate(self, text: str) -> bool:
         # True if text looks like it's in source_lang (always True when auto)
-        if self._source_lang == "auto" or self._langdetect is None:
-            return True
-        try:
-            detected = self._langdetect.detect(text)
-            return detected.lower().startswith(self._source_lang.lower())
-        except Exception:
-            return True
+        return True
 
     # ----- single-item convenience ----- #
 

@@ -84,7 +84,7 @@ class Worker:
         progress_cb: Callable[[str, str, Optional[float]], None],
         log_cb: Callable[[str], None],
         source_lang: str = "auto",
-        detector: str = "auto",
+        detector: str = "fasttext",
     ):
         if self._thread and self._thread.is_alive():
             raise RuntimeError("Worker already running")

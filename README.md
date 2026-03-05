@@ -35,7 +35,7 @@ Translating office documents should not mean losing formatting, tables, fonts, o
 - **Selective Translation**: Translate only text in a specified source language (or use auto).  
 - **Formatting Preserved**: DOCX run-level styles and XLSX cell styles are preserved.  
 - **In-place PDF Editing**: Uses PyMuPDF to replace text without breaking layout.  
-- **Multi-Engine Detection**: Lingua, FastText, LangDetect — or Auto (majority vote).  
+- **Multi-Engine Detection**: Lingua, FastText — choose your preferred engine.  
 - **Batching for Efficiency**: Segments are batched to reduce API calls and avoid rate limits.  
 - **Scanned-PDF Detection**: Image-only PDFs are detected and skipped with a log message.  
 - **Segment-Aware**: Keeps technical strings intact (splits on `/` and newlines for safe translation).
@@ -87,7 +87,7 @@ python -m src.verbilo.cli [LANG] [--source CODE] [--detector ENGINE] [--gui]
 |---|---|
 | `LANG` | Target language code (e.g., `es`, `pt`) |
 | `--source CODE` | Source language code (default: `auto`) |
-| `--detector ENGINE` | Detection engine: `auto` (default), `lingua`, `fasttext`, or `langdetect` |
+| `--detector ENGINE` | Detection engine: `fasttext` (default) or `lingua` |
 | `--gui` | Launch the graphical interface |
 
 Example commands:
@@ -160,10 +160,8 @@ README.md
 - **Install (has all)**: `pip install -r requirements.txt`  
 - GUI extras: `pip install customtkinter pytablericons Pillow`  
 - Detection engines:
-  - Lingua: high accuracy for short strings (heavier).  
-  - FastText: very fast, good balance.  
-  - LangDetect: lightweight.  
-  - Auto: majority-vote across engines for robustness.
+  - Lingua: high accuracy for short strings (heavier).
+  - FastText: very fast, good balance.
 
 Notes:
 - Scanned (image-only) PDFs are detected and skipped — they will be logged rather than producing broken output.  
@@ -193,7 +191,7 @@ Contributions are what makes open source great!
 
 - Tabler Icons / `pytablericons` for GUI icons.  
 - PyMuPDF for in-place PDF text editing.  
-- Lingua, FastText, LangDetect for language detection options.  
+- Lingua, FastText for language detection options.  
 - Google Translate (or the configured translation provider) for the translation backend.  
 - Everyone who files issues and contributes patches.
 

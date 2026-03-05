@@ -1,10 +1,8 @@
-# Multi-engine language detection with voting / confidence scoring.
+# Language detection backends for source-language filtering.
 #
 # Supported detectors:
-#   "auto"      – majority-vote across all available engines
 #   "fasttext"  – fast, accurate, needs fasttext-langdetect
 #   "lingua"    – designed for short text, needs lingua-language-detector
-#   "langdetect"– legacy, needs langdetect
 #
 # When source_lang == "auto" the detector is never called — every cell
 # is sent to the translator unconditionally.
@@ -80,7 +78,7 @@ def _clean_for_detection(text: str) -> str:
 def _detect_fasttext(text: str) -> Optional[tuple[str, float]]:
     # Detect language using fasttext-langdetect.  Returns (code, conf) or None
     try:
-        from ftlangdetect import detect as ft_detect  # type: ignore
+        from fast_langdetect import detect as ft_detect  # type: ignore
         result = ft_detect(text)
         code = _norm_code(result.get("lang", ""))
         conf = float(result.get("score", 0.0))
@@ -126,23 +124,6 @@ def _get_lingua_detector():
     return _lingua_detector_instance
 
 
-def _detect_langdetect(text: str) -> Optional[tuple[str, float]]:
-    # Detect language using langdetect.  Returns (code, conf) or None
-    try:
-        import langdetect  # type: ignore
-        langdetect.DetectorFactory.seed = 0
-        probs = langdetect.detect_langs(text)
-        if probs:
-            top = probs[0]
-            code = _norm_code(str(top.lang))
-            conf = float(top.prob)
-            if code:
-                return code, conf
-    except Exception:
-        pass
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Detector registry — maps name → callable
 # ---------------------------------------------------------------------------
@@ -151,62 +132,34 @@ _DETECTORS: dict[str, callable] = {
     "fasttext": _detect_fasttext,
     "fastText": _detect_fasttext,
     "lingua": _detect_lingua,
-    "langdetect": _detect_langdetect,
 }
-
-# Preferred order for "auto" mode — most accurate first.
-_AUTO_ORDER = ["fasttext", "lingua", "langdetect"]
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def detect_language(text: str, detector: str = "auto") -> tuple[str, float]:
+def detect_language(text: str, detector: str = "fasttext") -> tuple[str, float]:
     # Return (language_code, confidence) for *text*
     cleaned = _clean_for_detection(text)
     if len(cleaned) < _MIN_DETECT_CHARS:
         return "und", 0.0
 
-    if detector != "auto":
-        fn = _DETECTORS.get(detector.lower())
-        if fn is None:
-            logger.warning("Unknown detector '%s'; falling back to auto", detector)
-        else:
-            result = fn(cleaned)
-            if result:
-                return result
-            return "und", 0.0
-
-    # Auto mode: collect votes from every available engine.
-    votes: list[tuple[str, float]] = []
-    for name in _AUTO_ORDER:
-        fn = _DETECTORS[name]
-        result = fn(cleaned)
-        if result is not None:
-            votes.append(result)
-
-    if not votes:
+    fn = _DETECTORS.get(detector.lower())
+    if fn is None:
+        logger.warning("Unknown detector '%s'", detector)
         return "und", 0.0
 
-    if len(votes) == 1:
-        return votes[0]
-
-    # Tally: count how many engines agree on each code.
-    tally: dict[str, tuple[int, float]] = {}
-    for code, conf in votes:
-        count, best_conf = tally.get(code, (0, 0.0))
-        tally[code] = (count + 1, max(best_conf, conf))
-
-    # Pick the code with the most votes; break ties by confidence.
-    winner = max(tally.items(), key=lambda kv: (kv[1][0], kv[1][1]))
-    return winner[0], winner[1][1]
+    result = fn(cleaned)
+    if result:
+        return result
+    return "und", 0.0
 
 
 def is_source_language(
     text: str,
     source_lang: str,
-    detector: str = "auto",
+    detector: str = "fasttext",
     strict: bool = False,
 ) -> bool:
     # Return ``True`` if *text* appears to be written in *source_lang*.
