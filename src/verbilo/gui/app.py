@@ -1044,6 +1044,7 @@ class App:
         PAD = theme.PADDING  # CTk widgets self-scale padx/pady — do NOT pre-scale
 
         win = ctk.CTkToplevel(self.root)
+        win.wm_attributes("-alpha", 0)  # keep invisible until centered
         apply_window_icon(win)
         win.title("Settings")
         win.transient(self.root)
@@ -1231,7 +1232,10 @@ class App:
         # Title-bar X acts as Cancel (discard changes)
         win.protocol("WM_DELETE_WINDOW", win.destroy)
         win.update_idletasks()
-        win.after(20, lambda: center_window(win, parent=self.root))
+        def _show_settings():
+            center_window(win, parent=self.root)
+            win.wm_attributes("-alpha", 1)
+        win.after(20, _show_settings)
         try:
             win.resizable(False, False)
         except Exception:
@@ -1275,6 +1279,7 @@ class App:
         PAD = theme.PADDING  # CTk widgets self-scale padx/pady — do NOT pre-scale
 
         dlg = ctk.CTkToplevel(self.root)
+        dlg.wm_attributes("-alpha", 0)  # keep invisible until centered
         apply_window_icon(dlg)
         dlg.title("Update Available")
         dlg.transient(self.root)
@@ -1307,7 +1312,10 @@ class App:
 
         dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
         dlg.update_idletasks()
-        dlg.after(20, lambda: center_window(dlg, parent=self.root))
+        def _show_update():
+            center_window(dlg, parent=self.root)
+            dlg.wm_attributes("-alpha", 1)
+        dlg.after(20, _show_update)
         try:
             dlg.resizable(False, False)
         except Exception:
@@ -1321,6 +1329,7 @@ class App:
         PAD = theme.PADDING  # CTk widgets self-scale padx/pady — do NOT pre-scale
 
         win = ctk.CTkToplevel(self.root)
+        win.wm_attributes("-alpha", 0)  # keep invisible until centered
         apply_window_icon(win)
         win.title("About Verbilo")
         win.transient(self.root)
@@ -1450,7 +1459,10 @@ class App:
 
         win.protocol("WM_DELETE_WINDOW", win.destroy)
         win.update_idletasks()
-        win.after(20, lambda: center_window(win, parent=self.root))
+        def _show_about():
+            center_window(win, parent=self.root)
+            win.wm_attributes("-alpha", 1)
+        win.after(20, _show_about)
         try:
             win.resizable(False, False)
         except Exception:
@@ -1772,6 +1784,7 @@ def main():
 
 
     root = ctk.CTk()
+    root.wm_attributes("-alpha", 0)  # keep compositor-invisible during CTk init
     root.withdraw()  # hide until centered to avoid visible position jump
     theme.init_dpi(root)
     app = App(root)
@@ -1829,6 +1842,7 @@ def main():
         logger.exception("Failed to install GUI logging handler")
 
     def _show():
+        root.wm_attributes("-alpha", 1)
         try:
             center_window(root)
         except Exception:
