@@ -24,8 +24,14 @@ logger = logging.getLogger(__name__)
 # considered translatable — no detector is reliable on very short strings.
 _MIN_DETECT_CHARS = 10
 
-# Confidence floor for a single-engine result to be trusted on its own.
+# Confidence floor for fasttext results to be trusted on their own.
+# (Lingua uses its own built-in minimum_relative_distance instead.)
 _CONFIDENCE_THRESHOLD = 0.65
+
+# Lingua: minimum gap between the top-two language probabilities.
+# If the gap is smaller than this, detect_language_of() returns None
+# (= ambiguous).  Keep moderate so short cell text is not over-filtered.
+_LINGUA_MIN_RELATIVE_DISTANCE = 0.25
 
 # ISO 639-1 language code aliases — some detectors return longer codes.
 _LANG_ALIASES: dict[str, str] = {
@@ -79,9 +85,15 @@ def _detect_fasttext(text: str) -> Optional[tuple[str, float]]:
     # Detect language using fasttext-langdetect.  Returns (code, conf) or None
     try:
         from fast_langdetect import detect as ft_detect  # type: ignore
-        result = ft_detect(text)
-        code = _norm_code(result.get("lang", ""))
-        conf = float(result.get("score", 0.0))
+        results = ft_detect(text, model="auto", k=1)
+        if not results:
+            return None
+        first = results[0]
+        lang_val = first.get("lang", "")
+        if not isinstance(lang_val, str):
+            lang_val = ""
+        code = _norm_code(lang_val)
+        conf = float(first.get("score", 0.0))
         if code:
             return code, conf
     except Exception:
@@ -90,18 +102,18 @@ def _detect_fasttext(text: str) -> Optional[tuple[str, float]]:
 
 
 def _detect_lingua(text: str) -> Optional[tuple[str, float]]:
-    # Detect language using lingua-language-detector.  Returns (code, conf) or None
+    # Detect language using lingua-language-detector.  Returns (code, conf) or None.
+    # Uses Lingua's built-in minimum_relative_distance for confidence filtering:
+    # detect_language_of() returns None when the gap between top-two candidates
+    # is too small (ambiguous).  When it returns a language, we trust it (1.0).
     try:
-        from lingua import LanguageDetectorBuilder  # type: ignore
-        # Build a lightweight detector — cached at module level after first call.
         detector = _get_lingua_detector()
-        result = detector.compute_language_confidence_values(text)
-        if result:
-            top = result[0]
-            code = _norm_code(top.language.iso_code_639_1.name.lower())
-            conf = float(top.value)
-            if code:
-                return code, conf
+        language = detector.detect_language_of(text)
+        if language is None:
+            return None  # ambiguous — Lingua's own confidence filter rejected it
+        code = _norm_code(language.iso_code_639_1.name.lower())
+        if code:
+            return code, 1.0
     except Exception:
         pass
     return None
@@ -118,6 +130,7 @@ def _get_lingua_detector():
         _lingua_detector_instance = (
             LanguageDetectorBuilder
             .from_all_languages()
+            .with_minimum_relative_distance(_LINGUA_MIN_RELATIVE_DISTANCE)
             .with_preloaded_language_models()
             .build()
         )
@@ -191,3 +204,61 @@ def is_source_language(
         return not strict
 
     return match
+
+
+def is_source_language_batch(
+    texts: list[str],
+    source_lang: str,
+    detector: str = "fasttext",
+    strict: bool = False,
+) -> list[bool]:
+    # Batch version of is_source_language.
+    # For Lingua, uses detect_languages_in_parallel_of() across all CPU cores
+    # in a single call instead of looping per-text.
+    # For fasttext, falls back to per-item calls (no native batch API).
+    if source_lang == "auto":
+        return [True] * len(texts)
+
+    src = _norm_code(source_lang)
+
+    if detector.lower() == "lingua":
+        return _is_source_language_batch_lingua(texts, src, strict)
+
+    return [is_source_language(t, source_lang, detector=detector, strict=strict) for t in texts]
+
+
+def _is_source_language_batch_lingua(
+    texts: list[str],
+    src: str,
+    strict: bool,
+) -> list[bool]:
+    # Uses Lingua's detect_languages_in_parallel_of() — classifies all texts
+    # simultaneously across all available CPU cores.
+    # None results mean ambiguous (filtered by with_minimum_relative_distance).
+    cleaned = [_clean_for_detection(t) for t in texts]
+    results: list[bool] = [not strict] * len(texts)  # default for short/undecidable
+
+    detection_indices = [i for i, c in enumerate(cleaned) if len(c) >= _MIN_DETECT_CHARS]
+    if not detection_indices:
+        return results
+
+    detection_texts = [cleaned[i] for i in detection_indices]
+    try:
+        detector_instance = _get_lingua_detector()
+        # Returns list[Language | None]
+        detected = detector_instance.detect_languages_in_parallel_of(detection_texts)
+        for list_idx, orig_idx in enumerate(detection_indices):
+            language = detected[list_idx]
+            if language is None:
+                results[orig_idx] = not strict
+            else:
+                code = _norm_code(language.iso_code_639_1.name.lower())
+                results[orig_idx] = bool(code and code == src)
+    except Exception:
+        logger.warning("Lingua parallel detection failed; falling back to per-item", exc_info=True)
+        for list_idx, orig_idx in enumerate(detection_indices):
+            results[orig_idx] = is_source_language(
+                texts[orig_idx], src, detector="lingua", strict=strict
+            )
+
+    return results

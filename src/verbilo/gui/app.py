@@ -62,6 +62,57 @@ def _try_make_relative(absolute_path: str) -> str:
 
 # --- language helpers ---
 
+# ISO 639-1 base codes supported by each detector backend.
+# Used to filter the source-language dropdown when the detector changes.
+_LINGUA_LANG_CODES: frozenset[str] = frozenset({
+    # 75 languages supported by lingua-language-detector
+    "af", "sq", "ar", "hy", "az", "eu", "be", "bn", "no", "bs", "bg", "ca",
+    "zh", "hr", "cs", "da", "nl", "en", "eo", "et", "fi", "fr",
+    "lg",  # Ganda
+    "ka", "de",
+    "el", "gu", "he", "hi", "hu", "is", "id", "ga", "it", "ja", "kk", "ko",
+    "la", "lv", "lt", "mk", "ms", "mi", "mr", "mn", "fa", "pl", "pt", "pa",
+    "ro", "ru", "sr", "sn", "sk", "sl", "so", "st", "es", "sw", "sv", "tl",
+    "ta", "te", "th",
+    "ts",  # Tsonga
+    "tn",  # Tswana
+    "tr", "uk", "ur", "vi", "cy", "xh", "yo", "zu",
+})
+
+_FASTTEXT_LANG_CODES: frozenset[str] = frozenset({
+    # 176-language FastText lid.176 model (ISO 639-1 / BCP-47 base codes)
+    "af", "am", "an", "ar", "as", "az", "ba", "be", "bg", "bn", "br", "bs",
+    "ca", "ce", "co", "cs", "cv", "cy", "da", "de", "dv", "el", "en", "eo",
+    "es", "et", "eu", "fa", "fi", "fr", "fy", "ga", "gd", "gl", "gn", "gu",
+    "gv", "ha",  # Hausa
+    "he", "hi", "hr", "ht", "hu", "hy", "ia", "id", "ig",  # Igbo
+    "io", "is", "it",
+    "ja", "jv", "jw",  # Javanese (jv canonical; jw = Google's alias)
+    "ka", "kk", "km", "kn", "ko", "ku", "kw", "ky", "la", "lb",
+    "li", "lo", "lt", "lv", "mg", "mi", "mk", "ml", "mn", "mr", "ms", "mt",
+    "my", "ne", "nl", "nn", "no", "oc", "or", "os", "pa", "pl", "ps", "pt",
+    "qu", "rm", "ro", "ru", "rw",  # Kinyarwanda
+    "sa", "sc", "sd", "si", "sk", "sl", "sm",  # Samoan
+    "sn", "so",
+    "sq", "sr", "st", "su", "sv", "sw", "ta", "te", "tg", "th", "tk", "tl",
+    "tr", "tt", "ug", "uk", "ur", "uz", "vi", "vo", "wa", "xh", "yi", "yo",
+    "zh", "zu",
+})
+
+
+def _filter_by_detector(
+    opts: list[tuple[str, str]], detector: str,
+) -> list[tuple[str, str]]:
+    # Return only (code, name) pairs the given detector can identify.
+    codes = _LINGUA_LANG_CODES if detector == "lingua" else _FASTTEXT_LANG_CODES
+    result = []
+    for code, name in opts:
+        base = code.lower().split("-")[0].split("_")[0]
+        if base in codes:
+            result.append((code, name))
+    return result
+
+
 _cached_language_options: list[tuple[str, str]] | None = None
 
 
@@ -246,6 +297,15 @@ class SearchableComboBox:
         self._last_valid = value
         self._var.set(value)
         self._variable.set(value)
+
+    def update_values(self, values: list[str]) -> None:
+        # Replace the option list; revert selection if current value no longer exists.
+        self._all_values = list(values)
+        if self._last_valid not in self._all_values:
+            fallback = self._all_values[0] if self._all_values else ""
+            self.set(fallback)
+        if self._popup and self._popup.winfo_exists():
+            self._close()
 
     def refresh_colors(self):
         pass
@@ -595,9 +655,10 @@ class App:
         row += 1
 
         # Source language
-        theme.make_label(
+        self._source_lang_label = theme.make_label(
             self.sidebar, "Source language", level="small",
-        ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(4, 2))
+        )
+        self._source_lang_label.grid(row=row, column=0, sticky="w", padx=PAD, pady=(4, 2))
         row += 1
 
         lang_opts = _get_language_options()
@@ -606,10 +667,14 @@ class App:
         if not display_values:
             display_values = ["English (en)"]
 
+        # Source language: filtered to languages the initial detector (fasttext) can identify.
+        _src_filtered = _filter_by_detector(lang_opts, "fasttext")
+        _src_display = [f"{name} ({code})" for code, name in _src_filtered]
+        self._source_lang_label.configure(text=f"Source language ({len(_src_display)})")
         self.source_lang_var = tk.StringVar(value="Auto-detect (translate all)")
-        source_values = ["Auto-detect (translate all)"] + display_values
+        source_values = ["Auto-detect (translate all)"] + _src_display
         self._source_lang_map = {"Auto-detect (translate all)": "auto"}
-        self._source_lang_map.update(self._lang_map)
+        self._source_lang_map.update({k: v for k, v in self._lang_map.items() if k in set(_src_display)})
 
         self.source_lang_box = SearchableComboBox(
             self.sidebar, source_values, self.source_lang_var,
@@ -644,6 +709,7 @@ class App:
             self.sidebar,
             values=["fasttext", "lingua"],
             variable=self.detector_var,
+            command=self._on_detector_changed,
             fg_color=p.bg_input,
             button_color=p.accent,
             button_hover_color=p.accent_hover,
@@ -657,6 +723,9 @@ class App:
             height=32,
         )
         self.detector_menu.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 6))
+        # trace_add is a pure Tk primitive — fires reliably regardless of CTk version.
+        # command= above is kept as well; both calling _on_detector_changed is harmless.
+        self.detector_var.trace_add("write", lambda *_: self._on_detector_changed())
         row += 1
 
         # Divider
@@ -1479,6 +1548,24 @@ class App:
         if d:
             self.output_entry.delete(0, tk.END)
             self.output_entry.insert(0, _try_make_relative(d))
+
+    def _on_detector_changed(self, *_) -> None:
+        # Repopulate the source language dropdown to only show languages
+        # the newly selected detector can actually identify.
+        # Called by trace_add (args ignored) OR by CTkOptionMenu command=.
+        detector = (self.detector_var.get() or "fasttext").strip().lower()
+        lang_opts = _get_language_options()
+        filtered = _filter_by_detector(lang_opts, detector)
+        src_display = [f"{name} ({code})" for code, name in filtered]
+        src_display_set = set(src_display)
+        source_values = ["Auto-detect (translate all)"] + src_display
+        self._source_lang_map = {"Auto-detect (translate all)": "auto"}
+        self._source_lang_map.update(
+            {k: v for k, v in self._lang_map.items() if k in src_display_set}
+        )
+        self.source_lang_box.update_values(source_values)
+        self._source_lang_label.configure(text=f"Source language ({len(src_display)})")
+        self._log(f"Source language list updated for detector: {detector!r} ({len(src_display)} languages)")
 
     # --- progress helpers ---
 

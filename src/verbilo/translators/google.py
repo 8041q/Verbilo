@@ -196,6 +196,23 @@ class DeepTranslatorWrapper:
         results: list[str] = list(texts)
         tgt_cache = self._cache.setdefault(target_lang, {})
 
+        # Pre-compute batch language detection for Lingua (uses all CPU cores).
+        # For fasttext or source_lang=="auto", per-item detection is used instead.
+        _lingua_batch: dict[int, bool] = {}
+        if self._source_lang != "auto" and self._detector == "lingua":
+            from .lang_detect import is_source_language_batch
+            candidates = [
+                (i, t) for i, t in enumerate(texts)
+                if t and t.strip() and not self._SEGMENT_RE.search(t)
+            ]
+            if candidates:
+                batch_flags = is_source_language_batch(
+                    [t for _, t in candidates],
+                    self._source_lang,
+                    detector="lingua",
+                )
+                _lingua_batch = {i: flag for (i, _), flag in zip(candidates, batch_flags)}
+
         # Separate translatable vs pass-through, resolving cache hits inline.
         to_translate: list[tuple[int, str]] = []
         for i, t in enumerate(texts):
@@ -205,7 +222,8 @@ class DeepTranslatorWrapper:
             if self._source_lang != "auto" and self._SEGMENT_RE.search(t):
                 results[i] = self._translate_segments(t, target_lang)
                 continue
-            if not self._should_translate(t):
+            should = _lingua_batch[i] if i in _lingua_batch else self._should_translate(t)
+            if not should:
                 continue
             if t in tgt_cache:
                 results[i] = tgt_cache[t]
