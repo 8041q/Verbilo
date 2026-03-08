@@ -225,9 +225,9 @@ class SearchableComboBox:
             parent,
             fg_color=p.bg_input,
             corner_radius=theme.BUTTON_CORNER_RADIUS,
-            border_width=1,
-            border_color=p.border,
-        ) if ctk else tk.Frame(parent)
+            border_width=0,
+            border_color=p.bg_input,
+        ) if ctk else tk.Frame(parent, bd=0, highlightthickness=0)
         self._frame.grid_columnconfigure(0, weight=1)
 
         _font = ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]) if ctk else None
@@ -245,12 +245,16 @@ class SearchableComboBox:
         ) if ctk else tk.Entry(self._frame, textvariable=self._var)
         self._entry.grid(row=0, column=0, sticky="ew", padx=(6, 0))
 
-        # Arrow button
+        # Arrow button (borderless, non-focusable to avoid outline)
         arrow_img = get_icon("chevron-down", size=14)
         btn_kw = dict(
-            master=self._frame, width=28, height=28,
-            fg_color="transparent", hover_color=p.bg_card,
-            corner_radius=4, command=self._on_arrow,
+            master=self._frame,
+            width=28, height=28,
+            fg_color="transparent",
+            hover_color=p.bg_input,
+            corner_radius=4,
+            command=self._on_arrow,
+            border_width=0,
         )
         if arrow_img and ctk:
             self._btn = ctk.CTkButton(text="", image=arrow_img, **btn_kw)
@@ -261,7 +265,24 @@ class SearchableComboBox:
                 text_color=p.text_muted, **btn_kw,
             )
         else:
-            self._btn = tk.Button(self._frame, text="\u25BC", command=self._on_arrow)
+            self._btn = tk.Button(
+                self._frame,
+                text="\u25BC",
+                command=self._on_arrow,
+                bd=0,
+                relief="flat",
+                highlightthickness=0,
+                background=p.bg_input,
+                activebackground=p.bg_input,
+                takefocus=0,
+            )
+
+        # Ensure button doesn't draw focus highlight
+        try:
+            self._btn.configure(takefocus=False)
+        except Exception:
+            pass
+
         self._btn.grid(row=0, column=1, padx=(0, 2), pady=2)
 
         # Get the inner tk.Entry for select_range / low-level bindings
@@ -407,7 +428,7 @@ class SearchableComboBox:
 
         outer = tk.Frame(
             self._popup, bg=p.bg_popup,
-            highlightbackground=p.border, highlightthickness=1,
+            bd=0, highlightthickness=0,
         )
         outer.pack(fill="both", expand=True)
 
@@ -721,8 +742,8 @@ class App:
             variable=self.detector_var,
             command=self._on_detector_changed,
             fg_color=p.bg_input,
-            button_color=p.accent,
-            button_hover_color=p.accent_hover,
+            button_color=p.bg_input,
+            button_hover_color=p.bg_input,
             text_color=p.text_secondary,
             dropdown_fg_color=p.bg_popup,
             dropdown_hover_color=p.accent,
@@ -733,8 +754,6 @@ class App:
             height=32,
         )
         self.detector_menu.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 6))
-        # trace_add is a pure Tk primitive — fires reliably regardless of CTk version.
-        # command= above is kept as well; both calling _on_detector_changed is harmless.
         self.detector_var.trace_add("write", lambda *_: self._on_detector_changed())
         row += 1
 
