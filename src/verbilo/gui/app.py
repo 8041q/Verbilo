@@ -207,6 +207,245 @@ def _get_language_options() -> list[tuple[str, str]]:
 
 # --- searchable dropdown ---
 
+class SimpleComboBox:
+    """Non-searchable dropdown — same visual style as SearchableComboBox but read-only.
+    Used for small fixed option sets like the language detector picker."""
+
+    _POPUP_ROWS = 8
+
+    def __init__(self, parent, values, variable, command=None, **kw):
+        p = theme.get()
+        self._parent = parent
+        self._all_values = list(values)
+        self._variable = variable
+        self._last_valid = variable.get() or (values[0] if values else "")
+        self._popup = None
+        self._suppress_open = False
+        self._command = command
+
+        # Outer frame — identical styling to SearchableComboBox
+        self._frame = ctk.CTkFrame(
+            parent,
+            fg_color=p.bg_input,
+            corner_radius=theme.BUTTON_CORNER_RADIUS,
+            border_width=0,
+            border_color=p.bg_input,
+        ) if ctk else tk.Frame(parent, bd=0, highlightthickness=0)
+        self._frame.grid_columnconfigure(0, weight=1)
+
+        _font = ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]) if ctk else None
+
+        # Read-only label displaying the current value
+        self._label_var = tk.StringVar(value=self._last_valid)
+        if ctk:
+            self._label = ctk.CTkLabel(
+                self._frame,
+                textvariable=self._label_var,
+                font=_font,
+                text_color=p.text_secondary,
+                anchor="w",
+                fg_color="transparent",
+                height=32,
+            )
+        else:
+            self._label = tk.Label(
+                self._frame,
+                textvariable=self._label_var,
+                anchor="w",
+                bg=p.bg_input,
+                fg=p.text_secondary,
+            )
+        self._label.grid(row=0, column=0, sticky="ew", padx=(10, 0))
+
+        # Arrow button — identical to SearchableComboBox
+        arrow_img = get_icon("chevron-down", size=14)
+        btn_kw = dict(
+            master=self._frame,
+            width=28, height=28,
+            fg_color="transparent",
+            hover_color=p.bg_input,
+            corner_radius=4,
+            command=self._on_arrow,
+            border_width=0,
+        )
+        if arrow_img and ctk:
+            self._btn = ctk.CTkButton(text="", image=arrow_img, **btn_kw)
+        elif ctk:
+            self._btn = ctk.CTkButton(
+                text="\u25BC",
+                font=ctk.CTkFont(family=theme.FONT_FAMILY, size=10),
+                text_color=p.text_muted, **btn_kw,
+            )
+        else:
+            self._btn = tk.Button(
+                self._frame,
+                text="\u25BC",
+                command=self._on_arrow,
+                bd=0, relief="flat", highlightthickness=0,
+                background=p.bg_input,
+                activebackground=p.bg_input,
+                takefocus=0,
+            )
+        try:
+            self._btn.configure(takefocus=False)
+        except Exception:
+            pass
+        self._btn.grid(row=0, column=1, padx=(0, 2), pady=2)
+
+        # Click on the label area also toggles the popup
+        self._label.bind("<Button-1>", lambda _e: self._on_arrow())
+
+        # Close popup when user clicks anywhere outside
+        self._frame.after_idle(self._bind_root_click)
+
+    # -- Geometry passthrough ------------------------------------------
+
+    def grid(self, **kw):  self._frame.grid(**kw)
+    def pack(self, **kw):  self._frame.pack(**kw)
+    def place(self, **kw): self._frame.place(**kw)
+
+    # -- Public API ----------------------------------------------------
+
+    def get(self):
+        return self._last_valid
+
+    def set(self, value):
+        if value in self._all_values:
+            self._last_valid = value
+            self._label_var.set(value)
+            self._variable.set(value)
+
+    def configure(self, **kw):
+        # Accept state= so callers can disable/enable just like a normal widget
+        state = kw.get("state")
+        if state == "disabled":
+            try:
+                self._btn.configure(state="disabled")
+                self._label.configure(state="disabled")
+            except Exception:
+                pass
+        elif state == "normal":
+            try:
+                self._btn.configure(state="normal")
+                self._label.configure(state="normal")
+            except Exception:
+                pass
+
+    # -- Arrow / popup toggle ------------------------------------------
+
+    def _on_arrow(self):
+        if self._popup and self._popup.winfo_exists():
+            self._close()
+        else:
+            self._open()
+
+    # -- Root click detection ------------------------------------------
+
+    def _bind_root_click(self):
+        try:
+            self._frame.winfo_toplevel().bind("<Button-1>", self._root_click, "+")
+        except Exception:
+            pass
+
+    def _root_click(self, event):
+        if not (self._popup and self._popup.winfo_exists()):
+            return
+        for container in (self._frame, self._popup):
+            w = event.widget
+            while w is not None:
+                if w is container:
+                    return
+                w = getattr(w, "master", None)
+        self._close()
+
+    # -- Popup ---------------------------------------------------------
+
+    def _open(self):
+        if self._suppress_open:
+            return
+        if self._popup and self._popup.winfo_exists():
+            return
+
+        p = theme.get()
+        self._popup = tk.Toplevel(self._frame)
+        self._popup.wm_overrideredirect(True)
+        self._popup.wm_attributes("-topmost", True)
+
+        outer = tk.Frame(self._popup, bg=p.bg_popup, bd=0, highlightthickness=0)
+        outer.pack(fill="both", expand=True)
+
+        self._listbox = tk.Listbox(
+            outer,
+            height=min(self._POPUP_ROWS, len(self._all_values)),
+            font=(theme.FONT_FAMILY, theme.FONT_BODY[1]),
+            activestyle="none",
+            selectbackground=p.accent,
+            selectforeground=p.text_on_accent,
+            bg=p.bg_popup, fg=p.text_secondary,
+            relief="flat", borderwidth=0, highlightthickness=0,
+        )
+        self._listbox.pack(fill="both", expand=True, padx=4, pady=4)
+
+        for item in self._all_values:
+            self._listbox.insert(tk.END, item)
+
+        if self._last_valid in self._all_values:
+            idx = self._all_values.index(self._last_valid)
+            self._listbox.selection_set(idx)
+            self._listbox.see(idx)
+
+        self._listbox.bind("<ButtonRelease-1>", self._on_select)
+        self._listbox.bind("<Return>",          self._on_select)
+        self._listbox.bind("<Escape>",          lambda _e: self._close())
+        self._listbox.bind("<FocusOut>",        lambda _e: self._frame.after(100, self._check_focus))
+
+        self._position_popup()
+
+    def _position_popup(self):
+        self._frame.update_idletasks()
+        x = self._frame.winfo_rootx()
+        y = self._frame.winfo_rooty() + self._frame.winfo_height() + 2
+        w = self._frame.winfo_width()
+        rows = min(self._POPUP_ROWS, max(1, len(self._all_values)))
+        row_px = theme.scale(theme.FONT_BODY[1] + 10)
+        h = rows * row_px + 8
+        self._popup.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _on_select(self, _event=None):
+        if not hasattr(self, "_listbox"):
+            return
+        sel = self._listbox.curselection()
+        if not sel:
+            return
+        value = self._listbox.get(sel[0])
+        self._last_valid = value
+        self._label_var.set(value)
+        self._variable.set(value)
+        self._close(suppress_ms=150)
+        if self._command:
+            try:
+                self._command(value)
+            except Exception:
+                pass
+
+    def _check_focus(self):
+        # Close only if focus has truly left both the frame and the popup
+        try:
+            focused = self._frame.focus_get()
+            if focused and self._popup and self._popup.winfo_exists():
+                if focused.winfo_toplevel() is self._popup:
+                    return
+        except Exception:
+            pass
+        self._close()
+
+    def _close(self, suppress_ms=0):
+        if self._popup and self._popup.winfo_exists():
+            self._popup.destroy()
+        self._popup = None
+        if suppress_ms:
+            self._suppress_open = True
+            self._frame.after(suppress_ms, lambda: setattr(self, "_suppress_open", False))
 
 class SearchableComboBox:
     _POPUP_ROWS = 8  # max visible rows before scrolling
@@ -745,25 +984,13 @@ class App:
         row += 1
 
         self.detector_var = tk.StringVar(value="fasttext")
-        self.detector_menu = ctk.CTkOptionMenu(
+        self.detector_menu = SimpleComboBox(
             self.sidebar,
             values=["fasttext", "lingua"],
             variable=self.detector_var,
             command=self._on_detector_changed,
-            fg_color=p.bg_input,
-            button_color=p.bg_input,
-            button_hover_color=p.bg_input,
-            text_color=p.text_secondary,
-            dropdown_fg_color=p.bg_popup,
-            dropdown_hover_color=p.accent,
-            dropdown_text_color=p.text_secondary,
-            font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]),
-            dropdown_font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]),
-            corner_radius=theme.BUTTON_CORNER_RADIUS,
-            height=32,
         )
         self.detector_menu.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 6))
-        self.detector_var.trace_add("write", lambda *_: self._on_detector_changed())
         row += 1
 
         # Divider
