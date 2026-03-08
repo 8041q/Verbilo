@@ -302,7 +302,7 @@ class SearchableComboBox:
         self._tk_entry.bind("<Down>",       self._focus_list)
 
         # Root-level click to close on non-focusable area clicks
-        self._frame.after(200, self._bind_root_click)
+        self._frame.after_idle(self._bind_root_click)
 
     # -- Geometry passthrough ------------------------------------------
 
@@ -328,6 +328,7 @@ class SearchableComboBox:
             self.set(fallback)
         if self._popup and self._popup.winfo_exists():
             self._close()
+    
 
     def refresh_colors(self):
         pass
@@ -338,6 +339,8 @@ class SearchableComboBox:
         # Tab/programmatic focus: select-all and open.
         if self._suppress_open:
             return
+        if _event == "NotifyPointer":
+            return  # mouse click handled by _on_click instead
         self._select_all()
         self._open()
 
@@ -371,7 +374,10 @@ class SearchableComboBox:
     def _on_enter(self, _event=None):
         if self._popup and self._popup.winfo_exists() and hasattr(self, "_listbox"):
             sel = self._listbox.curselection()
-            self._confirm(self._listbox.get(sel[0] if sel else 0))
+            if sel:
+                self._confirm(self._listbox.get(sel[0]))
+            else:
+                self._validate_or_revert()
         else:
             self._validate_or_revert()
 
@@ -498,8 +504,11 @@ class SearchableComboBox:
         try:
             focused = self._frame.focus_get()
             if focused and self._popup and self._popup.winfo_exists():
-                if str(focused).startswith(str(self._popup)):
-                    return
+                try:
+                    if focused.winfo_toplevel() is self._popup:
+                        return
+                except Exception:
+                    pass
         except Exception:
             pass
         current = self._var.get().strip()
@@ -968,6 +977,30 @@ class App:
             "FileTable.Treeview.Heading",
             background=[("active", p.bg_input)],
         )
+        # Slim, styled scrollbar
+        style.configure(
+            "Slim.Vertical.TScrollbar",
+            gripcount=0,
+            background=p.bg_card,
+            darkcolor=p.bg_card,
+            lightcolor=p.bg_card,
+            troughcolor=p.bg_card,
+            bordercolor=p.bg_card,
+            arrowcolor=p.text_muted,
+            relief="flat",
+            borderwidth=0,
+            arrowsize=12,
+            width=10,
+        )
+        style.map(
+            "Slim.Vertical.TScrollbar",
+            background=[
+                ("active",   p.border),
+                ("!active",  p.divider),
+                ("disabled", p.bg_card),
+            ],
+            arrowcolor=[("disabled", p.bg_card)],
+        )
 
         # Load file-type icons for the treeview (PhotoImage for ttk)
         icon_color = p.text_muted
@@ -1005,11 +1038,15 @@ class App:
         self.file_table.column("status", width=100, minwidth=80, stretch=False, anchor="center")
         self.file_table.column("time", width=80, minwidth=60, stretch=False, anchor="center")
 
-        scrollbar = ttk.Scrollbar(container, orient=tk.VERTICAL, command=self.file_table.yview)
+        scrollbar = ttk.Scrollbar(
+            container, orient=tk.VERTICAL,
+            command=self.file_table.yview,
+            style="Slim.Vertical.TScrollbar",
+        )
         self.file_table.configure(yscrollcommand=scrollbar.set)
 
         self.file_table.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 2))
 
         # Status colour tags
         self.file_table.tag_configure("pending",   foreground=p.status_pending)
