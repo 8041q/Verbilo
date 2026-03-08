@@ -125,7 +125,7 @@ DARK = Palette(
     text_primary="#E8EAED",
     text_secondary="#B0B3B8",
     text_muted="#6B6F78",
-    text_on_accent="#FFFFFF",
+    text_on_accent="#CECECE",
 
     accent="#6C8878",
     accent_hover="#97B9A5",
@@ -209,7 +209,23 @@ def make_button(
     # Themed button. style: "primary" / "secondary" / "ghost".
     if ctk is None:
         import tkinter as _tk
-        return _tk.Button(parent, text=text, command=command)
+        p = get()
+        # Determine disabled text colour by style so disabled text remains readable
+        if style == "primary":
+            disabled_color = p.text_on_accent
+        elif style == "secondary":
+            disabled_color = p.text_secondary
+        else:
+            disabled_color = p.text_muted
+
+        # Allow callers to override `disabledforeground`; default to style mapping
+        disabled_fg = overrides.pop("disabledforeground", disabled_color)
+        btn = _tk.Button(parent, text=text, command=command, disabledforeground=disabled_fg, **overrides)
+        try:
+            setattr(btn, "_verbilo_style", style)
+        except Exception:
+            pass
+        return btn
     p = get()
     _font = ctk.CTkFont(family=FONT_FAMILY, size=FONT_BODY[1])
 
@@ -240,6 +256,16 @@ def make_button(
 
     kw.update(overrides)
 
+    # Ensure CTkButton shows a readable disabled text color by default (style-aware)
+    if style == "primary":
+        disabled_color = p.text_on_accent
+    elif style == "secondary":
+        disabled_color = p.text_secondary
+    else:
+        disabled_color = p.text_muted
+
+    kw.setdefault("text_color_disabled", disabled_color)
+
     btn_args: dict[str, Any] = dict(
         text=text,
         command=command,
@@ -250,7 +276,12 @@ def make_button(
         btn_args["image"] = image
         btn_args["compound"] = "left"
 
-    return ctk.CTkButton(parent, **btn_args, **kw)
+    btn = ctk.CTkButton(parent, **btn_args, **kw)
+    try:
+        setattr(btn, "_verbilo_style", style)
+    except Exception:
+        pass
+    return btn
 
 
 def make_label(parent: Any, text: str, level: str = "body", **overrides: Any) -> Any:

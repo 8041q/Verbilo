@@ -47,6 +47,7 @@ APP_VERSION, APP_BUILD_DATE = _read_pyproject_meta()
 # Github URLs
 GITHUB_URL = "https://github.com/8041q/Verbilo"
 RELEASES_URL = "https://github.com/8041q/Verbilo/releases"
+ISSUE_URL = "https://github.com/8041q/Verbilo/issues"
 
 # Default folder name
 DEFAULT_OUTPUT_FOLDER = "Output"
@@ -563,6 +564,15 @@ class App:
                     self._add_file_to_table(f)
 
     # --- directory helpers ---
+
+    def _set_button_disabled(self, button: object, disabled: bool) -> None:
+        # Centralized enable/disable helper: sets state and ensures CTk disabled text color
+        try:
+            state = "disabled" if disabled else "normal"
+            button.configure(state=state)
+            # Do not override CTk disabled colour here; it is set at creation time
+        except Exception:
+            pass
 
     def _initialdir_for_input(self) -> str:
         try:
@@ -1361,7 +1371,7 @@ class App:
         )
         # Small muted beta badge beside the product heading
         theme.make_label(
-            brand_frame, "(beta)", level="tiny", text_color=p.text_muted,
+            brand_frame, "Made by crt_ (8041q)", level="tiny", text_color=p.text_muted,
         ).grid(row=0, column=2, sticky="sw", padx=(6, 0))
         theme.make_label(brand_frame, "File translation tool", level="small").grid(
             row=1, column=1, sticky="nw",
@@ -1392,10 +1402,10 @@ class App:
 
         def _do_check():
             update_status_var.set("Checking\u2026")
-            check_btn.configure(state="disabled")
+            self._set_button_disabled(check_btn, True)
 
             def _on_result(result):
-                check_btn.configure(state="normal")
+                self._set_button_disabled(check_btn, False)
                 if result["status"] == "update":
                     update_status_var.set(f"Update available: v{result['version']}")
                     self._show_update_dialog(result)
@@ -1451,11 +1461,15 @@ class App:
         def _open_releases():
             webbrowser.open(RELEASES_URL)
 
+        def _open_issue():
+            webbrowser.open(ISSUE_URL)
+
         theme.make_button(links_frame, "View on GitHub", command=_open_github, style="ghost",
-                          height=28).pack(side=tk.LEFT, padx=(0, 6))
+                          height=28).pack(side=tk.LEFT, padx=(0, theme.scale(8)))
         theme.make_button(links_frame, "Release Notes", command=_open_releases, style="ghost",
-                          height=28).pack(side=tk.LEFT, padx=(0, 16))
-        theme.make_label(links_frame, "Made by crt_ (8041q)", level="tiny").pack(side=tk.LEFT)
+                          height=28).pack(side=tk.LEFT, padx=(0, theme.scale(8)))
+        theme.make_button(links_frame, "Report a Bug", command=_open_issue, style="ghost",
+                          height=28).pack(side=tk.LEFT, padx=(0, theme.scale(8)))
 
         win.protocol("WM_DELETE_WINDOW", win.destroy)
         win.update_idletasks()
@@ -1649,8 +1663,8 @@ class App:
 
         # Update UI state
         self._running = True
-        self.start_btn.configure(state="disabled")
-        self.cancel_btn.configure(state="normal")
+        self._set_button_disabled(self.start_btn, True)
+        self._set_button_disabled(self.cancel_btn, False)
 
         self._update_all_statuses("pending")
         self.total_files = len(self.files)
@@ -1670,7 +1684,7 @@ class App:
         if not self._running:
             return
         self.worker.stop()
-        self.cancel_btn.configure(state="disabled")
+        self._set_button_disabled(self.cancel_btn, True)
         self._log("Cancelling\u2026")
 
     # --- callbacks (run on main thread) ---
@@ -1721,8 +1735,8 @@ class App:
         if not self._running:
             return
         self._running = False
-        self.start_btn.configure(state="normal")
-        self.cancel_btn.configure(state="disabled")
+        self._set_button_disabled(self.start_btn, False)
+        self._set_button_disabled(self.cancel_btn, True)
         if cancelled:
             pct = self.completed_files / max(1, self.total_files)
             self._update_progress_label(

@@ -31,7 +31,11 @@ def save_config(cfg: Dict[str, Any]) -> None:
     p = _config_path()
     try:
         text = json.dumps(cfg, indent=2, ensure_ascii=False)
-        # write via explicit open so we can fsync to ensure the file appears on disk
+        # ensure parent folder exists
+        parent = p.parent
+        if not parent.exists():
+            parent.mkdir(parents=True, exist_ok=True)
+        # write to ensure the file appears on disk
         with open(p, "w", encoding="utf-8") as fh:
             fh.write(text)
             fh.flush()
