@@ -2,6 +2,7 @@
 origin
 output
 .verbilo_gui.json
+models/
 
 # OS
 .DS_Store
