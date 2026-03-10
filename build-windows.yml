@@ -1,0 +1,60 @@
+name: Build Nuitka Windows executable
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install nuitka wheel
+          if exist requirements.txt (
+            pip install -r requirements.txt
+          )
+
+      - name: Download models
+        run: python scripts/download_models.py --dest models/lid.176.bin
+
+      - name: Build with Nuitka
+        run: |
+          python scripts/build_nuitka.py --entry gui --output dist/nuitka
+
+      - name: Archive build
+        run: |
+          powershell -Command "Compress-Archive -Path dist\nuitka\cli.dist\* -DestinationPath artifact.zip -Force"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: verbilo-windows-gui
+          path: artifact.zip
+
+      - name: Create GitHub Release (on tag)
+        id: release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Release ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+
+      - name: Upload release asset (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.release.outputs.upload_url }}
+          asset_path: artifact.zip
+          asset_name: verbilo-windows-gui-${{ github.ref_name }}.zip
+          asset_content_type: application/zip

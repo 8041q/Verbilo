@@ -8,7 +8,7 @@
 # is sent to the translator unconditionally.
 
 from __future__ import annotations
-
+import os
 import logging
 import re
 import unicodedata
@@ -81,8 +81,20 @@ def _clean_for_detection(text: str) -> str:
 # Individual detector back-ends
 # ---------------------------------------------------------------------------
 
+def _setup_fasttext_model_path() -> None:
+    # Point fast_langdetect at the bundled model in a Nuitka standalone build.
+    import sys
+    if os.environ.get("FTLANG_CACHE"):
+        return  # already configured (user override or previous call)
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    models_dir = os.path.join(exe_dir, "models")
+    if os.path.isdir(models_dir):
+        os.environ["FTLANG_CACHE"] = models_dir
+
+
 def _detect_fasttext(text: str) -> Optional[tuple[str, float]]:
     # Detect language using fasttext-langdetect.  Returns (code, conf) or None
+    _setup_fasttext_model_path()
     try:
         from fast_langdetect import detect as ft_detect  # type: ignore
         results = ft_detect(text, model="auto", k=1)
