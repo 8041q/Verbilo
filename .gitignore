@@ -3,6 +3,8 @@ origin
 output
 .verbilo_gui.json
 models/
+src/verbilo/_version.py
+*.pdb
 
 # OS
 .DS_Store

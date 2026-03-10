@@ -1,13 +1,15 @@
 python-docx==0.8.11
 openpyxl==3.1.2
 deep-translator==1.11.4
-# PDF: donwgraded due to known unfixed issue, MSVC cannot compile that 2M+ line C file
-# PyMuPDF>=1.24.0
-PyMuPDF>=1.23.26 # if you go a version newer, the build will fail due to memory
-# PDF: Unicode font support (Noto Sans) – strongly recommended
-pymupdf-fonts>=1.0.5
+# PDF: if build fails due to memory, use --clang
+PyMuPDF==1.27.2
+# PDF: Unicode font support (Noto Sans)
+pymupdf-fonts==1.0.5
 # multi-engine source-language detection
-lingua-language-detector>=2.0.2
-fast-langdetect>=1.0.0
-customtkinter>=5.2.0
-pytablericons>=1.0.1
+lingua-language-detector==2.1.1
+fast-langdetect==1.0.0
+# theme style and icons
+customtkinter==5.2.2
+pytablericons==1.0.1
+# others
+toml==0.10.2

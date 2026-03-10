@@ -18,7 +18,6 @@ try:
 except Exception:
     ctk = None
 
-import tomllib
 import webbrowser
 
 from . import theme
@@ -29,20 +28,8 @@ from .icons import get_icon, get_photo_image, get_app_icon, apply_window_icon
 logger = logging.getLogger(__name__)
 
 # --- version & about constants ---
-
-def _read_pyproject_meta() -> tuple[str, str]:
-    try:
-        toml_path = Path(__file__).parent.parent.parent.parent / "pyproject.toml"
-        with open(toml_path, "rb") as fh:
-            data = tomllib.load(fh)
-        poetry = data.get("tool", {}).get("poetry", {})
-        version = poetry.get("version", "unknown")
-        build_date = poetry.get("build_date", "unknown")
-        return version, build_date
-    except Exception:
-        return "unknown", "unknown"
-
-APP_VERSION, APP_BUILD_DATE = _read_pyproject_meta()
+from .. import __version__ as APP_VERSION
+from .. import __build_date__ as APP_BUILD_DATE
 
 # Github URLs
 GITHUB_URL = "https://github.com/8041q/Verbilo"

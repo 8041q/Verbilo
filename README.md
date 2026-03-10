@@ -60,17 +60,18 @@ pip install pytablericons Pillow
 4. Launch the GUI:
 
 ```bash
-python -m src.verbilo.cli --gui
+cd src
+python -m verbilo.cli --gui
 ```
 
 5. Or run CLI translations directly (examples below):
 
 ```bash
 # Translate all supported files in `origin/` to Spanish
-python -m src.verbilo.cli es
+python -m verbilo.cli es
 
 # Translate only English segments to Portuguese
-python -m src.verbilo.cli pt --source en
+python -m verbilo.cli pt --source en
 ```
 
 
@@ -80,7 +81,7 @@ python -m src.verbilo.cli pt --source en
 Usage:
 
 ```text
-python -m src.verbilo.cli [LANG] [--source CODE] [--detector ENGINE] [--gui]
+python -m verbilo.cli [LANG] [--source CODE] [--detector ENGINE] [--gui]
 ```
 
 | Argument | Description |
@@ -93,25 +94,25 @@ python -m src.verbilo.cli [LANG] [--source CODE] [--detector ENGINE] [--gui]
 Example commands:
 
 ```bash
-python -m src.verbilo.cli es
-python -m src.verbilo.cli pt --source en
-python -m src.verbilo.cli --gui
+python -m verbilo.cli es
+python -m verbilo.cli pt --source en
+python -m verbilo.cli --gui
 ```
 
 
 
 ## Programmatic API (quick example)
 
-Use the core API when embedding Verbilo into scripts. `translate_file()` is the project’s core helper available in `src/verbilo/main.py`.
+Use the core API when embedding Verbilo into scripts. `translate_file()` is the project’s core helper available in `verbilo/main.py`.
 
 ```python
-from src.verbilo.main import translate_file
+from verbilo.main import translate_file
 
 # This is an example; adapt params to match your needs.
 translate_file("input.docx", "output.docx", target="es", source="auto")
 ```
 
-(See `src/verbilo/main.py` for the exact function signature and options.)
+(See `verbilo/main.py` for the exact function signature and options.)
 
 
 
@@ -121,9 +122,11 @@ translate_file("input.docx", "output.docx", target="es", source="auto")
 <summary>Click to expand the repository tree</summary>
 
 ```
-output/          ← translated files (auto-created if needed)
 src/
+  Origin/
+  Output/
   verbilo/
+    _version.py
     cli.py
     main.py         - `translate_file()` core API
     gui/
@@ -152,6 +155,37 @@ README.md
 
 </details>
 
+## Nuitka build (Windows)
+
+Prerequisites:
+
+- A Python virtual environment (recommended) activated.
+- `nuitka` installed in the virtualenv (`pip install nuitka`).
+
+Build the GUI executable:
+
+```bash
+# From the repository root, with your virtualenv active
+.venv\Scripts\python.exe scripts\build_nuitka.py --entry gui --output dist/nuitka
+```
+
+Notes:
+
+- For a final GUI build without a console window, pass the flag `--windows-console-mode=disable` to the underlying Nuitka command (the helper script already exposes this behavior when appropriate).
+- To build the CLI-only executable use `--entry cli`.
+
+Run the built GUI (console enabled example):
+
+```bash
+dist\nuitka\verbilo_launcher.dist\verbilo_launcher.exe --gui
+```
+
+Or run the `.exe` directly by double-clicking it in Explorer to launch without the console.
+
+Troubleshooting:
+
+- You will need the language model used by fasttext detector, run `python scripts/download_models.py` to download `models/lid.176.bin`.
+- If paths or behavior differ, confirm you executed the commands from the repository root and that your virtualenv has `nuitka` installed.
 
 
 ## Requirements & Notes

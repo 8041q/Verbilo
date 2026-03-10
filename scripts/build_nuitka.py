@@ -5,6 +5,39 @@ import os
 import shlex
 import subprocess
 import sys
+from pathlib import Path
+
+def write_version_from_pyproject():
+    root = Path(__file__).resolve().parents[1]
+    py = root / "pyproject.toml"
+    if not py.exists():
+        return
+    try:
+        import tomllib as toml
+        loads = toml.loads
+    except Exception:
+        import toml
+        loads = toml.loads
+
+    data = loads(py.read_text())
+    poetry = data.get("tool", {}).get("poetry", {})
+    version = (
+        data.get("project", {}).get("version")
+        or poetry.get("version")
+    )
+    if not version:
+        return
+    build_date = (
+        data.get("project", {}).get("build_date")
+        or poetry.get("build_date")
+        or ""
+    )
+    target = root / "src" / "verbilo" / "_version.py"
+    target.write_text(
+        "# Auto-generated at build time - do not edit, this file is overwritten on every build.\n"
+        f'__version__ = "{version}"\n'
+        f'__build_date__ = "{build_date}"\n'
+    )
 
 def main():
     parser = argparse.ArgumentParser()
@@ -12,6 +45,7 @@ def main():
     parser.add_argument("--output", default="dist")
     parser.add_argument("--python", default=sys.executable)
     args = parser.parse_args()
+    write_version_from_pyproject()
 
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     src_dir = os.path.join(repo_root, "src")
@@ -32,15 +66,20 @@ def main():
     assets_abs_path = os.path.join(repo_root, "src", "verbilo", "assets")
     models_abs_path = os.path.join(repo_root, "models")
     favicon_ico = os.path.join(assets_abs_path, "favicon.ico")
+    version_abs_path = os.path.join(repo_root, "src", "verbilo",)
+    os.environ["PYTHONPATH"] = src_dir + os.pathsep + os.environ.get("PYTHONPATH", "")
 
     flags = [
         "--standalone",
         f"--output-dir={outdir}",
+        "--include-package=verbilo",
+        "--prefer-source-code",
 
         # ── Tkinter / GUI ────────────────────────────────────────────────
         "--enable-plugin=tk-inter",
         "--include-package=PIL",
         "--include-package=pytablericons",
+        "--include-package-data=pytablericons",
         "--include-package-data=customtkinter",
 
         # ── Language detectors (dynamically imported inside functions) ───
@@ -59,12 +98,13 @@ def main():
         "--include-package-data=openpyxl",
 
         # ── PDF (PyMuPDF) ────────────────────────────────────────────────
-        # fitz.mupdf is a SWIG C extension that expands to ~1.75M lines of C.
-        # MSVC runs out of heap on this file; Clang handles it far better.
+        # fitz.mupdf is a SWIG C extension that expands to ~1.75M lines of C. MSVC runs out of heap on this file; Clang handles it far better.
+        # Best to do is use --lto=no and --low-memory on first build, and then there is no need for it
         "--clang", # use Clang-cl (installed via Visual Studio) instead of MSVC
-        "--lto=no", # disable link-time optimisation to reduce peak memory further
-        "--low-memory", # serialise compilation and reduce Nuitka-side RAM usage
+        # "--lto=no", # disable link-time optimisation to reduce peak memory further
+        # "--low-memory", # serialise compilation and reduce Nuitka-side RAM usage
         "--include-package=fitz",
+        "--plugin-enable=pylint-warnings",
 
         # ── Verbilo assets ───────────────────────────────────────────────
         # icons.py resolves: Path(__file__).parent.parent / "assets" / "favicon.*" which maps to verbilo/assets/ inside the standalone dist folder.
@@ -74,6 +114,26 @@ def main():
         # ── FastText language detection model ────────────────────────────
         # Bundled at <dist>/models/lid.176.bin; lang_detect.py points. FTLANG_CACHE to <dist>/models/ at runtime so fast_langdetect
         f"--include-data-files={os.path.join(models_abs_path, 'lid.176.bin')}=models/lid.176.bin",
+        "--nofollow-import-to=fasttext.tests",
+        "--nofollow-import-to=fasttext.tests.test_script",
+
+        # ── App Version Control ──────────────────────────────────────────
+        "--include-module=verbilo._version",
+        # f"--include-data-files={os.path.join(version_abs_path, '_version.py')}=verbilo/_version.py",
+        
+        # ── Optimization ─────────────────────────────────────────────────
+        "--python-flag=no_site",
+        "--python-flag=-OO",
+        "--enable-plugin=tk-inter",
+        "--nofollow-import-to=pytest",
+        "--nofollow-import-to=pluggy",
+        "--nofollow-import-to=iniconfig",
+        "--nofollow-import-to=setuptools",
+        "--nofollow-import-to=pip",
+        "--nofollow-import-to=packaging",
+        "--nofollow-import-to=pybind11",
+        "--nofollow-import-to=toml",
+        f"--output-filename=verbilo",
     ]
 
     # Windows app icon embedded into the .exe
@@ -82,8 +142,8 @@ def main():
 
     # GUI builds: hide the console window on Windows.
     # Comment this line out while debugging so you can see tracebacks.
-    """if args.entry == "gui":
-        flags.append("--windows-console-mode=disable")"""
+    if args.entry == "gui":
+        flags.append("--windows-console-mode=disable")
 
     cmd = [args.python, "-m", "nuitka"] + flags + [entry]
 
