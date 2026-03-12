@@ -132,7 +132,8 @@ def main():
         "--nofollow-import-to=pygame",
         "--nofollow-import-to=robust_downloader",
         "--nofollow-import-to=tqdm",
-        "--collect-all=fitz",
+        "--include-package=fitz",
+        "--include-package-data=fitz",
 
         f"--output-filename=verbilo",
     ]
