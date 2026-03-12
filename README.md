@@ -7,7 +7,7 @@
 [![Releases](https://img.shields.io/github/v/release/8041q/Verbilo)](https://github.com/8041q/Verbilo/releases)
 [![Release Notes](https://img.shields.io/badge/release-notes-blue)](https://github.com/8041q/Verbilo/releases)
 [![Python](https://img.shields.io/badge/python-3.12%2B-brightgreen)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![License](https://img.shields.io/badge/License-AGPL)](https://www.gnu.org/licenses/agpl-3.0.en.html)
 [![Stars](https://img.shields.io/github/stars/8041q/Verbilo?style=flat)](https://github.com/8041q/Verbilo/stargazers)
 [![Issues](https://img.shields.io/github/issues/8041q/Verbilo)](https://github.com/8041q/Verbilo/issues)
 
@@ -233,5 +233,4 @@ Contributions are what makes open source great!
 
 ## License
 
-This project is released under the **MIT License** — see the `LICENSE` file for details.
-
+This project is released under the **GNU Affero General Public License v3 (AGPL-3.0-or-later)** — see the LICENSE file for details.
