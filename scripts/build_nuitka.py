@@ -12,14 +12,9 @@ def write_version_from_pyproject():
     py = root / "pyproject.toml"
     if not py.exists():
         return
-    try:
-        import tomllib as toml
-        loads = toml.loads
-    except Exception:
-        import toml
-        loads = toml.loads
+    import tomllib
 
-    data = loads(py.read_text())
+    data = tomllib.loads(py.read_text())
     poetry = data.get("tool", {}).get("poetry", {})
     version = (
         data.get("project", {}).get("version")
@@ -70,16 +65,18 @@ def main():
     os.environ["PYTHONPATH"] = src_dir + os.pathsep + os.environ.get("PYTHONPATH", "")
 
     flags = [
-        "--standalone",
+        "--mode=standalone",
         f"--output-dir={outdir}",
         "--include-package=verbilo",
-        "--prefer-source-code",
+        #"--prefer-source-code", # will make build 2x/3x longer, but it's the most optimizing of the code
+        "--assume-yes-for-downloads", # to make sure Nuitka is using cache to save time on next build
 
         # ── Tkinter / GUI ────────────────────────────────────────────────
         "--enable-plugin=tk-inter",
         "--include-package=PIL",
         "--include-package=pytablericons",
         "--include-package-data=pytablericons",
+        "--include-package=customtkinter",
         "--include-package-data=customtkinter",
 
         # ── Language detectors (dynamically imported inside functions) ───
@@ -90,7 +87,8 @@ def main():
 
         # ── Translation engine ───────────────────────────────────────────
         "--include-package=deep_translator",
-
+        # ── System / runtime ────────────────────────────────────────────────
+        "--include-package=platformdirs",
         # ── Document converters ──────────────────────────────────────────
         "--include-package=docx",
         "--include-package-data=docx",
@@ -101,10 +99,9 @@ def main():
         # fitz.mupdf is a SWIG C extension that expands to ~1.75M lines of C. MSVC runs out of heap on this file; Clang handles it far better.
         # Best to do is use --lto=no and --low-memory on first build, and then there is no need for it
         "--clang", # use Clang-cl (installed via Visual Studio) instead of MSVC
-        # "--lto=no", # disable link-time optimisation to reduce peak memory further
-        # "--low-memory", # serialise compilation and reduce Nuitka-side RAM usage
-        "--include-package=fitz",
-        "--plugin-enable=pylint-warnings",
+        "--lto=no", # disables link-time optimisation to reduce peak memory further
+        "--low-memory", # serialise compilation and reduce Nuitka-side RAM usage
+        "--enable-plugin=pylint-warnings",
 
         # ── Verbilo assets ───────────────────────────────────────────────
         # icons.py resolves: Path(__file__).parent.parent / "assets" / "favicon.*" which maps to verbilo/assets/ inside the standalone dist folder.
@@ -117,22 +114,26 @@ def main():
         "--nofollow-import-to=fasttext.tests",
         "--nofollow-import-to=fasttext.tests.test_script",
 
+        # ── Model-download utilities: bytecode is fine ───────────────────
+        # tqdm and robust_downloader are used only to download the FastText model at first run.  The model is pre-bundled (lid.176.bin)
+
+        # ── Compilation report (for diagnostics) ─────────────────────────
+        "--report=compilation-report.xml",
+
         # ── App Version Control ──────────────────────────────────────────
         "--include-module=verbilo._version",
-        # f"--include-data-files={os.path.join(version_abs_path, '_version.py')}=verbilo/_version.py",
         
         # ── Optimization ─────────────────────────────────────────────────
         "--python-flag=no_site",
-        "--python-flag=-OO",
-        "--enable-plugin=tk-inter",
-        "--nofollow-import-to=pytest",
-        "--nofollow-import-to=pluggy",
-        "--nofollow-import-to=iniconfig",
-        "--nofollow-import-to=setuptools",
-        "--nofollow-import-to=pip",
+        "--nofollow-import-to=81d243bd2c585b0f4821__mypyc",
+        "--nofollow-import-to=__pycache__",
         "--nofollow-import-to=packaging",
-        "--nofollow-import-to=pybind11",
-        "--nofollow-import-to=toml",
+        "--nofollow-import-to=pip",
+        "--nofollow-import-to=pygame",
+        "--nofollow-import-to=robust_downloader",
+        "--nofollow-import-to=tqdm",
+        "--collect-all=fitz",
+
         f"--output-filename=verbilo",
     ]
 

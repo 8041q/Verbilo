@@ -837,7 +837,9 @@ class App:
         except Exception:
             pass
         if self.cfg.get("default_input"):
-            return str((Path.cwd() / self.cfg["default_input"]).resolve())
+            val = self.cfg["default_input"]
+            p = Path(val)
+            return str(p.resolve() if p.is_absolute() else (Path.cwd() / p).resolve())
         return str(Path.cwd())
 
     def _initialdir_for_output(self) -> str:
@@ -1355,13 +1357,17 @@ class App:
 
         def _browse_default_input():
             raw = in_entry.get().strip() or self.cfg.get("default_input") or ""
-            candidate = (Path.cwd() / raw).resolve() if raw else Path.cwd()
+            if raw:
+                _p = Path(raw)
+                candidate = _p.resolve() if _p.is_absolute() else (Path.cwd() / _p).resolve()
+            else:
+                candidate = Path.cwd()
             while not candidate.exists() and candidate.parent != candidate:
                 candidate = candidate.parent
             d = filedialog.askdirectory(title="Select default input folder", parent=win, initialdir=str(candidate))
             if d:
                 in_entry.delete(0, tk.END)
-                in_entry.insert(0, _try_make_relative(d))
+                in_entry.insert(0, str(Path(d).resolve()))
 
         browse_icon_s = get_icon("folder", size=14)
         theme.make_button(card, "Browse", command=_browse_default_input, style="secondary",
@@ -1379,13 +1385,17 @@ class App:
 
         def _browse_default_output():
             raw = out_entry.get().strip() or self.cfg.get("default_output") or DEFAULT_OUTPUT_FOLDER
-            candidate = (Path.cwd() / raw).resolve() if raw else Path.cwd()
+            if raw:
+                _p = Path(raw)
+                candidate = _p.resolve() if _p.is_absolute() else (Path.cwd() / _p).resolve()
+            else:
+                candidate = Path.cwd()
             while not candidate.exists() and candidate.parent != candidate:
                 candidate = candidate.parent
             d = filedialog.askdirectory(title="Select default output folder", parent=win, initialdir=str(candidate))
             if d:
                 out_entry.delete(0, tk.END)
-                out_entry.insert(0, _try_make_relative(d))
+                out_entry.insert(0, str(Path(d).resolve()))
 
         theme.make_button(card, "Browse", command=_browse_default_output, style="secondary",
                           image=browse_icon_s, height=28).grid(

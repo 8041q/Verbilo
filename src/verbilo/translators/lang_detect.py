@@ -16,21 +16,10 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
+
 # Thresholds
-# ---------------------------------------------------------------------------
-
-# Text shorter than this (after stripping numbers/punctuation) is always
-# considered translatable — no detector is reliable on very short strings.
 _MIN_DETECT_CHARS = 10
-
-# Confidence floor for fasttext results to be trusted on their own.
-# (Lingua uses its own built-in minimum_relative_distance instead.)
 _CONFIDENCE_THRESHOLD = 0.65
-
-# Lingua: minimum gap between the top-two language probabilities.
-# If the gap is smaller than this, detect_language_of() returns None
-# (= ambiguous).  Keep moderate so short cell text is not over-filtered.
 _LINGUA_MIN_RELATIVE_DISTANCE = 0.25
 
 # ISO 639-1 language code aliases — some detectors return longer codes.
@@ -56,10 +45,7 @@ def _norm_code(code: str) -> str:
     return code
 
 
-# ---------------------------------------------------------------------------
 # Text pre-processing for detection
-# ---------------------------------------------------------------------------
-
 _NON_LETTER_RE = re.compile(r"[^a-zA-Z\u00C0-\u024F\u0400-\u04FF"
                              r"\u0600-\u06FF\u4e00-\u9fff\u3040-\u30FF"
                              r"\uAC00-\uD7AF]")
@@ -77,19 +63,25 @@ def _clean_for_detection(text: str) -> str:
     return " ".join(text.split())
 
 
-# ---------------------------------------------------------------------------
 # Individual detector back-ends
-# ---------------------------------------------------------------------------
-
 def _setup_fasttext_model_path() -> None:
-    # Point fast_langdetect at the bundled model in a Nuitka standalone build.
     import sys
     if os.environ.get("FTLANG_CACHE"):
-        return  # already configured (user override or previous call)
-    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-    models_dir = os.path.join(exe_dir, "models")
-    if os.path.isdir(models_dir):
-        os.environ["FTLANG_CACHE"] = models_dir
+        return
+    try:
+        models_dir = os.path.join(__compiled__.containing_dir, "models")  # noqa: F821
+        if os.path.isdir(models_dir):
+            os.environ["FTLANG_CACHE"] = models_dir
+            logger.debug("FastText model dir (frozen): %s", models_dir)
+        return
+    except NameError:
+        pass  # not running as a Nuitka compiled binary
+    dev_models = os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "models")
+    )
+    if os.path.isdir(dev_models):
+        os.environ["FTLANG_CACHE"] = dev_models
+        logger.debug("FastText model dir (dev): %s", dev_models)
 
 
 def _detect_fasttext(text: str) -> Optional[tuple[str, float]]:
@@ -114,10 +106,8 @@ def _detect_fasttext(text: str) -> Optional[tuple[str, float]]:
 
 
 def _detect_lingua(text: str) -> Optional[tuple[str, float]]:
-    # Detect language using lingua-language-detector.  Returns (code, conf) or None.
     # Uses Lingua's built-in minimum_relative_distance for confidence filtering:
-    # detect_language_of() returns None when the gap between top-two candidates
-    # is too small (ambiguous).  When it returns a language, we trust it (1.0).
+
     try:
         detector = _get_lingua_detector()
         language = detector.detect_language_of(text)
@@ -130,10 +120,8 @@ def _detect_lingua(text: str) -> Optional[tuple[str, float]]:
         pass
     return None
 
-
 # Module-level cache for the lingua detector (expensive to build).
 _lingua_detector_instance = None
-
 
 def _get_lingua_detector():
     global _lingua_detector_instance
@@ -149,10 +137,8 @@ def _get_lingua_detector():
     return _lingua_detector_instance
 
 
-# ---------------------------------------------------------------------------
-# Detector registry — maps name → callable
-# ---------------------------------------------------------------------------
 
+# Detector registry — maps name → callable
 _DETECTORS: dict[str, callable] = {
     "fasttext": _detect_fasttext,
     "fastText": _detect_fasttext,
@@ -160,10 +146,7 @@ _DETECTORS: dict[str, callable] = {
 }
 
 
-# ---------------------------------------------------------------------------
 # Public API
-# ---------------------------------------------------------------------------
-
 def detect_language(text: str, detector: str = "fasttext") -> tuple[str, float]:
     # Return (language_code, confidence) for *text*
     cleaned = _clean_for_detection(text)
@@ -195,21 +178,14 @@ def is_source_language(
 
     cleaned = _clean_for_detection(text)
     if len(cleaned) < _MIN_DETECT_CHARS:
-        # Too short to detect reliably.
-        # Lenient: translate (avoid missing cells).
-        # Strict: preserve (avoid translating ambiguous segments).
         return not strict
 
     detected_code, confidence = detect_language(text, detector=detector)
 
     if detected_code == "und":
-        # Detection failed entirely.
-        # Lenient: translate to be safe.  Strict: preserve to be safe.
         return not strict
 
     match = detected_code == src
-
-    # Require decent confidence to *reject* a match.
     # Lenient: low-confidence non-match → translate (avoid skipping cells).
     # Strict:  low-confidence non-match → preserve (avoid clobbering segments).
     if not match and confidence < _CONFIDENCE_THRESHOLD:
@@ -224,10 +200,6 @@ def is_source_language_batch(
     detector: str = "fasttext",
     strict: bool = False,
 ) -> list[bool]:
-    # Batch version of is_source_language.
-    # For Lingua, uses detect_languages_in_parallel_of() across all CPU cores
-    # in a single call instead of looping per-text.
-    # For fasttext, falls back to per-item calls (no native batch API).
     if source_lang == "auto":
         return [True] * len(texts)
 
@@ -244,9 +216,6 @@ def _is_source_language_batch_lingua(
     src: str,
     strict: bool,
 ) -> list[bool]:
-    # Uses Lingua's detect_languages_in_parallel_of() — classifies all texts
-    # simultaneously across all available CPU cores.
-    # None results mean ambiguous (filtered by with_minimum_relative_distance).
     cleaned = [_clean_for_detection(t) for t in texts]
     results: list[bool] = [not strict] * len(texts)  # default for short/undecidable
 

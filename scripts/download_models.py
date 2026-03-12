@@ -3,10 +3,14 @@
 import argparse
 import os
 import sys
+from pathlib import Path
 from urllib.request import urlopen
 
 
 FASTTEXT_URL = "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin"
+
+# Default destination is anchored to the repo root, regardless of where the script is run from.
+_DEFAULT_DEST = str(Path(__file__).resolve().parents[1] / "models" / "lid.176.bin")
 
 
 def download(url, dest_path):
@@ -18,7 +22,7 @@ def download(url, dest_path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dest", default="models/lid.176.bin")
+    parser.add_argument("--dest", default=_DEFAULT_DEST)
     args = parser.parse_args()
 
     try:

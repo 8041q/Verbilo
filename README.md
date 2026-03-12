@@ -173,11 +173,12 @@ Notes:
 
 - For a final GUI build without a console window, pass the flag `--windows-console-mode=disable` to the underlying Nuitka command (the helper script already exposes this behavior when appropriate).
 - To build the CLI-only executable use `--entry cli`.
+- If build fails and you try with changes, clean the Nuitka cache at `%LOCALAPPDATA%\Nuitka\Nuitka\`
 
 Run the built GUI (console enabled example):
 
 ```bash
-dist\nuitka\verbilo_launcher.dist\verbilo_launcher.exe --gui
+dist\nuitka\verbilo_launcher.dist\verbilo.exe --gui
 ```
 
 Or run the `.exe` directly by double-clicking it in Explorer to launch without the console.

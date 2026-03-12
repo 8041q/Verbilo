@@ -4,7 +4,7 @@ import os
 
 def resolve_output_path(input_path: Path | str, out_arg: str | None = None) -> str:
     # None → .translated next to input; dir → original name inside it; else use as-is
-    p = Path(input_path)
+    p = Path(input_path).resolve()
     if out_arg is None:
         return str(p.with_name(p.stem + ".translated" + p.suffix))
 

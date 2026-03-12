@@ -1,4 +1,4 @@
-# loads/saves GUI defaults from .verbilo_gui.json in cwd
+# loads/saves GUI defaults from .verbilo_gui.json in the platform user-config dir
 
 from __future__ import annotations
 
@@ -8,12 +8,18 @@ import logging
 from pathlib import Path
 from typing import Dict, Any
 
+try:
+    from platformdirs import user_config_dir as _user_config_dir
+except ImportError:
+    # Graceful fallback when platformdirs is not installed (e.g. bare clone without pip install)
+    def _user_config_dir(appname: str, **_kw) -> str:  # type: ignore[misc]
+        return str(Path.home() / f".{appname.lower()}")
+
 CONFIG_FILENAME = ".verbilo_gui.json"
 
 
 def _config_path() -> Path:
-    # Resolved relative to this file so it works regardless of launch directory / Nuitka binary
-    return Path(__file__).parent.parent.parent.parent / "config" / CONFIG_FILENAME
+    return Path(_user_config_dir("verbilo", appauthor=False)) / CONFIG_FILENAME
 
 
 def load_config() -> Dict[str, Any]:
