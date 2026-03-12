@@ -68,6 +68,7 @@ def main():
         "--mode=standalone",
         f"--output-dir={outdir}",
         "--include-package=verbilo",
+        "--include-package-data=verbilo",
         #"--prefer-source-code", # will make build 2x/3x longer, but it's the most optimizing of the code
         "--assume-yes-for-downloads", # to make sure Nuitka is using cache to save time on next build
 
@@ -104,18 +105,16 @@ def main():
         "--enable-plugin=pylint-warnings",
 
         # ── Verbilo assets ───────────────────────────────────────────────
-        # icons.py resolves: Path(__file__).parent.parent / "assets" / "favicon.*" which maps to verbilo/assets/ inside the standalone dist folder.
         f"--include-data-files={favicon_ico}=verbilo/assets/favicon.ico",
         f"--include-data-files={os.path.join(assets_abs_path, 'favicon.jpg')}=verbilo/assets/favicon.jpg",
 
         # ── FastText language detection model ────────────────────────────
-        # Bundled at <dist>/models/lid.176.bin; lang_detect.py points. FTLANG_CACHE to <dist>/models/ at runtime so fast_langdetect
         f"--include-data-files={os.path.join(models_abs_path, 'lid.176.bin')}=models/lid.176.bin",
         "--nofollow-import-to=fasttext.tests",
         "--nofollow-import-to=fasttext.tests.test_script",
 
         # ── Model-download utilities: bytecode is fine ───────────────────
-        # tqdm and robust_downloader are used only to download the FastText model at first run.  The model is pre-bundled (lid.176.bin)
+        # tqdm and robust_downloader are used only to download the FastText model at first run
 
         # ── Compilation report (for diagnostics) ─────────────────────────
         "--report=compilation-report.xml",
@@ -127,13 +126,12 @@ def main():
         "--python-flag=no_site",
         "--nofollow-import-to=81d243bd2c585b0f4821__mypyc",
         "--nofollow-import-to=__pycache__",
-        "--nofollow-import-to=packaging",
         "--nofollow-import-to=pip",
-        "--nofollow-import-to=pygame",
         "--nofollow-import-to=robust_downloader",
         "--nofollow-import-to=tqdm",
         "--include-package=fitz",
         "--include-package-data=fitz",
+        "--include-package=charset_normalizer",
 
         f"--output-filename=verbilo",
     ]

@@ -13,10 +13,7 @@ from tkinter import filedialog, messagebox
 from tkinter import ttk
 import logging
 
-try:
-    import customtkinter as ctk
-except Exception:
-    ctk = None
+import customtkinter as ctk
 
 import webbrowser
 

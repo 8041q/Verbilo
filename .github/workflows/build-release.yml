@@ -53,7 +53,7 @@ jobs:
         shell: pwsh
         run: |
           # Create a clean staging area
-          New-Item -ItemType Directory -Path "Verbilo-Release\verbilo"
+          New-Item -ItemType Directory -Path "Verbilo-Release"
           
           # Copy only the .dist contents (not .build)
           Copy-Item -Path "dist\nuitka\verbilo_launcher.dist\*" -Destination "Verbilo-Release\" -Recurse
