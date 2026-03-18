@@ -48,9 +48,9 @@ CARD_BORDER_WIDTH: int = 1
 SIDEBAR_WIDTH: int = 260
 BUTTON_CORNER_RADIUS: int = 8
 WINDOW_WIDTH: int = 1100
-WINDOW_HEIGHT: int = 720
-WINDOW_MIN_WIDTH: int = 960
-WINDOW_MIN_HEIGHT: int = 660
+WINDOW_HEIGHT: int = 735
+WINDOW_MIN_WIDTH: int = 850
+WINDOW_MIN_HEIGHT: int = 735
 
 #  Fonts — proper hierarchy, OS-native family first
 def _detect_font_family() -> str:
