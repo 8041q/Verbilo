@@ -31,15 +31,12 @@ Translating office documents should not mean losing formatting, tables, fonts, o
 
 ## Feature Highlights
 
-- **130+ Languages**: Translate to any language supported by Google Translate.  
-- **Selective Translation**: Translate only text in a specified source language (or use auto).  
-- **Formatting Preserved**: DOCX run-level styles and XLSX cell styles are preserved.  
-- **In-place PDF Editing**: Uses PyMuPDF to replace text without breaking layout.  
-- **Multi-Engine Detection**: Lingua, FastText — choose your preferred engine.  
-- **Batching for Efficiency**: Segments are batched to reduce API calls and avoid rate limits.  
-- **Scanned-PDF Detection**: Image-only PDFs are detected and skipped with a log message.  
-- **Segment-Aware**: Keeps technical strings intact (splits on `/` and newlines for safe translation).
-
+- **Multiple translation engines**: Google Translate (free), Google Cloud Translation API, and Baidu Translate.
+- **Proxy & resilience**: All engines use a resilient HTTP session with retries, backoff, timeouts, and optional HTTPS/HTTP proxy.
+- **Selective Translation**: Translate only text in a specified source language (or use auto).
+- **Formatting Preserved**: DOCX run-level, XLSX cell and in-place PDF Editing are preserved. 
+- **Multi-Engine Detection**: Lingua, FastText — choose your preferred engine. (quality / speed)
+- **Batching for Efficiency**: Segments are batched to reduce API calls and avoid rate limits.
 
 
 ## Quick Start — For Developers
@@ -50,21 +47,21 @@ Translating office documents should not mean losing formatting, tables, fonts, o
 pip install -r requirements.txt
 ```
 
-3. (GUI extras) Install UI helpers and icons (if any error appears):
-
-```bash
-pip install customtkinter
-pip install pytablericons Pillow
-```
-
-4. Launch the GUI:
+2. Launch the GUI:
 
 ```bash
 cd src
 python -m verbilo.cli --gui
 ```
 
-5. Or run CLI translations directly (examples below):
+3. If using GUI, and errors for UI helpers or icons appear:
+
+```bash
+pip install customtkinter
+pip install pytablericons Pillow
+```
+
+4. Or run CLI translations directly (examples below):
 
 ```bash
 # Translate all supported files in `origin/` to Spanish
@@ -75,51 +72,103 @@ python -m verbilo.cli pt --source en
 ```
 
 
-
 ## CLI Reference
 
 Usage:
 
 ```text
-python -m verbilo.cli [LANG] [--source CODE] [--detector ENGINE] [--gui]
+python -m verbilo.cli [LANG] [options]
+
+| Argument/Option      | Description                                                   |
+| -------------------- | ------------------------------------------------------------- |
+| LANG                 | Target language code (e.g., es, pt).                          |
+| --source CODE        | Source language code (default: auto).                         |
+| --detector ENGINE    | Detection engine: fasttext (default) or lingua.               |
+| --engine NAME        | Translation engine: google (default), google-cloud, or baidu. |
+| --proxy URL          | HTTPS/HTTP proxy (e.g. http://127.0.0.1:7890).                |
+| --google-api-key KEY | Google Cloud Translation API key (for --engine google-cloud). |
+| --baidu-appid ID     | Baidu Translate App ID (for --engine baidu).                  |
+| --baidu-appkey KEY   | Baidu Translate App Key (for --engine baidu).                 |
+| --gui                | Launch the graphical interface.                               |
 ```
 
-| Argument | Description |
-|---|---|
-| `LANG` | Target language code (e.g., `es`, `pt`) |
-| `--source CODE` | Source language code (default: `auto`) |
-| `--detector ENGINE` | Detection engine: `fasttext` (default) or `lingua` |
-| `--gui` | Launch the graphical interface |
-
 Example commands:
-
 ```bash
+Free Google Translate (default engine)
 python -m verbilo.cli es
-python -m verbilo.cli pt --source en
+
+Use Baidu Translate via proxy
+python -m verbilo.cli zh-CN \
+  --engine baidu \
+  --baidu-appid YOUR_APPID \
+  --baidu-appkey YOUR_APPKEY \
+  --proxy http://127.0.0.1:7890
+
+Use Google Cloud Translation API
+python -m verbilo.cli pt \
+  --engine google-cloud \
+  --google-api-key YOUR_GOOGLE_API_KEY
+
+Launch GUI
 python -m verbilo.cli --gui
 ```
 
+***
 
+
+### GUI translation engines & network settings
+
+In the GUI sidebar you can choose the translation engine:
+
+- Google Translate (free) — default, no API key required.
+- Google Cloud API — requires a valid Google Cloud Translation API key.
+- Baidu Translate — requires Baidu App ID and App Key.
+
+**Settings → Network & API keys** to configure
+
+If Baidu or Google Cloud is selected without credentials, the GUI will show a warning instead of starting the job.
 
 ## Programmatic API (quick example)
 
 Use the core API when embedding Verbilo into scripts. `translate_file()` is the project’s core helper available in `verbilo/main.py`.
 
-```python
+<details>
+<summary>Click to expand</summary>
+  
+```
 from verbilo.main import translate_file
 
-# This is an example; adapt params to match your needs.
-translate_file("input.docx", "output.docx", target="es", source="auto")
+# Free Google (default)
+translate_file("input.docx", "es", "output", source_lang="auto")
+
+# Google Cloud API
+translate_file(
+    "input.docx", "es", "output",
+    source_lang="auto",
+    engine="google-cloud",
+    google_api_key="YOUR_GOOGLE_API_KEY",
+)
+
+# Baidu Translate behind a proxy
+translate_file(
+    "input.docx", "zh-CN", "output",
+    source_lang="auto",
+    engine="baidu",
+    baidu_appid="YOUR_BAIDU_APPID",
+    baidu_appkey="YOUR_BAIDU_APPKEY",
+    proxies={"https": "http://127.0.0.1:7890", "http": "http://127.0.0.1:7890"},
+)
 ```
 
 (See `verbilo/main.py` for the exact function signature and options.)
 
+</details>
 
 
 ## Project Structure
 
 <details>
-<summary>Click to expand the repository tree</summary>
+<summary>Click to expand</summary>
 
 ```
 src/
