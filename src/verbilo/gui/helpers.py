@@ -85,6 +85,11 @@ class Worker:
         log_cb: Callable[[str], None],
         source_lang: str = "auto",
         detector: str = "fasttext",
+        engine: str = "google",
+        proxies: dict | None = None,
+        google_api_key: str = "",
+        baidu_appid: str = "",
+        baidu_appkey: str = "",
     ):
         if self._thread and self._thread.is_alive():
             raise RuntimeError("Worker already running")
@@ -93,7 +98,11 @@ class Worker:
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._run,
-            args=(list(files), target_lang, output_dir, translator_name, progress_cb, log_cb, source_lang, detector),
+            args=(
+                list(files), target_lang, output_dir, translator_name,
+                progress_cb, log_cb, source_lang, detector,
+                engine, proxies, google_api_key, baidu_appid, baidu_appkey,
+            ),
             daemon=True,
         )
         self._thread.start()
@@ -101,7 +110,8 @@ class Worker:
     def stop(self):
         self._stop.set()
 
-    def _run(self, files, target_lang, output_dir, translator_name, progress_cb, log_cb, source_lang, detector):
+    def _run(self, files, target_lang, output_dir, translator_name, progress_cb, log_cb, source_lang, detector,
+             engine, proxies, google_api_key, baidu_appid, baidu_appkey):
         for f in files:
             if self._stop.is_set():
                 log_cb("Cancelled by user")
@@ -116,6 +126,11 @@ class Worker:
                     source_lang=source_lang,
                     cancel_event=self._stop,
                     detector=detector,
+                    engine=engine,
+                    proxies=proxies,
+                    google_api_key=google_api_key,
+                    baidu_appid=baidu_appid,
+                    baidu_appkey=baidu_appkey,
                 )
                 elapsed = time.perf_counter() - t0
 

@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "verbilo"
-version = "1.9.3"
-build_date = "2026-03-12"
+version = "1.9.5"
+build_date = "2026-03-18"
 description = "Translate .docx, .pdf, .xlsx, .xls files while preserving formatting."
 authors = ["crt_ (8041q)"]
 packages = [{ include = "verbilo", from = "src" }]

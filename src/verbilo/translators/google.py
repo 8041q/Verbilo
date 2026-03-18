@@ -3,13 +3,29 @@
 from __future__ import annotations
 
 import re
+import types
 import threading
 from typing import Optional, Dict, Any
 from .base import Translator
+from .http_session import make_session, resolve_proxies
 from ..utils import CancelledError
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _patch_google_requests(session):
+    """Monkey-patch ``deep_translator.google.requests`` so that all HTTP calls
+    go through *session* (which carries retry, timeout, and proxy settings)."""
+    try:
+        import deep_translator.google as _mod
+        shim = types.ModuleType("requests_shim")
+        shim.get = session.get    # type: ignore[attr-defined]
+        shim.post = session.post  # type: ignore[attr-defined]
+        _mod.requests = shim      # type: ignore[attr-defined]
+        logger.debug("Patched deep_translator.google.requests → resilient session")
+    except Exception:
+        logger.debug("Could not patch deep_translator.google.requests", exc_info=True)
 
 # Maximum texts per Google Translate batch request.
 _BATCH_SIZE = 50
@@ -79,9 +95,16 @@ class IdentityTranslator:
 
 class DeepTranslatorWrapper:
 
-    def __init__(self, source_lang: str = "auto", detector: str = "fasttext"):
+    def __init__(self, source_lang: str = "auto", detector: str = "fasttext",
+                 proxies: Optional[dict] = None):
         self._source_lang = source_lang
         self._detector = detector
+        self._proxies = proxies
+
+        # Set up a resilient session and inject it into deep_translator.google
+        self._session = make_session(proxies=proxies)
+        _patch_google_requests(self._session)
+
         try:
             from deep_translator import GoogleTranslator
             self._impl_cls = GoogleTranslator
@@ -97,7 +120,10 @@ class DeepTranslatorWrapper:
                 raise RuntimeError("deep_translator is not available")
             # Always let Google auto-detect the source; pre-filtering handles
             # source-language selection so we never feed the wrong lang code.
-            inst = self._impl_cls(source="auto", target=target_lang)
+            inst = self._impl_cls(
+                source="auto", target=target_lang,
+                proxies=resolve_proxies(self._proxies),
+            )
             self._instances[target_lang] = inst
         return inst
 
@@ -347,21 +373,257 @@ class DeepTranslatorWrapper:
         return chunks
 
 
+class GoogleCloudTranslatorWrapper:
+    """Uses the official Google Cloud Translation API v2 (requires an API key).
+
+    Endpoint: ``https://translation.googleapis.com/language/translate/v2``
+    This is more reliable than the mobile-scrape endpoint, especially from
+    regions where ``translate.google.com`` is throttled or blocked.
+    """
+
+    _API_URL = "https://translation.googleapis.com/language/translate/v2"
+
+    def __init__(
+        self,
+        api_key: str,
+        source_lang: str = "auto",
+        detector: str = "fasttext",
+        proxies: Optional[dict] = None,
+    ):
+        self._api_key = api_key
+        self._source_lang = source_lang
+        self._detector = detector
+        self._session = make_session(proxies=proxies)
+        self._cache: Dict[str, Dict[str, str]] = {}
+
+    # --- language filtering (same logic as DeepTranslatorWrapper) -----------
+
+    def _should_translate(self, text: str) -> bool:
+        if self._source_lang == "auto":
+            return True
+        from .lang_detect import is_source_language
+        return is_source_language(text, self._source_lang, detector=self._detector)
+
+    _SEGMENT_RE = re.compile(r'(\n|\r\n|\r|/)')
+
+    def _translate_segments(self, text: str, target_lang: str) -> str:
+        from .lang_detect import is_source_language
+        parts = self._SEGMENT_RE.split(text)
+        changed = False
+        result_parts: list[str] = []
+        for i, part in enumerate(parts):
+            if i % 2 == 1:
+                result_parts.append(part)
+                continue
+            stripped = part.strip()
+            if not stripped:
+                result_parts.append(part)
+                continue
+            if is_source_language(stripped, self._source_lang, detector=self._detector, strict=True):
+                translated = self._cloud_translate_single(stripped, target_lang)
+                leading = part[:len(part) - len(part.lstrip())]
+                trailing = part[len(part.rstrip()):]
+                result_parts.append(leading + translated + trailing)
+                changed = True
+            else:
+                result_parts.append(part)
+        return "".join(result_parts) if changed else text
+
+    # --- core API call ---------------------------------------------------
+
+    def _cloud_translate_texts(self, texts: list[str], target_lang: str) -> list[str]:
+        """Call the Cloud Translation v2 REST API for a list of texts."""
+        params: dict = {
+            "key": self._api_key,
+            "target": target_lang,
+            "format": "text",
+        }
+        if self._source_lang != "auto":
+            params["source"] = self._source_lang
+        # The v2 API accepts multiple 'q' params in one POST
+        data = {"q": texts}
+        data.update(params)
+        resp = self._session.post(self._API_URL, json=data)
+        resp.raise_for_status()
+        body = resp.json()
+        translations = body.get("data", {}).get("translations", [])
+        return [
+            t.get("translatedText", orig)
+            for t, orig in zip(translations, texts)
+        ]
+
+    def _cloud_translate_single(self, text: str, target_lang: str) -> str:
+        tgt_cache = self._cache.setdefault(target_lang, {})
+        if text in tgt_cache:
+            return tgt_cache[text]
+        try:
+            results = self._cloud_translate_texts([text], target_lang)
+            result = post_process(results[0]) if results else text
+            tgt_cache[text] = result
+            return result
+        except Exception:
+            logger.exception("Google Cloud single translation failed for target '%s'", target_lang)
+            return text
+
+    # --- public interface (Translator protocol) ----------------------------
+
+    def translate_text(self, text: str, target_lang: str) -> str:
+        if not text or not text.strip():
+            return text
+        if self._source_lang != "auto":
+            if self._SEGMENT_RE.search(text):
+                return self._translate_segments(text, target_lang)
+            if not self._should_translate(text):
+                return text
+        tgt_cache = self._cache.setdefault(target_lang, {})
+        if text in tgt_cache:
+            return tgt_cache[text]
+        try:
+            results = self._cloud_translate_texts([text], target_lang)
+            result = post_process(results[0]) if results else text
+            tgt_cache[text] = result
+            return result
+        except Exception:
+            logger.exception("Google Cloud translate failed for target '%s'", target_lang)
+            raise
+
+    def translate_batch(
+        self,
+        texts: list[str],
+        target_lang: str,
+        *,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> list[str]:
+        results: list[str] = list(texts)
+        tgt_cache = self._cache.setdefault(target_lang, {})
+
+        _lingua_batch: dict[int, bool] = {}
+        if self._source_lang != "auto" and self._detector == "lingua":
+            from .lang_detect import is_source_language_batch
+            candidates = [
+                (i, t) for i, t in enumerate(texts)
+                if t and t.strip() and not self._SEGMENT_RE.search(t)
+            ]
+            if candidates:
+                batch_flags = is_source_language_batch(
+                    [t for _, t in candidates],
+                    self._source_lang,
+                    detector="lingua",
+                )
+                _lingua_batch = {i: flag for (i, _), flag in zip(candidates, batch_flags)}
+
+        to_translate: list[tuple[int, str]] = []
+        for i, t in enumerate(texts):
+            if not t or not t.strip():
+                continue
+            if self._source_lang != "auto" and self._SEGMENT_RE.search(t):
+                results[i] = self._translate_segments(t, target_lang)
+                continue
+            should = _lingua_batch[i] if i in _lingua_batch else self._should_translate(t)
+            if not should:
+                continue
+            if t in tgt_cache:
+                results[i] = tgt_cache[t]
+            else:
+                to_translate.append((i, t))
+
+        if not to_translate:
+            return results
+
+        # Deduplicate
+        unique_texts: dict[str, list[int]] = {}
+        for idx, t in to_translate:
+            unique_texts.setdefault(t, []).append(idx)
+        dedup_items: list[tuple[str, list[int]]] = list(unique_texts.items())
+
+        # Cloud API can handle up to ~128 segments per request;  use the same
+        # chunk helper but with a larger batch size.
+        chunks = DeepTranslatorWrapper._make_chunks(dedup_items)
+
+        for chunk in chunks:
+            if cancel_event is not None and cancel_event.is_set():
+                raise CancelledError("Translation cancelled")
+            chunk_texts = [t for t, _ in chunk]
+            try:
+                translated = _run_cancellable(
+                    lambda texts=chunk_texts: self._cloud_translate_texts(texts, target_lang),
+                    cancel_event,
+                )
+                if translated is None:
+                    translated = chunk_texts
+                for (orig_text, indices), tr_text in zip(chunk, translated):
+                    tr_text = post_process(tr_text) if tr_text else orig_text
+                    tgt_cache[orig_text] = tr_text
+                    for idx in indices:
+                        results[idx] = tr_text
+            except CancelledError:
+                raise
+            except Exception:
+                logger.exception("Cloud batch failed; falling back to per-item")
+                for orig_text, indices in chunk:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise CancelledError("Translation cancelled")
+                    try:
+                        r = self._cloud_translate_single(orig_text, target_lang)
+                        for idx in indices:
+                            results[idx] = r
+                    except Exception:
+                        logger.exception("Cloud per-item fallback also failed")
+        return results
+
+
 class TranslatorFactory:
     @staticmethod
-    def get(name: Optional[str] = None, source_lang: str = "auto", detector: str = "fasttext") -> Translator:
-        if name is None:
-            try:
-                from deep_translator import GoogleTranslator  # type: ignore  # noqa: F401
-                return DeepTranslatorWrapper(source_lang=source_lang, detector=detector)
-            except Exception:
-                logger.warning(
-                    "deep_translator is not available — returning IdentityTranslator "
-                    "(text will NOT be translated). Install it with: pip install deep-translator"
-                )
+    def get(
+        name: Optional[str] = None,
+        source_lang: str = "auto",
+        detector: str = "fasttext",
+        *,
+        engine: str = "google",
+        proxies: Optional[dict] = None,
+        google_api_key: str = "",
+        baidu_appid: str = "",
+        baidu_appkey: str = "",
+    ) -> Translator:
+        engine = (engine or "google").strip().lower()
+
+        # --- Baidu Translate ---
+        if engine == "baidu":
+            if not baidu_appid or not baidu_appkey:
+                logger.error("Baidu engine selected but appid/appkey not provided")
                 return IdentityTranslator()
-        if name.lower() == "identity":
+            from .baidu import BaiduTranslatorWrapper
+            return BaiduTranslatorWrapper(
+                appid=baidu_appid, appkey=baidu_appkey,
+                source_lang=source_lang, detector=detector,
+                proxies=proxies,
+            )
+
+        # --- Google Cloud Translation API (with user-provided key) ---
+        if engine in ("google-cloud", "google_cloud"):
+            if not google_api_key:
+                logger.warning("Google Cloud engine selected but no API key — falling back to free Google")
+                engine = "google"
+            else:
+                return GoogleCloudTranslatorWrapper(
+                    api_key=google_api_key,
+                    source_lang=source_lang,
+                    detector=detector,
+                    proxies=proxies,
+                )
+
+        # --- Google Translate (free mobile scraper, default) ---
+        if name and name.lower() == "identity":
             return IdentityTranslator()
-        if name.lower() in ("deep", "deep-translator", "google"):
-            return DeepTranslatorWrapper(source_lang=source_lang, detector=detector)
-        return IdentityTranslator()
+        try:
+            from deep_translator import GoogleTranslator  # type: ignore  # noqa: F401
+            return DeepTranslatorWrapper(
+                source_lang=source_lang, detector=detector,
+                proxies=proxies,
+            )
+        except Exception:
+            logger.warning(
+                "deep_translator is not available — returning IdentityTranslator "
+                "(text will NOT be translated). Install it with: pip install deep-translator"
+            )
+            return IdentityTranslator()

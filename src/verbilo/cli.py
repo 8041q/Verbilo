@@ -21,6 +21,17 @@ def main():
     parser.add_argument("--detector", "-d", default="fasttext",
                         choices=["fasttext", "lingua"],
                         help="Language detector engine (default: fasttext)")
+    parser.add_argument("--engine", "-e", default="google",
+                        choices=["google", "google-cloud", "baidu"],
+                        help="Translation engine (default: google)")
+    parser.add_argument("--proxy", default=None,
+                        help="HTTPS proxy URL (e.g. http://127.0.0.1:7890)")
+    parser.add_argument("--google-api-key", default="",
+                        help="Google Cloud Translation API key (for --engine google-cloud)")
+    parser.add_argument("--baidu-appid", default="",
+                        help="Baidu Translate App ID (for --engine baidu)")
+    parser.add_argument("--baidu-appkey", default="",
+                        help="Baidu Translate App Key (for --engine baidu)")
     parser.add_argument("--gui", action="store_true", help="Launch the GUI instead of running batch CLI")
     args = parser.parse_args()
 
@@ -48,10 +59,21 @@ def main():
         print("Error: target language code is required for batch CLI. Example: python -m src.verbilo.cli es")
         return
 
-    print(f"Source language: {args.source}  |  Target language: {args.lang}")
+    proxies = {"https": args.proxy, "http": args.proxy} if args.proxy else None
+
+    print(f"Source language: {args.source}  |  Target language: {args.lang}  |  Engine: {args.engine}")
     for f in files:
         try:
-            result = translate_file(str(f), args.lang, str(output), source_lang=args.source, detector=args.detector)
+            result = translate_file(
+                str(f), args.lang, str(output),
+                source_lang=args.source,
+                detector=args.detector,
+                engine=args.engine,
+                proxies=proxies,
+                google_api_key=args.google_api_key,
+                baidu_appid=args.baidu_appid,
+                baidu_appkey=args.baidu_appkey,
+            )
             if result == "skipped-ocr":
                 print(f"Skipped {f.name} (scanned/image PDF requiring OCR)")
             else:

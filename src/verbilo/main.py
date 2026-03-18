@@ -15,13 +15,27 @@ def translate_file(
     source_lang: str = "auto",
     cancel_event: threading.Event | None = None,
     detector: str = "fasttext",
+    engine: str = "google",
+    proxies: dict | None = None,
+    google_api_key: str = "",
+    baidu_appid: str = "",
+    baidu_appkey: str = "",
 ):
     # source_lang="auto" translates everything; cancel_event raises CancelledError before saving
     p = Path(input_path)
     if not p.exists():
         raise FileNotFoundError(input_path)
 
-    translator = TranslatorFactory.get(translator_name, source_lang=source_lang or "auto", detector=detector)
+    translator = TranslatorFactory.get(
+        translator_name,
+        source_lang=source_lang or "auto",
+        detector=detector,
+        engine=engine,
+        proxies=proxies,
+        google_api_key=google_api_key,
+        baidu_appid=baidu_appid,
+        baidu_appkey=baidu_appkey,
+    )
 
     # Validate target language early to avoid silent no-ops downstream
     if not target_lang or not isinstance(target_lang, str) or not target_lang.strip():

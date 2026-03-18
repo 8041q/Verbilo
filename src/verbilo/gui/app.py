@@ -84,6 +84,23 @@ _FASTTEXT_LANG_CODES: frozenset[str] = frozenset({
     "zh", "zu",
 })
 
+# ISO 639-1 codes that Baidu Translate supports (mapped from its native codes).
+_BAIDU_LANG_CODES: frozenset[str] = frozenset({
+    "ar", "bg", "cs", "da", "de", "el", "en", "es", "et", "fi",
+    "fr", "hu", "it", "ja", "ko", "nl", "pl", "pt", "ro", "ru",
+    "sl", "sv", "th", "vi", "zh", "zh-CN", "zh-TW",
+})
+
+# Translation engine choices (display name → internal key).
+_ENGINE_OPTIONS: list[tuple[str, str]] = [
+    ("Google Translate (free)", "google"),
+    ("Google Cloud API", "google-cloud"),
+    ("Baidu Translate", "baidu"),
+]
+_ENGINE_DISPLAY = [name for name, _ in _ENGINE_OPTIONS]
+_ENGINE_MAP = {name: key for name, key in _ENGINE_OPTIONS}
+_ENGINE_REVERSE = {key: name for name, key in _ENGINE_OPTIONS}
+
 
 def _filter_by_detector(
     opts: list[tuple[str, str]], detector: str,
@@ -96,6 +113,21 @@ def _filter_by_detector(
         if base in codes:
             result.append((code, name))
     return result
+
+
+def _filter_by_engine(
+    opts: list[tuple[str, str]], engine: str,
+) -> list[tuple[str, str]]:
+    """Return only (code, name) pairs that the given translation engine supports.
+    Google (free & cloud) supports all languages, so no filtering needed."""
+    if engine == "baidu":
+        result = []
+        for code, name in opts:
+            base = code.lower().split("_")[0]
+            if base in _BAIDU_LANG_CODES or code in _BAIDU_LANG_CODES:
+                result.append((code, name))
+        return result
+    return list(opts)  # google / google-cloud: no restriction
 
 
 _cached_language_options: list[tuple[str, str]] | None = None
@@ -979,6 +1011,24 @@ class App:
         self.detector_menu.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 6))
         row += 1
 
+        # Translation engine
+        theme.make_label(
+            self.sidebar, "Translation engine", level="small",
+        ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(6, 2))
+        row += 1
+
+        saved_engine = self.cfg.get("translation_engine", "google")
+        default_engine_display = _ENGINE_REVERSE.get(saved_engine, _ENGINE_DISPLAY[0])
+        self.engine_var = tk.StringVar(value=default_engine_display)
+        self.engine_menu = SimpleComboBox(
+            self.sidebar,
+            values=_ENGINE_DISPLAY,
+            variable=self.engine_var,
+            command=self._on_engine_changed,
+        )
+        self.engine_menu.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 6))
+        row += 1
+
         # Divider
         theme.make_divider(self.sidebar).grid(
             row=row, column=0, sticky="ew", padx=PAD, pady=8,
@@ -1431,11 +1481,69 @@ class App:
             level="tiny",
         ).grid(row=4, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 8))
 
-        # --- Updates section ---
+        # --- Network section ---
         theme.make_divider(card).grid(row=5, column=0, columnspan=3, sticky="ew", padx=PAD, pady=(4, 8))
 
-        theme.make_label(card, "UPDATES", level="section").grid(
+        theme.make_label(card, "NETWORK", level="section").grid(
             row=6, column=0, sticky="w", padx=PAD, pady=(0, 6),
+        )
+
+        theme.make_label(card, "HTTPS Proxy", level="small").grid(
+            row=7, column=0, sticky="w", padx=PAD, pady=(0, 4),
+        )
+        proxy_entry = theme.make_entry(card, height=32)
+        proxy_entry.grid(row=7, column=1, columnspan=2, sticky="ew", padx=(4, PAD), pady=(0, 4))
+        proxy_entry.insert(0, self.cfg.get("proxy_url", ""))
+        theme.make_label(
+            card, "e.g. http://127.0.0.1:7890  —  also reads HTTPS_PROXY env var",
+            level="tiny",
+        ).grid(row=8, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 8))
+
+        # --- API Keys section ---
+        theme.make_divider(card).grid(row=9, column=0, columnspan=3, sticky="ew", padx=PAD, pady=(4, 8))
+
+        theme.make_label(card, "API KEYS", level="section").grid(
+            row=10, column=0, sticky="w", padx=PAD, pady=(0, 6),
+        )
+
+        # Google Cloud API key
+        theme.make_label(card, "Google Cloud API key", level="small").grid(
+            row=11, column=0, sticky="w", padx=PAD, pady=(0, 4),
+        )
+        google_key_entry = theme.make_entry(card, height=32)
+        google_key_entry.grid(row=11, column=1, columnspan=2, sticky="ew", padx=(4, PAD), pady=(0, 4))
+        google_key_entry.insert(0, self.cfg.get("google_api_key", ""))
+        google_key_entry.configure(show="•")
+        theme.make_label(
+            card, "Optional — enables \"Google Cloud API\" engine. Leave empty to use free Google Translate.",
+            level="tiny",
+        ).grid(row=12, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 8))
+
+        # Baidu API credentials
+        theme.make_label(card, "Baidu App ID", level="small").grid(
+            row=13, column=0, sticky="w", padx=PAD, pady=(0, 4),
+        )
+        baidu_id_entry = theme.make_entry(card, height=32)
+        baidu_id_entry.grid(row=13, column=1, columnspan=2, sticky="ew", padx=(4, PAD), pady=(0, 4))
+        baidu_id_entry.insert(0, self.cfg.get("baidu_appid", ""))
+
+        theme.make_label(card, "Baidu App Key", level="small").grid(
+            row=14, column=0, sticky="w", padx=PAD, pady=(0, 4),
+        )
+        baidu_key_entry = theme.make_entry(card, height=32)
+        baidu_key_entry.grid(row=14, column=1, columnspan=2, sticky="ew", padx=(4, PAD), pady=(0, 4))
+        baidu_key_entry.insert(0, self.cfg.get("baidu_appkey", ""))
+        baidu_key_entry.configure(show="•")
+        theme.make_label(
+            card, "Get credentials at fanyi-api.baidu.com/choose — required for Baidu engine.",
+            level="tiny",
+        ).grid(row=15, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 8))
+
+        # --- Updates section ---
+        theme.make_divider(card).grid(row=16, column=0, columnspan=3, sticky="ew", padx=PAD, pady=(4, 8))
+
+        theme.make_label(card, "UPDATES", level="section").grid(
+            row=17, column=0, sticky="w", padx=PAD, pady=(0, 6),
         )
 
         auto_updates_var = tk.BooleanVar(value=self.cfg.get("auto_check_updates", True))
@@ -1452,11 +1560,11 @@ class App:
             text_color=p.text_secondary,
             font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]),
         )
-        auto_updates_cb.grid(row=6, column=1, columnspan=2, sticky="w", padx=4, pady=(0, 6))
+        auto_updates_cb.grid(row=17, column=1, columnspan=2, sticky="w", padx=4, pady=(0, 6))
 
         # --- DEBUG section ---
         theme.make_label(card, "DEBUG", level="section").grid(
-            row=7, column=0, sticky="w", padx=PAD, pady=(0, 6),
+            row=18, column=0, sticky="w", padx=PAD, pady=(0, 6),
         )
 
         debug_var = tk.BooleanVar(value=bool(self.cfg.get("debug_mode", False)))
@@ -1474,18 +1582,18 @@ class App:
             font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]),
         )
         # Place on its own row so it doesn't overlap the updates checkbox
-        debug_cb.grid(row=7, column=1, columnspan=2, sticky="w", padx=4, pady=(8, 6))
+        debug_cb.grid(row=18, column=1, columnspan=2, sticky="w", padx=4, pady=(8, 6))
 
         # Inline validation error
         self._settings_error = theme.make_label(
             card, "", level="tiny",
             text_color=p.status_error,
         )
-        self._settings_error.grid(row=8, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 2))
+        self._settings_error.grid(row=19, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 2))
 
         # Button row
         btn_frame = ctk.CTkFrame(card, fg_color="transparent")
-        btn_frame.grid(row=9, column=0, columnspan=3, pady=(4, PAD))
+        btn_frame.grid(row=20, column=0, columnspan=3, pady=(4, PAD))
 
         def _save_and_close():
             inp = in_entry.get().strip()
@@ -1500,6 +1608,11 @@ class App:
             self.cfg["appearance_mode"] = new_mode
             self.cfg["auto_check_updates"] = auto_updates_var.get()
             self.cfg["debug_mode"] = debug_var.get()
+            # Network & API keys
+            self.cfg["proxy_url"] = proxy_entry.get().strip()
+            self.cfg["google_api_key"] = google_key_entry.get().strip()
+            self.cfg["baidu_appid"] = baidu_id_entry.get().strip()
+            self.cfg["baidu_appkey"] = baidu_key_entry.get().strip()
             save_config(self.cfg)
             try:
                 self._apply_debug_mode()
@@ -1856,19 +1969,41 @@ class App:
         # Repopulate the source language dropdown to only show languages
         # the newly selected detector can actually identify.
         # Called by trace_add (args ignored) OR by CTkOptionMenu command=.
+        self._refresh_language_dropdowns()
+
+    def _on_engine_changed(self, *_) -> None:
+        # Repopulate language dropdowns when the translation engine changes.
+        self._refresh_language_dropdowns()
+        engine_key = _ENGINE_MAP.get(self.engine_var.get(), "google")
+        self.cfg["translation_engine"] = engine_key
+        save_config(self.cfg)
+        self._log(f"Translation engine changed to: {engine_key!r}")
+
+    def _refresh_language_dropdowns(self) -> None:
+        """Recompute source and target language lists based on current engine + detector."""
         detector = (self.detector_var.get() or "fasttext").strip().lower()
+        engine_key = _ENGINE_MAP.get(self.engine_var.get(), "google")
         lang_opts = _get_language_options()
-        filtered = _filter_by_detector(lang_opts, detector)
-        src_display = [f"{name} ({code})" for code, name in filtered]
+
+        # Target: filter by engine only (detector doesn't restrict target)
+        tgt_filtered = _filter_by_engine(lang_opts, engine_key)
+        tgt_display = [f"{name} ({code})" for code, name in tgt_filtered]
+        self._lang_map = {f"{name} ({code})": code for code, name in tgt_filtered}
+        self.target_lang_box.update_values(tgt_display)
+
+        # Source: intersection of engine-supported and detector-supported
+        src_filtered = _filter_by_engine(_filter_by_detector(lang_opts, detector), engine_key)
+        src_display = [f"{name} ({code})" for code, name in src_filtered]
         src_display_set = set(src_display)
         source_values = ["Auto-detect (translate all)"] + src_display
         self._source_lang_map = {"Auto-detect (translate all)": "auto"}
         self._source_lang_map.update(
-            {k: v for k, v in self._lang_map.items() if k in src_display_set}
+            {f"{name} ({code})": code for code, name in src_filtered}
         )
         self.source_lang_box.update_values(source_values)
         self._source_lang_label.configure(text=f"Source language ({len(src_display)})")
-        self._log(f"Source language list updated for detector: {detector!r} ({len(src_display)} languages)")
+        self._log(f"Language lists updated for engine={engine_key!r}, detector={detector!r} "
+                  f"(target: {len(tgt_display)}, source: {len(src_display)})")
 
     # --- progress helpers ---
 
@@ -1933,8 +2068,33 @@ class App:
         if detector not in ("fasttext", "lingua"):
             detector = "fasttext"
 
+        # Resolve translation engine and credentials from config
+        engine = _ENGINE_MAP.get(self.engine_var.get(), "google")
+        proxy_url = self.cfg.get("proxy_url", "").strip()
+        proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else None
+        google_api_key = self.cfg.get("google_api_key", "")
+        baidu_appid = self.cfg.get("baidu_appid", "")
+        baidu_appkey = self.cfg.get("baidu_appkey", "")
+
+        # Validate credentials for engines that require them
+        if engine == "baidu" and (not baidu_appid or not baidu_appkey):
+            messagebox.showwarning(
+                "Missing credentials",
+                "Baidu Translate requires an App ID and App Key.\n"
+                "Please configure them in Settings → API Keys.",
+            )
+            return
+        if engine == "google-cloud" and not google_api_key:
+            messagebox.showwarning(
+                "Missing API key",
+                "Google Cloud API requires an API key.\n"
+                "Please configure it in Settings → API Keys,\n"
+                "or switch to \"Google Translate (free)\".",
+            )
+            return
+
         try:
-            self._log(f"Starting: source={source_lang!r}, target={lang!r}, detector={detector!r}")
+            self._log(f"Starting: engine={engine!r}, source={source_lang!r}, target={lang!r}, detector={detector!r}")
         except Exception:
             pass
 
@@ -1955,6 +2115,11 @@ class App:
             self._progress_cb, self._log,
             source_lang=source_lang,
             detector=detector,
+            engine=engine,
+            proxies=proxies,
+            google_api_key=google_api_key,
+            baidu_appid=baidu_appid,
+            baidu_appkey=baidu_appkey,
         )
 
     def _cancel(self):
