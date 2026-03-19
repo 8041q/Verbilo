@@ -1666,8 +1666,9 @@ class App:
             self._update_check_result = result
             if callback:
                 self.root.after(0, lambda r=result: callback(r))
-            elif not startup and result["status"] == "update":
-                self.root.after(0, lambda r=result: self._show_update_dialog(r))
+            elif result["status"] == "update":
+                delay = 100 if startup else 0
+                self.root.after(delay, lambda r=result: self._show_update_dialog(r))
 
         threading.Thread(target=_check, daemon=True).start()
 
