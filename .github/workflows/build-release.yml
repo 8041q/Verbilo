@@ -57,7 +57,7 @@ jobs:
           New-Item -ItemType Directory -Path "Verbilo-Release"
           
           # Copy only the .dist contents (not .build)
-          Copy-Item -Path "dist\nuitka\verbilo_launcher.dist\*" -Destination "Verbilo-Release\" -Recurse
+          Copy-Item -Path "dist\nuitka\launch.dist\*" -Destination "Verbilo-Release\" -Recurse
           
           if (Test-Path "README.md") { Copy-Item "README.md" "Verbilo-Release\" }
           if (Test-Path "LICENSE") { Copy-Item "LICENSE" "Verbilo-Release\" }

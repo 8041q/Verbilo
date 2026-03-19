@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Usage: python scripts/build_nuitka.py --entry cli|gui --output dist/nuitka
+# Usage: python scripts/build_nuitka.py --entry gui --output dist/nuitka
 import argparse
 import os
 import shlex
@@ -36,7 +36,8 @@ def write_version_from_pyproject():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--entry", choices=["cli", "gui"], default="cli")
+    # This project is GUI-only now; default to GUI entry.
+    parser.add_argument("--entry", choices=["gui"], default="gui")
     parser.add_argument("--output", default="dist")
     parser.add_argument("--python", default=sys.executable)
     args = parser.parse_args()
@@ -45,11 +46,8 @@ def main():
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     src_dir = os.path.join(repo_root, "src")
 
-    # cli.py handles both modes: run as-is for CLI, pass --gui for the GUI.
-    if args.entry == "cli":
-        entry = os.path.join(src_dir, "verbilo", "cli.py")
-    else:
-        entry = os.path.join(src_dir, "verbilo_launcher.py")
+    # GUI-only: use the GUI launcher as entry.
+    entry = os.path.join(src_dir, "launch.py")
 
     # Ensure output lives under the repository root unless an absolute
     if os.path.isabs(args.output):
@@ -140,10 +138,8 @@ def main():
     if os.path.isfile(favicon_ico):
         flags.append(f"--windows-icon-from-ico={favicon_ico}")
 
-    # GUI builds: hide the console window on Windows.
-    # Comment this line out while debugging so you can see tracebacks.
-    if args.entry == "gui":
-        flags.append("--windows-console-mode=disable")
+    # GUI builds: hide the console window on Windows by default.
+    flags.append("--windows-console-mode=disable")
 
     cmd = [args.python, "-m", "nuitka"] + flags + [entry]
 

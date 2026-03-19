@@ -51,7 +51,7 @@ pip install -r requirements.txt
 
 ```bash
 cd src
-python -m verbilo.cli --gui
+python -m launch
 ```
 
 3. If using GUI, and errors for UI helpers or icons appear:
@@ -61,57 +61,10 @@ pip install customtkinter
 pip install pytablericons Pillow
 ```
 
-4. Or run CLI translations directly (examples below):
-
-```bash
-# Translate all supported files in `origin/` to Spanish
-python -m verbilo.cli es
-
-# Translate only English segments to Portuguese
-python -m verbilo.cli pt --source en
-```
+4. The command-line interface has been removed; use the GUI or the programmatic API (`translate_file()` in `verbilo/main.py`).
 
 
-## CLI Reference
-
-Usage:
-
-```text
-python -m verbilo.cli [LANG] [options]
-
-| Argument/Option      | Description                                                   |
-| -------------------- | ------------------------------------------------------------- |
-| LANG                 | Target language code (e.g., es, pt).                          |
-| --source CODE        | Source language code (default: auto).                         |
-| --detector ENGINE    | Detection engine: fasttext (default) or lingua.               |
-| --engine NAME        | Translation engine: google (default), google-cloud, or baidu. |
-| --proxy URL          | HTTPS/HTTP proxy (e.g. http://127.0.0.1:7890).                |
-| --google-api-key KEY | Google Cloud Translation API key (for --engine google-cloud). |
-| --baidu-appid ID     | Baidu Translate App ID (for --engine baidu).                  |
-| --baidu-appkey KEY   | Baidu Translate App Key (for --engine baidu).                 |
-| --gui                | Launch the graphical interface.                               |
-```
-
-Example commands:
-```bash
-Free Google Translate (default engine)
-python -m verbilo.cli es
-
-Use Baidu Translate via proxy
-python -m verbilo.cli zh-CN \
-  --engine baidu \
-  --baidu-appid YOUR_APPID \
-  --baidu-appkey YOUR_APPKEY \
-  --proxy http://127.0.0.1:7890
-
-Use Google Cloud Translation API
-python -m verbilo.cli pt \
-  --engine google-cloud \
-  --google-api-key YOUR_GOOGLE_API_KEY
-
-Launch GUI
-python -m verbilo.cli --gui
-```
+<!-- CLI removed: use GUI or programmatic API -->
 
 ***
 
@@ -221,13 +174,12 @@ Build the GUI executable:
 Notes:
 
 - For a final GUI build without a console window, pass the flag `--windows-console-mode=disable` to the underlying Nuitka command (the helper script already exposes this behavior when appropriate).
-- To build the CLI-only executable use `--entry cli`.
 - If build fails and you try with changes, clean the Nuitka cache at `%LOCALAPPDATA%\Nuitka\Nuitka\`
 
 Run the built GUI (console enabled example):
 
 ```bash
-dist\nuitka\verbilo_launcher.dist\verbilo.exe --gui
+dist\nuitka\launch.dist\verbilo.exe --gui
 ```
 
 Or run the `.exe` directly by double-clicking it in Explorer to launch without the console.
