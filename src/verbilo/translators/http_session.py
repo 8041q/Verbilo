@@ -20,10 +20,7 @@ RETRY_STATUS_CODES = (429, 500, 502, 503, 504)
 
 
 def resolve_proxies(proxies: Optional[dict] = None) -> Optional[dict]:
-    """Return a proxy dict, merging explicit *proxies* with environment fallback.
-
-    Priority: explicit dict > HTTPS_PROXY / HTTP_PROXY env vars > None.
-    """
+    # Return a proxy dict, merging explicit *proxies* with environment fallback.
     if proxies:
         return proxies
     https = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
@@ -39,7 +36,7 @@ def resolve_proxies(proxies: Optional[dict] = None) -> Optional[dict]:
 
 
 class _TimeoutAdapter(HTTPAdapter):
-    """HTTPAdapter that injects a default timeout on every request."""
+    # HTTPAdapter that injects a default timeout on every request
 
     def __init__(self, timeout: float = DEFAULT_TIMEOUT, **kwargs):
         self._timeout = timeout
@@ -57,7 +54,7 @@ def make_session(
     retries: int = DEFAULT_RETRIES,
     backoff: float = DEFAULT_BACKOFF,
 ) -> requests.Session:
-    """Create a :class:`requests.Session` with retry, backoff, timeout, and proxy support."""
+    # Create a :class:`requests.Session` with retry, backoff, timeout, and proxy support
     session = requests.Session()
 
     retry = Retry(

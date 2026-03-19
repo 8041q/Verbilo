@@ -257,8 +257,7 @@ def _get_language_options() -> list[tuple[str, str]]:
 # --- searchable dropdown ---
 
 class SimpleComboBox:
-    """Non-searchable dropdown — same visual style as SearchableComboBox but read-only.
-    Used for small fixed option sets like the language detector picker."""
+    # Non-searchable dropdown — same visual style as SearchableComboBox but read-only
 
     _POPUP_ROWS = 8
 
@@ -1556,7 +1555,7 @@ class App:
             progress_color=p.accent,
             button_color=p.accent,
             button_hover_color=p.accent_hover,
-            fg_color=p.bg_input,
+            fg_color=p.divider,
             text_color=p.text_secondary,
             font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]),
         )
@@ -2360,7 +2359,7 @@ class App:
         self._update_usage_label(engine_key)
 
     def _update_usage_label(self, engine_key: str) -> None:
-        """Update the small quota label below the engine dropdown."""
+        # Update the small quota label below the engine dropdown
         try:
             from ..translators.usage import get_tracker
             tracker = get_tracker()
@@ -2389,7 +2388,7 @@ class App:
             pass
 
     def _refresh_language_dropdowns(self) -> None:
-        """Recompute source and target language lists based on current engine + detector."""
+        # Recompute source and target language lists based on current engine + detector
         detector = (self.detector_var.get() or "fasttext").strip().lower()
         engine_key = _ENGINE_MAP.get(self.engine_var.get(), "google")
         lang_opts = _get_language_options()

@@ -15,8 +15,6 @@ logger = logging.getLogger(__name__)
 
 
 def _patch_google_requests(session):
-    """Monkey-patch ``deep_translator.google.requests`` so that all HTTP calls
-    go through *session* (which carries retry, timeout, and proxy settings)."""
     try:
         import deep_translator.google as _mod
         shim = types.ModuleType("requests_shim")
@@ -432,12 +430,7 @@ class DeepTranslatorWrapper:
 
 
 class GoogleCloudTranslatorWrapper:
-    """Uses the official Google Cloud Translation API v2 (requires an API key).
-
-    Endpoint: ``https://translation.googleapis.com/language/translate/v2``
-    This is more reliable than the mobile-scrape endpoint, especially from
-    regions where ``translate.google.com`` is throttled or blocked.
-    """
+    # Uses the official Google Cloud Translation API v2 (requires an API key).
 
     _API_URL = "https://translation.googleapis.com/language/translate/v2"
     _engine_name = "google-cloud"
@@ -491,7 +484,7 @@ class GoogleCloudTranslatorWrapper:
     # --- core API call ---------------------------------------------------
 
     def _cloud_translate_texts(self, texts: list[str], target_lang: str) -> list[str]:
-        """Call the Cloud Translation v2 REST API for a list of texts."""
+        # Call the Cloud Translation v2 REST API for a list of texts
         params: dict = {
             "key": self._api_key,
             "target": target_lang,
@@ -680,27 +673,7 @@ class GoogleCloudTranslatorWrapper:
 
 
 class GoogleCloudV3TranslatorWrapper:
-    """Uses the Google Cloud Translation API v3 (Advanced).
-
-    Supports a Service Account JSON key file, raw JSON content, or Application
-    Default Credentials (ADC) when ``sa_json`` is left empty.
-
-    Requires ``pip install "google-cloud-translate>=3.0.0"``.
-
-    Parameters
-    ----------
-    project_id:  GCP project ID, e.g. ``"my-project-123"``.
-    sa_json:     Path to a Service Account JSON key file **or** the raw JSON
-                 content as a string.  Leave empty to use ADC
-                 (``gcloud auth application-default login``, Workload Identity…).
-    source_lang: ISO 639-1 code, or ``"auto"`` to translate everything.
-    detector:    ``"fasttext"`` or ``"lingua"`` for source-language detection.
-
-    Notes
-    -----
-    The gRPC transport does not respect an HTTP proxy dict.  Users behind a
-    proxy should set ``HTTPS_PROXY`` / ``GRPC_PROXY`` environment variables.
-    """
+    # Uses the Google Cloud Translation API v3 (Advanced).
 
     _engine_name = "google-cloud-v3"
 
@@ -785,7 +758,7 @@ class GoogleCloudV3TranslatorWrapper:
     # ── Core API call ─────────────────────────────────────────────────────────────────────
 
     def _v3_translate_texts(self, texts: list[str], target_lang: str) -> list[str]:
-        """Call the Cloud Translation v3 API and return one result per input."""
+        # Call the Cloud Translation v3 API and return one result per input
         client = self._get_client()
         parent = f"projects/{self._project_id}/locations/global"
         request: dict = {

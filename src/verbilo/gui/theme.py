@@ -240,7 +240,7 @@ def make_button(
     elif style == "secondary":
         kw = dict(
             fg_color="transparent",
-            hover_color=p.bg_card,
+            hover_color=p.bg_sidebar,
             text_color=p.text_secondary,
             border_color=p.border,
             border_width=1,
@@ -248,7 +248,7 @@ def make_button(
     else:  # ghost
         kw = dict(
             fg_color="transparent",
-            hover_color=p.bg_card,
+            hover_color=p.bg_sidebar,
             text_color=p.text_secondary,
             border_color=p.bg_sidebar,
             border_width=0,

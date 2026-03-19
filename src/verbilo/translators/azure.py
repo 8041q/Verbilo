@@ -59,7 +59,7 @@ _AZURE_TARGET_MAP: dict[str, str] = {
 
 
 def _azure_target_lang(iso_code: str) -> str:
-    """Map an ISO 639-1 (or regional) code to the Azure API language code."""
+    # Map an ISO 639-1 (or regional) code to the Azure API language code
     return _AZURE_TARGET_MAP.get(iso_code.lower(), iso_code)
 
 
@@ -105,7 +105,7 @@ class AzureTranslatorWrapper:
         return is_source_language(text, self._source_lang, detector=self._detector)
 
     def _translate_segments(self, text: str, target_lang: str) -> str:
-        """Translate only the segments that match source_lang (splits on / and newlines)."""
+        # Translate only the segments that match source_lang (splits on / and newlines)
         from .lang_detect import is_source_language
         parts = self._SEGMENT_RE.split(text)
         changed = False
@@ -131,7 +131,7 @@ class AzureTranslatorWrapper:
     # ── Core API call ─────────────────────────────────────────────────────────
 
     def _azure_translate_texts(self, texts: list[str], target_lang: str) -> list[str]:
-        """POST to Azure Translator v3 and return one translated string per input."""
+        # POST to Azure Translator v3 and return one translated string per input.
         api_target = _azure_target_lang(target_lang)
         params: dict = {"api-version": _API_VERSION, "to": api_target}
         if self._source_lang != "auto":

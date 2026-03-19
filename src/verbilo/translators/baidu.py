@@ -45,7 +45,7 @@ BAIDU_LANG_CODES: frozenset[str] = frozenset(
 
 
 def _baidu_code(iso_code: str) -> str:
-    """Convert an ISO 639-1 code to the Baidu API code."""
+    # Convert an ISO 639-1 code to the Baidu API code
     return _ISO_TO_BAIDU.get(iso_code, iso_code)
 
 
@@ -54,8 +54,7 @@ from .google import post_process, _run_cancellable
 
 
 def _patch_baidu_requests(session):
-    """Monkey-patch ``deep_translator.baidu.requests`` so that all HTTP calls
-    go through *session* (which carries retry, timeout, and proxy settings)."""
+    # Monkey-patch ``deep_translator.baidu.requests`` so that all HTTP calls go through *session*
     try:
         import deep_translator.baidu as _mod
         # Create a thin shim module that delegates .post / .get to the session
@@ -69,8 +68,7 @@ def _patch_baidu_requests(session):
 
 
 class BaiduTranslatorWrapper:
-    """Wraps :class:`deep_translator.BaiduTranslator` with caching, batching,
-    fallback, cancellation, and resilient HTTP."""
+    # Wraps :class:`deep_translator.BaiduTranslator` with caching, batching, fallback, cancellation, and HTTP.
 
     _engine_name = "baidu"
 

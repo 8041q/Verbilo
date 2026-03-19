@@ -44,11 +44,7 @@ def _usage_path() -> Path:
 
 
 class UsageTracker:
-    """Thread-safe, persistent monthly character-count tracker.
-
-    Instances are normally obtained via :func:`get_tracker` rather than
-    constructing one directly.
-    """
+    # Thread-safe, persistent monthly character-count tracker.
 
     def __init__(self, path: Optional[Path] = None):
         self._path = path or _usage_path()
@@ -90,7 +86,7 @@ class UsageTracker:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def record(self, engine: str, char_count: int) -> None:
-        """Add *char_count* characters to this month's tally for *engine*."""
+        # Add *char_count* characters to this month's tally for *engine*
         if char_count <= 0:
             return
         with self._lock:
@@ -100,24 +96,23 @@ class UsageTracker:
             self._save()
 
     def get_usage(self, engine: str) -> int:
-        """Return total characters used this month for *engine*."""
+        # Return total characters used this month for *engine*
         with self._lock:
             return self._data.get(self._month_key(), {}).get(engine, 0)
 
     def get_limit(self, engine: str) -> Optional[int]:
-        """Return the monthly character limit for *engine*, or ``None`` if unlimited."""
+        # Return the monthly character limit for *engine*, or ``None`` if unlimited
         return ENGINE_LIMITS.get(engine)
 
     def get_remaining(self, engine: str) -> Optional[int]:
-        """Return remaining characters this month, or ``None`` if engine is unlimited."""
+        # Return remaining characters this month, or ``None`` if engine is unlimited
         limit = self.get_limit(engine)
         if limit is None:
             return None
         return max(0, limit - self.get_usage(engine))
 
     def check_warning(self, engine: str) -> Optional[str]:
-        """Return a warning level string if usage is above a threshold, else ``None``.
-
+        """Return a warning level string if usage is above a threshold
         Return values
         -------------
         ``"limit"``  — at or above 100 %
@@ -139,10 +134,9 @@ class UsageTracker:
         return None
 
     def format_usage(self, engine: str) -> Optional[str]:
-        """Return a human-readable usage string or ``None`` for unlimited engines.
-
-        Example: ``"1.2M / 2M chars (60%)"``
-        """
+        # Return a human-readable usage string or ``None`` for unlimited engines.
+        # Example: ``"1.2M / 2M chars (60%)"``
+        
         limit = self.get_limit(engine)
         if limit is None:
             return None
@@ -159,7 +153,7 @@ class UsageTracker:
         return f"{_fmt(used)} / {_fmt(limit)} chars ({pct}%)"
 
     def reset(self, engine: Optional[str] = None) -> None:
-        """Reset this month's usage — all engines when *engine* is ``None``."""
+        # Reset this month's usage - all engines when *engine* is ``None``
         with self._lock:
             month = self._month_key()
             if engine is None:
@@ -176,7 +170,7 @@ _tracker_lock = threading.Lock()
 
 
 def get_tracker() -> UsageTracker:
-    """Return the global :class:`UsageTracker` instance (created on first call)."""
+    # Return the global :class:`UsageTracker` instance (created on first call)
     global _tracker
     if _tracker is None:
         with _tracker_lock:

@@ -81,12 +81,12 @@ DEEPL_LANG_CODES: frozenset[str] = frozenset({
 
 
 def _deepl_target_lang(iso_code: str) -> str:
-    """Convert an ISO 639-1 (or regional) code to the DeepL target language code."""
+    # Convert an ISO 639-1 (or regional) code to the DeepL target language code
     return _ISO_TO_DEEPL_TARGET.get(iso_code.lower(), iso_code.upper())
 
 
 def _deepl_source_lang(iso_code: str) -> str:
-    """Convert an ISO 639-1 code to the DeepL source language code (plain uppercase)."""
+    # Convert an ISO 639-1 code to the DeepL source language code (plain uppercase)
     code = iso_code.lower()
     if code in ("zh", "zh-cn", "zh-tw"):
         return "ZH"
@@ -142,7 +142,7 @@ class DeepLTranslatorWrapper:
         return is_source_language(text, self._source_lang, detector=self._detector)
 
     def _translate_segments(self, text: str, target_lang: str) -> str:
-        """Translate only segments that match source_lang (splits on / and newlines)."""
+        # Translate only segments that match source_lang (splits on / and newlines)
         from .lang_detect import is_source_language
         parts = self._SEGMENT_RE.split(text)
         changed = False
@@ -168,7 +168,7 @@ class DeepLTranslatorWrapper:
     # ── Core API call ─────────────────────────────────────────────────────────
 
     def _deepl_translate_texts(self, texts: list[str], target_lang: str) -> list[str]:
-        """Call the DeepL translate endpoint and return one result per input text."""
+        # Call the DeepL translate endpoint and return one result per input text
         payload: dict = {
             "text": texts,
             "target_lang": _deepl_target_lang(target_lang),

@@ -22,7 +22,7 @@ _FLAG_BOLD = 16
 
 
 def _is_ocr_required(doc: fitz.Document) -> bool:
-    """True if the PDF looks scanned (too few extractable chars per page)."""
+    # True if the PDF looks scanned (too few extractable chars per page)
     if doc.page_count == 0:
         return True
     total_chars = 0
@@ -34,12 +34,10 @@ def _is_ocr_required(doc: fitz.Document) -> bool:
     return avg < _MIN_CHARS_PER_PAGE
 
 
-# ---------------------------------------------------------------------------
 # Line-level span grouping helpers
-# ---------------------------------------------------------------------------
 
 def _group_spans_by_line(blocks: list[dict]) -> list[dict]:
-    """Group spans into lines and return per-line metadata."""
+    # Group spans into lines and return per-line metadata
     lines_out: list[dict] = []
     for block in blocks:
         if block.get("type") != 0:
@@ -88,15 +86,10 @@ def _group_spans_by_line(blocks: list[dict]) -> list[dict]:
     return lines_out
 
 
-# ---------------------------------------------------------------------------
+
 # HTML builder for insert_htmlbox
-# ---------------------------------------------------------------------------
-
 def _build_html(text: str, fontsize: float, color: int, flags: int) -> tuple[str, str]:
-    """Build an HTML snippet and CSS string for insert_htmlbox.
-
-    Returns (html_text, css_string).
-    """
+    # Build an HTML snippet and CSS string for insert_htmlbox. Returns (html_text, css_string).
     # Convert integer colour to hex
     if isinstance(color, int):
         hex_color = f"#{color:06x}"
@@ -126,9 +119,7 @@ def _build_html(text: str, fontsize: float, color: int, flags: int) -> tuple[str
     return html, css
 
 
-# ---------------------------------------------------------------------------
 # Main entry point
-# ---------------------------------------------------------------------------
 
 def translate_pdf(
     input_path: str,
@@ -180,9 +171,8 @@ def translate_pdf(
         if not line_infos:
             continue
 
-        # ------------------------------------------------------------------
+
         # Batch-translate all line texts for this page
-        # ------------------------------------------------------------------
         original_texts = [li["text"] for li in line_infos]
         try:
             translated_texts = translator.translate_batch(
@@ -206,18 +196,15 @@ def translate_pdf(
                     translated_texts.append(t)
                     errors += 1
 
-        # ------------------------------------------------------------------
         # Redact original text per-line
         # fill=None -> do NOT paint white over the area (preserves background)
-        # ------------------------------------------------------------------
         for info in line_infos:
             page.add_redact_annot(info["rect"], fill=None)  # type: ignore[arg-type]
         # 0 = PDF_REDACT_IMAGE_NONE -> leave underlying images untouched
         page.apply_redactions(images=0)  # type: ignore[arg-type]
 
-        # ------------------------------------------------------------------
+
         # Insert translated text using insert_htmlbox
-        # ------------------------------------------------------------------
         for info, tr_text in zip(line_infos, translated_texts):
             if tr_text is None:
                 tr_text = info["text"]

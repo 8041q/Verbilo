@@ -10,9 +10,7 @@ from ..utils import CancelledError
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
 # Run-formatting helpers
-# ---------------------------------------------------------------------------
 
 def _run_fmt(run) -> tuple:
     # Return a hashable tuple of the formatting properties that matter
@@ -34,9 +32,8 @@ def _all_same_format(runs) -> bool:
     return len(fmts) <= 1
 
 
-# ---------------------------------------------------------------------------
+
 # Paragraph-level text helpers
-# ---------------------------------------------------------------------------
 
 def _paragraph_full_text(runs) -> str:
     # Join all run texts into the full paragraph string.
@@ -98,9 +95,7 @@ def _redistribute_translated(runs, translated: str) -> None:
             run.text = ""
 
 
-# ---------------------------------------------------------------------------
 # Paragraph collectors
-# ---------------------------------------------------------------------------
 
 def _iter_all_paragraphs(doc):
     # Yield every paragraph in the document: body, tables, headers, footers, text boxes
@@ -167,9 +162,7 @@ def _iter_all_paragraphs(doc):
                     pass
 
 
-# ---------------------------------------------------------------------------
 # TOC / structural paragraph helpers
-# ---------------------------------------------------------------------------
 
 _TOC_TRAILING_RE = re.compile(r'\t\s*\d+\s*$')
 
@@ -207,9 +200,8 @@ def _get_translatable_runs(para, runs: list) -> list:
     return result if result else runs  # fallback to all runs if no tab found
 
 
-# ---------------------------------------------------------------------------
+
 # Main entry point
-# ---------------------------------------------------------------------------
 
 def translate_docx(input_path: str, output_path: str, translator: Any, target_lang: str, *, cancel_event: threading.Event | None = None):
     # Batch-translate DOCX at paragraph level while preserving formatting
