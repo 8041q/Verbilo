@@ -20,6 +20,12 @@ def translate_file(
     google_api_key: str = "",
     baidu_appid: str = "",
     baidu_appkey: str = "",
+    azure_key: str = "",
+    azure_region: str = "",
+    deepl_api_key: str = "",
+    baidu_tier: str = "standard",
+    google_project_id: str = "",
+    google_sa_json: str = "",
 ):
     # source_lang="auto" translates everything; cancel_event raises CancelledError before saving
     p = Path(input_path)
@@ -35,6 +41,12 @@ def translate_file(
         google_api_key=google_api_key,
         baidu_appid=baidu_appid,
         baidu_appkey=baidu_appkey,
+        azure_key=azure_key,
+        azure_region=azure_region,
+        deepl_api_key=deepl_api_key,
+        baidu_tier=baidu_tier,
+        google_project_id=google_project_id,
+        google_sa_json=google_sa_json,
     )
 
     # Validate target language early to avoid silent no-ops downstream

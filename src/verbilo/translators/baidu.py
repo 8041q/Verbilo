@@ -72,6 +72,8 @@ class BaiduTranslatorWrapper:
     """Wraps :class:`deep_translator.BaiduTranslator` with caching, batching,
     fallback, cancellation, and resilient HTTP."""
 
+    _engine_name = "baidu"
+
     def __init__(
         self,
         appid: str,
@@ -79,12 +81,17 @@ class BaiduTranslatorWrapper:
         source_lang: str = "auto",
         detector: str = "fasttext",
         proxies: Optional[dict] = None,
+        tier: str = "standard",
     ):
         self._source_lang = source_lang
         self._detector = detector
         self._appid = appid
         self._appkey = appkey
         self._proxies = proxies
+        self._tier = tier
+        # Premium tier records under a separate engine key so it does not count
+        # against the Standard free-tier limit (50K chars/month).
+        self._engine_name = "baidu-premium" if tier == "premium" else "baidu"
 
         # Set up a resilient session and inject it into deep_translator.baidu
         self._session = make_session(proxies=proxies)
@@ -151,14 +158,31 @@ class BaiduTranslatorWrapper:
         tgt_cache = self._cache.setdefault(target_lang, {})
         if text in tgt_cache:
             return tgt_cache[text]
+        # L2 SQLite cache lookup
+        try:
+            from .cache import get_cache
+            cached = get_cache().get(self._engine_name, text, target_lang)
+            if cached is not None:
+                tgt_cache[text] = cached
+                return cached
+        except Exception:
+            pass
         try:
             import time
-            time.sleep(_BAIDU_QPS_DELAY)
+            if self._tier == "standard":
+                time.sleep(_BAIDU_QPS_DELAY)
             translator = self._get_instance(target_lang)
             result = translator.translate(text)
             result = result if result is not None else text
             result = post_process(result)
             tgt_cache[text] = result
+            try:
+                from .cache import get_cache
+                from .usage import get_tracker
+                get_cache().put(self._engine_name, text, target_lang, result)
+                get_tracker().record(self._engine_name, len(text))
+            except Exception:
+                pass
             return result
         except Exception:
             logger.exception("Baidu segment translation failed for target '%s'", target_lang)
@@ -177,14 +201,31 @@ class BaiduTranslatorWrapper:
         tgt_cache = self._cache.setdefault(target_lang, {})
         if text in tgt_cache:
             return tgt_cache[text]
+        # L2 SQLite cache lookup
+        try:
+            from .cache import get_cache
+            cached = get_cache().get(self._engine_name, text, target_lang)
+            if cached is not None:
+                tgt_cache[text] = cached
+                return cached
+        except Exception:
+            pass
         try:
             import time
-            time.sleep(_BAIDU_QPS_DELAY)
+            if self._tier == "standard":
+                time.sleep(_BAIDU_QPS_DELAY)
             translator = self._get_instance(target_lang)
             result = translator.translate(text)
             result = result if result is not None else text
             result = post_process(result)
             tgt_cache[text] = result
+            try:
+                from .cache import get_cache
+                from .usage import get_tracker
+                get_cache().put(self._engine_name, text, target_lang, result)
+                get_tracker().record(self._engine_name, len(text))
+            except Exception:
+                pass
             return result
         except Exception:
             logger.exception("Baidu translation failed for target '%s'", target_lang)
@@ -238,6 +279,27 @@ class BaiduTranslatorWrapper:
         if not to_translate:
             return results
 
+        # L2 SQLite cache lookup for L1 misses
+        try:
+            from .cache import get_cache
+            l2_hits = get_cache().get_batch(
+                self._engine_name, [t for _, t in to_translate], target_lang
+            )
+            if l2_hits:
+                still: list[tuple[int, str]] = []
+                for i, t in to_translate:
+                    if t in l2_hits:
+                        tgt_cache[t] = l2_hits[t]
+                        results[i] = l2_hits[t]
+                    else:
+                        still.append((i, t))
+                to_translate = still
+        except Exception:
+            pass
+
+        if not to_translate:
+            return results
+
         # Deduplicate
         unique_texts: dict[str, list[int]] = {}
         for idx, t in to_translate:
@@ -257,7 +319,8 @@ class BaiduTranslatorWrapper:
                     raise CancelledError("Translation cancelled")
                 try:
                     import time
-                    time.sleep(_BAIDU_QPS_DELAY)
+                    if self._tier == "standard":
+                        time.sleep(_BAIDU_QPS_DELAY)
 
                     def _do(text=orig_text):
                         return translator.translate(text)
@@ -268,6 +331,13 @@ class BaiduTranslatorWrapper:
                     tgt_cache[orig_text] = r
                     for idx in indices:
                         results[idx] = r
+                    try:
+                        from .cache import get_cache
+                        from .usage import get_tracker
+                        get_cache().put(self._engine_name, orig_text, target_lang, r)
+                        get_tracker().record(self._engine_name, len(orig_text))
+                    except Exception:
+                        pass
                 except CancelledError:
                     raise
                 except Exception:

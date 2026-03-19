@@ -22,7 +22,7 @@ def main():
                         choices=["fasttext", "lingua"],
                         help="Language detector engine (default: fasttext)")
     parser.add_argument("--engine", "-e", default="google",
-                        choices=["google", "google-cloud", "baidu"],
+                        choices=["google", "google-cloud", "google-cloud-v3", "baidu", "azure", "deepl"],
                         help="Translation engine (default: google)")
     parser.add_argument("--proxy", default=None,
                         help="HTTPS proxy URL (e.g. http://127.0.0.1:7890)")
@@ -32,6 +32,19 @@ def main():
                         help="Baidu Translate App ID (for --engine baidu)")
     parser.add_argument("--baidu-appkey", default="",
                         help="Baidu Translate App Key (for --engine baidu)")
+    parser.add_argument("--azure-key", default="",
+                        help="Azure Translator subscription key (for --engine azure)")
+    parser.add_argument("--azure-region", default="",
+                        help="Azure Translator region (for --engine azure, e.g. eastus)")
+    parser.add_argument("--deepl-api-key", default="",
+                        help="DeepL API key (for --engine deepl)")
+    parser.add_argument("--baidu-tier", default="standard",
+                        choices=["standard", "premium"],
+                        help="Baidu API tier (for --engine baidu, default: standard)")
+    parser.add_argument("--google-project-id", default="",
+                        help="GCP project ID (for --engine google-cloud-v3)")
+    parser.add_argument("--google-sa-json", default="",
+                        help="Service Account JSON file path or content (for --engine google-cloud-v3)")
     parser.add_argument("--gui", action="store_true", help="Launch the GUI instead of running batch CLI")
     args = parser.parse_args()
 
@@ -73,6 +86,12 @@ def main():
                 google_api_key=args.google_api_key,
                 baidu_appid=args.baidu_appid,
                 baidu_appkey=args.baidu_appkey,
+                azure_key=args.azure_key,
+                azure_region=args.azure_region,
+                deepl_api_key=args.deepl_api_key,
+                baidu_tier=args.baidu_tier,
+                google_project_id=args.google_project_id,
+                google_sa_json=args.google_sa_json,
             )
             if result == "skipped-ocr":
                 print(f"Skipped {f.name} (scanned/image PDF requiring OCR)")

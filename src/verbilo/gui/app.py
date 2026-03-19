@@ -91,11 +91,36 @@ _BAIDU_LANG_CODES: frozenset[str] = frozenset({
     "sl", "sv", "th", "vi", "zh", "zh-CN", "zh-TW",
 })
 
+# ISO 639-1 codes supported by Azure Translator.
+_AZURE_LANG_CODES: frozenset[str] = frozenset({
+    "af", "am", "ar", "as", "az", "ba", "bg", "bn", "bo", "bs",
+    "ca", "cs", "cy", "da", "de", "el", "en", "es", "et", "eu",
+    "fa", "fi", "fj", "fr", "ga", "gl", "gu", "he", "hi", "hr",
+    "ht", "hu", "hy", "id", "ig", "is", "it", "ja", "ka", "kk",
+    "km", "ko", "ku", "ky", "lo", "lt", "lv", "mg", "mi", "mk",
+    "ml", "mn", "ms", "mt", "my", "ne", "nl", "no", "or", "pa",
+    "pl", "pt", "ro", "ru", "sk", "sl", "sm", "sn", "so", "sq",
+    "sr", "st", "sv", "sw", "ta", "te", "th", "ti", "tk", "tl",
+    "tn", "tr", "tt", "ug", "uk", "ur", "uz", "vi", "xh", "yo",
+    "zh", "zu", "zh-CN", "zh-TW",
+})
+
+# ISO 639-1 codes supported by DeepL Free.
+_DEEPL_LANG_CODES: frozenset[str] = frozenset({
+    "ar", "bg", "cs", "da", "de", "el", "en", "es", "et", "fi",
+    "fr", "hu", "id", "it", "ja", "ko", "lt", "lv", "nb", "no",
+    "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv", "tr", "uk",
+    "zh", "zh-CN", "zh-TW",
+})
+
 # Translation engine choices (display name → internal key).
 _ENGINE_OPTIONS: list[tuple[str, str]] = [
-    ("Google Translate (free)", "google"),
-    ("Google Cloud API", "google-cloud"),
-    ("Baidu Translate", "baidu"),
+    ("Google Translate (free)",  "google"),
+    ("Google Cloud API (v2)",    "google-cloud"),
+    ("Google Cloud API (v3)",    "google-cloud-v3"),
+    ("Baidu Translate",          "baidu"),
+    ("Microsoft Azure",          "azure"),
+    ("DeepL Free",               "deepl"),
 ]
 _ENGINE_DISPLAY = [name for name, _ in _ENGINE_OPTIONS]
 _ENGINE_MAP = {name: key for name, key in _ENGINE_OPTIONS}
@@ -118,16 +143,24 @@ def _filter_by_detector(
 def _filter_by_engine(
     opts: list[tuple[str, str]], engine: str,
 ) -> list[tuple[str, str]]:
-    """Return only (code, name) pairs that the given translation engine supports.
-    Google (free & cloud) supports all languages, so no filtering needed."""
-    if engine == "baidu":
-        result = []
-        for code, name in opts:
-            base = code.lower().split("_")[0]
-            if base in _BAIDU_LANG_CODES or code in _BAIDU_LANG_CODES:
-                result.append((code, name))
-        return result
-    return list(opts)  # google / google-cloud: no restriction
+    # Return only (code, name) pairs that the given translation engine supports. Google (free & cloud) supports all languages, so no filtering needed
+    _ENGINE_CODES: dict[str, frozenset[str]] = {
+        "baidu":           _BAIDU_LANG_CODES,
+        "baidu-premium":   _BAIDU_LANG_CODES,
+        "azure":           _AZURE_LANG_CODES,
+        "deepl":           _DEEPL_LANG_CODES,
+        "deepl-free":      _DEEPL_LANG_CODES,
+        "deepl-pro":       _DEEPL_LANG_CODES,
+    }
+    codes = _ENGINE_CODES.get(engine)
+    if codes is None:
+        return list(opts)  # google / google-cloud: no restriction
+    result = []
+    for code, name in opts:
+        base = code.lower().split("_")[0]
+        if base in codes or code in codes:
+            result.append((code, name))
+    return result
 
 
 _cached_language_options: list[tuple[str, str]] | None = None
@@ -956,12 +989,6 @@ class App:
             pass
         row += 1
 
-        # TRANSLATION section
-        theme.make_label(
-            self.sidebar, "Translation", level="section",
-        ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(0, 6))
-        row += 1
-
         # Source language
         self._source_lang_label = theme.make_label(
             self.sidebar, "Source language", level="small",
@@ -1037,8 +1064,14 @@ class App:
             variable=self.engine_var,
             command=self._on_engine_changed,
         )
-        self.engine_menu.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 6))
+        self.engine_menu.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 2))
         row += 1
+
+        # Usage label — shows monthly quota for engines that have one
+        self._engine_usage_label = theme.make_label(self.sidebar, "", level="tiny")
+        self._engine_usage_label.grid(row=row, column=0, sticky="w", padx=PAD, pady=(0, 6))
+        row += 1
+        self._update_usage_label(_ENGINE_MAP.get(default_engine_display, "google"))
 
         # Divider
         theme.make_divider(self.sidebar).grid(
@@ -1635,11 +1668,38 @@ class App:
         _rrow += 1
 
         lbl1 = theme.make_label(
-            right, "Get credentials at cloud.google.com/translate\n500k chars free/month",
+            right, "For Google Cloud API (v2). Get key at cloud.google.com/translate\n500K chars/month free",
             level="tiny",
         )
         lbl1.configure(anchor="w", justify="left")
         lbl1.grid(row=_rrow, column=0, sticky="w", pady=(0, 8))
+        _rrow += 1
+
+        # Google Cloud v3 Project ID
+        theme.make_label(right, "Google Cloud Project ID (v3)", level="small").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 2),
+        )
+        _rrow += 1
+        google_project_entry = theme.make_entry(right, height=28)
+        google_project_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 2))
+        google_project_entry.insert(0, self.cfg.get("google_project_id", ""))
+        _rrow += 1
+
+        # Google Cloud v3 Service Account JSON
+        theme.make_label(right, "Service Account JSON key (v3)", level="small").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 2),
+        )
+        _rrow += 1
+        google_sa_entry = theme.make_entry(right, height=28)
+        google_sa_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 1))
+        google_sa_entry.insert(0, self.cfg.get("google_sa_json", ""))
+        _rrow += 1
+        lbl_v3 = theme.make_label(
+            right, "For Google Cloud API (v3). Project ID required; SA JSON = file path or raw JSON.\nLeave SA JSON blank to use Application Default Credentials.",
+            level="tiny",
+        )
+        lbl_v3.configure(anchor="w", justify="left")
+        lbl_v3.grid(row=_rrow, column=0, sticky="w", pady=(0, 8))
         _rrow += 1
 
         # Baidu App ID
@@ -1664,12 +1724,139 @@ class App:
         _rrow += 1
 
         lbl = theme.make_label(
-            right, "Get credentials at fanyi-api.baidu.com/choose -> 通用文本翻译 / 文本翻译 API \nUsage: 50k chars free/month\nThen: 49¥ per 1,000,000 chars - Auto-billing depends on Baidu account",
+            right, "Get credentials at fanyi-api.baidu.com/choose -> 通用文本翻译 / 文本翻译 API\nStandard: 50K chars/month free (1 req/s QPS limit)\nPremium: no char limit, higher QPS (requires approved account)",
             level="tiny",
         )
         lbl.configure(anchor="w", justify="left")
-        lbl.grid(row=_rrow, column=0, sticky="w", pady=(0, 6))
+        lbl.grid(row=_rrow, column=0, sticky="w", pady=(0, 4))
         _rrow += 1
+
+        # Baidu API tier selection
+        theme.make_label(right, "API Tier", level="small").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 2),
+        )
+        _rrow += 1
+        baidu_tier_var = ctk.StringVar(value=self.cfg.get("baidu_tier", "standard"))
+        baidu_tier_seg = ctk.CTkSegmentedButton(
+            right,
+            values=["standard", "premium"],
+            variable=baidu_tier_var,
+        )
+        baidu_tier_seg.grid(row=_rrow, column=0, sticky="w", pady=(0, 6))
+        _rrow += 1
+
+        # Divider
+        theme.make_divider(right).grid(row=_rrow, column=0, sticky="ew", pady=(4, 8))
+        _rrow += 1
+
+        # Azure section
+        theme.make_label(right, "AZURE TRANSLATOR", level="section").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 6),
+        )
+        _rrow += 1
+
+        theme.make_label(right, "Subscription Key", level="small").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 2),
+        )
+        _rrow += 1
+        azure_key_entry = theme.make_entry(right, height=28)
+        azure_key_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 2))
+        azure_key_entry.insert(0, self.cfg.get("azure_key", ""))
+        azure_key_entry.configure(show="•")
+        _rrow += 1
+
+        theme.make_label(right, "Region (e.g. eastus)", level="small").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 2),
+        )
+        _rrow += 1
+        azure_region_entry = theme.make_entry(right, height=28)
+        azure_region_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 1))
+        azure_region_entry.insert(0, self.cfg.get("azure_region", ""))
+        _rrow += 1
+        lbl_az = theme.make_label(
+            right, "Get key at portal.azure.com → Cognitive Services → Translator\n2M chars free/month",
+            level="tiny",
+        )
+        lbl_az.configure(anchor="w", justify="left")
+        lbl_az.grid(row=_rrow, column=0, sticky="w", pady=(0, 8))
+        _rrow += 1
+
+        # Divider
+        theme.make_divider(right).grid(row=_rrow, column=0, sticky="ew", pady=(4, 8))
+        _rrow += 1
+
+        # DeepL section
+        theme.make_label(right, "DEEPL FREE", level="section").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 6),
+        )
+        _rrow += 1
+
+        theme.make_label(right, "DeepL API Key", level="small").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 2),
+        )
+        _rrow += 1
+        deepl_key_entry = theme.make_entry(right, height=28)
+        deepl_key_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 1))
+        deepl_key_entry.insert(0, self.cfg.get("deepl_api_key", ""))
+        deepl_key_entry.configure(show="•")
+        _rrow += 1
+        lbl_dl = theme.make_label(
+            right, "Get key at deepl.com/pro-api (free tier)\n500K chars free/month",
+            level="tiny",
+        )
+        lbl_dl.configure(anchor="w", justify="left")
+        lbl_dl.grid(row=_rrow, column=0, sticky="w", pady=(0, 8))
+        _rrow += 1
+
+        # Divider
+        theme.make_divider(right).grid(row=_rrow, column=0, sticky="ew", pady=(4, 8))
+        _rrow += 1
+
+        # Usage summary + cache controls
+        theme.make_label(right, "USAGE THIS MONTH", level="section").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 4),
+        )
+        _rrow += 1
+
+        def _get_usage_text() -> str:
+            try:
+                from ..translators.usage import get_tracker
+                t = get_tracker()
+                lines: list[str] = []
+                for display_name, eng_key in _ENGINE_OPTIONS:
+                    usage_str = t.format_usage(eng_key)
+                    if usage_str:
+                        lines.append(f"{display_name}: {usage_str}")
+                return "\n".join(lines) if lines else "No usage data yet."
+            except Exception:
+                return ""
+
+        usage_text = _get_usage_text()
+        usage_lbl = theme.make_label(right, usage_text or "No usage data yet.", level="tiny")
+        usage_lbl.configure(anchor="w", justify="left")
+        usage_lbl.grid(row=_rrow, column=0, sticky="w", pady=(0, 6))
+        _rrow += 1
+
+        def _clear_cache():
+            try:
+                from ..translators.cache import get_cache
+                get_cache().clear()
+                self._log("Translation cache cleared.")
+            except Exception as e:
+                self._log(f"Error clearing cache: {e}")
+
+        cache_size_str = ""
+        try:
+            from ..translators.cache import get_cache
+            n = get_cache().size()
+            cache_size_str = f" ({n:,} entries)" if n else ""
+        except Exception:
+            pass
+
+        theme.make_button(
+            right, f"Clear translation cache{cache_size_str}",
+            command=_clear_cache, style="secondary", height=26,
+        ).grid(row=_rrow, column=0, sticky="w", pady=(0, 4))
 
         # ── Bottom row: error label + buttons ────────────────────────────
         bottom = ctk.CTkFrame(card, fg_color="transparent")
@@ -1705,6 +1892,12 @@ class App:
             self.cfg["google_api_key"] = google_key_entry.get().strip()
             self.cfg["baidu_appid"] = baidu_id_entry.get().strip()
             self.cfg["baidu_appkey"] = baidu_key_entry.get().strip()
+            self.cfg["baidu_tier"] = baidu_tier_var.get()
+            self.cfg["google_project_id"] = google_project_entry.get().strip()
+            self.cfg["google_sa_json"] = google_sa_entry.get().strip()
+            self.cfg["azure_key"] = azure_key_entry.get().strip()
+            self.cfg["azure_region"] = azure_region_entry.get().strip()
+            self.cfg["deepl_api_key"] = deepl_key_entry.get().strip()
             save_config(self.cfg)
             try:
                 self._apply_debug_mode()
@@ -2071,6 +2264,36 @@ class App:
         self.cfg["translation_engine"] = engine_key
         save_config(self.cfg)
         self._log(f"Translation engine changed to: {engine_key!r}")
+        self._update_usage_label(engine_key)
+
+    def _update_usage_label(self, engine_key: str) -> None:
+        """Update the small quota label below the engine dropdown."""
+        try:
+            from ..translators.usage import get_tracker
+            tracker = get_tracker()
+            # For Baidu, use the tier-specific usage key
+            usage_key = engine_key
+            if engine_key == "baidu":
+                tier = self.cfg.get("baidu_tier", "standard")
+                if tier != "standard":
+                    usage_key = "baidu-premium"
+            text = tracker.format_usage(usage_key)
+            if not text:
+                self._engine_usage_label.configure(text="")
+                return
+            p = theme.get()
+            warning = tracker.check_warning(usage_key)
+            if warning == "limit":
+                color = p.status_error
+            elif warning == "warn":
+                color = p.status_warn if hasattr(p, "status_warn") else "#e67e22"
+            elif warning == "info":
+                color = "#f39c12"
+            else:
+                color = p.text_secondary
+            self._engine_usage_label.configure(text=text, text_color=color)
+        except Exception:
+            pass
 
     def _refresh_language_dropdowns(self) -> None:
         """Recompute source and target language lists based on current engine + detector."""
@@ -2166,8 +2389,14 @@ class App:
         proxy_url = self.cfg.get("proxy_url", "").strip()
         proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else None
         google_api_key = self.cfg.get("google_api_key", "")
+        google_project_id = self.cfg.get("google_project_id", "")
+        google_sa_json = self.cfg.get("google_sa_json", "")
         baidu_appid = self.cfg.get("baidu_appid", "")
         baidu_appkey = self.cfg.get("baidu_appkey", "")
+        baidu_tier = self.cfg.get("baidu_tier", "standard")
+        azure_key = self.cfg.get("azure_key", "")
+        azure_region = self.cfg.get("azure_region", "")
+        deepl_api_key = self.cfg.get("deepl_api_key", "")
 
         # Validate credentials for engines that require them
         if engine == "baidu" and (not baidu_appid or not baidu_appkey):
@@ -2175,6 +2404,13 @@ class App:
                 "Missing credentials",
                 "Baidu Translate requires an App ID and App Key.\n"
                 "Please configure them in Settings → API Keys.",
+            )
+            return
+        if engine == "google-cloud-v3" and not google_project_id:
+            messagebox.showwarning(
+                "Missing credentials",
+                "Google Cloud API (v3) requires a Project ID.\n"
+                "Please configure it in Settings → API Keys.",
             )
             return
         if engine == "google-cloud" and not google_api_key:
@@ -2185,6 +2421,50 @@ class App:
                 "or switch to \"Google Translate (free)\".",
             )
             return
+        if engine == "azure" and (not azure_key or not azure_region):
+            messagebox.showwarning(
+                "Missing credentials",
+                "Microsoft Azure Translator requires a Subscription Key and Region.\n"
+                "Please configure them in Settings → Azure Translator.",
+            )
+            return
+        if engine == "deepl" and not deepl_api_key:
+            messagebox.showwarning(
+                "Missing API key",
+                "DeepL Free requires an API Key.\n"
+                "Please configure it in Settings → DeepL Free.",
+            )
+            return
+
+        # Warn if usage is close to or at the monthly limit.
+        # For Baidu, the usage key depends on the configured tier.
+        _usage_key = engine
+        if engine == "baidu" and baidu_tier != "standard":
+            _usage_key = "baidu-premium"
+        if engine in ("azure", "deepl", "google-cloud", "baidu"):
+            try:
+                from ..translators.usage import get_tracker
+                tracker = get_tracker()
+                warning = tracker.check_warning(_usage_key)
+                if warning in ("warn", "limit"):
+                    used_str = tracker.format_usage(_usage_key) or ""
+                    engine_display = _ENGINE_REVERSE.get(engine, engine)
+                    if warning == "limit":
+                        msg = (
+                            f"You have used {used_str} of your {engine_display} quota.\n\n"
+                            "You may have exceeded your monthly limit. "
+                            "The API will likely reject requests.\n\nContinue anyway?"
+                        )
+                    else:
+                        msg = (
+                            f"You have used {used_str} of your {engine_display} quota "
+                            "for this month.\n\nYou are approaching your monthly limit. Continue?"
+                        )
+                    if not messagebox.askyesno("Usage Warning", msg):
+                        return
+                    self._update_usage_label(engine)
+            except Exception:
+                pass
 
         try:
             self._log(f"Starting: engine={engine!r}, source={source_lang!r}, target={lang!r}, detector={detector!r}")
@@ -2211,8 +2491,14 @@ class App:
             engine=engine,
             proxies=proxies,
             google_api_key=google_api_key,
+            google_project_id=google_project_id,
+            google_sa_json=google_sa_json,
             baidu_appid=baidu_appid,
             baidu_appkey=baidu_appkey,
+            baidu_tier=baidu_tier,
+            azure_key=azure_key,
+            azure_region=azure_region,
+            deepl_api_key=deepl_api_key,
         )
 
     def _cancel(self):
@@ -2272,6 +2558,11 @@ class App:
         self._running = False
         self._set_button_disabled(self.start_btn, False)
         self._set_button_disabled(self.cancel_btn, True)
+        try:
+            engine_key = _ENGINE_MAP.get(self.engine_var.get(), "google")
+            self._update_usage_label(engine_key)
+        except Exception:
+            pass
         if cancelled:
             pct = self.completed_files / max(1, self.total_files)
             self._update_progress_label(
