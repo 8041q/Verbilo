@@ -1391,24 +1391,57 @@ class App:
 
         win.grid_columnconfigure(0, weight=1)
 
-        # Card wrapper
+        # Outer card wrapper — holds title + two-column body
         card = theme.make_card(win)
         card.grid(row=0, column=0, sticky="nsew", padx=PAD, pady=PAD)
-        card.grid_columnconfigure(1, weight=1)
+        card.grid_columnconfigure(0, weight=1)
 
+        # ── Title row ────────────────────────────────────────────────────
         settings_icon = get_icon("settings", size=20)
         title_frame = ctk.CTkFrame(card, fg_color="transparent")
-        title_frame.grid(row=0, column=0, columnspan=3, sticky="w", padx=PAD, pady=(PAD, PAD))
+        title_frame.grid(row=0, column=0, sticky="w", padx=PAD, pady=(PAD, PAD))
         if settings_icon:
             ctk.CTkLabel(title_frame, text="", image=settings_icon, width=20).pack(side=tk.LEFT, padx=(0, 8))
         theme.make_label(title_frame, "Settings", level="heading").pack(side=tk.LEFT)
 
-        # Default input folder
-        theme.make_label(card, "Default input folder", level="small").grid(
-            row=1, column=0, sticky="w", padx=PAD, pady=(0, 6),
+        # ── Two-column body ───────────────────────────────────────────────
+        body = ctk.CTkFrame(card, fg_color="transparent")
+        body.grid(row=1, column=0, sticky="nsew", padx=PAD, pady=(0, PAD))
+        # col 0 = left, col 1 = vertical divider (fixed width), col 2 = right
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=0, minsize=theme.scale(1))
+        body.grid_columnconfigure(2, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        # Vertical divider — use a plain tk.Frame so the fixed 1-px width is respected
+        p_now = theme.get()
+        _vdiv = tk.Frame(body, width=1, bg=p_now.divider)
+        _vdiv.grid(row=0, column=1, sticky="ns", padx=(PAD, PAD))
+        _vdiv.grid_propagate(False)
+
+        # ── LEFT COLUMN: Folders + Appearance + Updates + Debug ──────────
+        left = ctk.CTkFrame(body, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew")
+        left.grid_columnconfigure(0, weight=1)
+
+        _lrow = 0
+
+        # FOLDERS section
+        theme.make_label(left, "FOLDERS", level="section").grid(
+            row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 6),
         )
-        in_entry = theme.make_entry(card, height=32)
-        in_entry.grid(row=1, column=1, sticky="ew", padx=4, pady=(0, 6))
+        _lrow += 1
+
+        # Default input folder
+        theme.make_label(left, "Default input folder", level="small").grid(
+            row=_lrow, column=0, sticky="w", pady=(0, 4),
+        )
+        _lrow += 1
+        _input_row = ctk.CTkFrame(left, fg_color="transparent")
+        _input_row.grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(0, 2))
+        _input_row.grid_columnconfigure(0, weight=1)
+        in_entry = theme.make_entry(_input_row, height=32)
+        in_entry.grid(row=0, column=0, sticky="ew")
         in_entry.insert(0, self.cfg.get("default_input", ""))
 
         def _browse_default_input():
@@ -1426,17 +1459,20 @@ class App:
                 in_entry.insert(0, str(Path(d).resolve()))
 
         browse_icon_s = get_icon("folder", size=14)
-        theme.make_button(card, "Browse", command=_browse_default_input, style="secondary",
-                          image=browse_icon_s, height=28).grid(
-            row=1, column=2, padx=(4, PAD), pady=(0, 6),
-        )
+        theme.make_button(_input_row, "Browse", command=_browse_default_input, style="secondary",
+                          image=browse_icon_s, height=28).grid(row=0, column=1, padx=(6, 0))
+        _lrow += 1
 
         # Default output folder
-        theme.make_label(card, "Default output folder", level="small").grid(
-            row=2, column=0, sticky="w", padx=PAD, pady=(0, 6),
+        theme.make_label(left, "Default output folder", level="small").grid(
+            row=_lrow, column=0, sticky="w", pady=(8, 4),
         )
-        out_entry = theme.make_entry(card, height=32)
-        out_entry.grid(row=2, column=1, sticky="ew", padx=4, pady=(0, 6))
+        _lrow += 1
+        _output_row = ctk.CTkFrame(left, fg_color="transparent")
+        _output_row.grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(0, 2))
+        _output_row.grid_columnconfigure(0, weight=1)
+        out_entry = theme.make_entry(_output_row, height=32)
+        out_entry.grid(row=0, column=0, sticky="ew")
         out_entry.insert(0, self.cfg.get("default_output", DEFAULT_OUTPUT_FOLDER))
 
         def _browse_default_output():
@@ -1453,19 +1489,23 @@ class App:
                 out_entry.delete(0, tk.END)
                 out_entry.insert(0, str(Path(d).resolve()))
 
-        theme.make_button(card, "Browse", command=_browse_default_output, style="secondary",
-                          image=browse_icon_s, height=28).grid(
-            row=2, column=2, padx=(4, PAD), pady=(0, 6),
-        )
+        theme.make_button(_output_row, "Browse", command=_browse_default_output, style="secondary",
+                          image=browse_icon_s, height=28).grid(row=0, column=1, padx=(6, 0))
+        _lrow += 1
 
-        # Appearance mode toggle
-        theme.make_label(card, "Appearance", level="small").grid(
-            row=3, column=0, sticky="w", padx=PAD, pady=(8, 4),
+        # Divider
+        theme.make_divider(left).grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(14, 10))
+        _lrow += 1
+
+        # APPEARANCE section
+        theme.make_label(left, "APPEARANCE", level="section").grid(
+            row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 6),
         )
+        _lrow += 1
 
         mode_switch_var = tk.BooleanVar(value=(theme.get_mode() == "Dark"))
         mode_switch = ctk.CTkSwitch(
-            card,
+            left,
             text="Dark mode" if theme.get_mode() == "Dark" else "Light mode",
             variable=mode_switch_var,
             onvalue=True,
@@ -1477,87 +1517,33 @@ class App:
             text_color=p.text_secondary,
             font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]),
         )
-        mode_switch.grid(row=3, column=1, sticky="w", padx=4, pady=(8, 4))
+        mode_switch.grid(row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        _lrow += 1
 
         def _on_mode_switch(*_):
             mode_switch.configure(text="Dark mode" if mode_switch_var.get() else "Light mode")
 
         mode_switch_var.trace_add("write", _on_mode_switch)
 
-        # Restart note
         theme.make_label(
-            card, "Appearance changes require a restart to take effect.",
+            left, "Appearance changes require a restart to take effect.",
             level="tiny",
-        ).grid(row=4, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 8))
+        ).grid(row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        _lrow += 1
 
-        # --- Network section ---
-        theme.make_divider(card).grid(row=5, column=0, columnspan=3, sticky="ew", padx=PAD, pady=(4, 8))
+        # Divider
+        theme.make_divider(left).grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(14, 10))
+        _lrow += 1
 
-        theme.make_label(card, "NETWORK", level="section").grid(
-            row=6, column=0, sticky="w", padx=PAD, pady=(0, 6),
+        # UPDATES section
+        theme.make_label(left, "UPDATES", level="section").grid(
+            row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 6),
         )
-
-        theme.make_label(card, "HTTPS Proxy", level="small").grid(
-            row=7, column=0, sticky="w", padx=PAD, pady=(0, 4),
-        )
-        proxy_entry = theme.make_entry(card, height=32)
-        proxy_entry.grid(row=7, column=1, columnspan=2, sticky="ew", padx=(4, PAD), pady=(0, 4))
-        proxy_entry.insert(0, self.cfg.get("proxy_url", ""))
-        theme.make_label(
-            card, "e.g. http://127.0.0.1:7890  —  also reads HTTPS_PROXY env var",
-            level="tiny",
-        ).grid(row=8, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 8))
-
-        # --- API Keys section ---
-        theme.make_divider(card).grid(row=9, column=0, columnspan=3, sticky="ew", padx=PAD, pady=(4, 8))
-
-        theme.make_label(card, "API KEYS", level="section").grid(
-            row=10, column=0, sticky="w", padx=PAD, pady=(0, 6),
-        )
-
-        # Google Cloud API key
-        theme.make_label(card, "Google Cloud API key", level="small").grid(
-            row=11, column=0, sticky="w", padx=PAD, pady=(0, 4),
-        )
-        google_key_entry = theme.make_entry(card, height=32)
-        google_key_entry.grid(row=11, column=1, columnspan=2, sticky="ew", padx=(4, PAD), pady=(0, 4))
-        google_key_entry.insert(0, self.cfg.get("google_api_key", ""))
-        google_key_entry.configure(show="•")
-        theme.make_label(
-            card, "Optional — enables \"Google Cloud API\" engine. Leave empty to use free Google Translate.",
-            level="tiny",
-        ).grid(row=12, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 8))
-
-        # Baidu API credentials
-        theme.make_label(card, "Baidu App ID", level="small").grid(
-            row=13, column=0, sticky="w", padx=PAD, pady=(0, 4),
-        )
-        baidu_id_entry = theme.make_entry(card, height=32)
-        baidu_id_entry.grid(row=13, column=1, columnspan=2, sticky="ew", padx=(4, PAD), pady=(0, 4))
-        baidu_id_entry.insert(0, self.cfg.get("baidu_appid", ""))
-
-        theme.make_label(card, "Baidu App Key", level="small").grid(
-            row=14, column=0, sticky="w", padx=PAD, pady=(0, 4),
-        )
-        baidu_key_entry = theme.make_entry(card, height=32)
-        baidu_key_entry.grid(row=14, column=1, columnspan=2, sticky="ew", padx=(4, PAD), pady=(0, 4))
-        baidu_key_entry.insert(0, self.cfg.get("baidu_appkey", ""))
-        baidu_key_entry.configure(show="•")
-        theme.make_label(
-            card, "Get credentials at fanyi-api.baidu.com/choose — required for Baidu engine.",
-            level="tiny",
-        ).grid(row=15, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 8))
-
-        # --- Updates section ---
-        theme.make_divider(card).grid(row=16, column=0, columnspan=3, sticky="ew", padx=PAD, pady=(4, 8))
-
-        theme.make_label(card, "UPDATES", level="section").grid(
-            row=17, column=0, sticky="w", padx=PAD, pady=(0, 6),
-        )
+        _lrow += 1
 
         auto_updates_var = tk.BooleanVar(value=self.cfg.get("auto_check_updates", True))
         auto_updates_cb = ctk.CTkCheckBox(
-            card,
+            left,
             text="Automatically check for updates",
             variable=auto_updates_var,
             onvalue=True,
@@ -1569,16 +1555,22 @@ class App:
             text_color=p.text_secondary,
             font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]),
         )
-        auto_updates_cb.grid(row=17, column=1, columnspan=2, sticky="w", padx=4, pady=(0, 6))
+        auto_updates_cb.grid(row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        _lrow += 1
 
-        # --- DEBUG section ---
-        theme.make_label(card, "DEBUG", level="section").grid(
-            row=18, column=0, sticky="w", padx=PAD, pady=(0, 6),
+        # Divider
+        theme.make_divider(left).grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(14, 10))
+        _lrow += 1
+
+        # DEBUG section
+        theme.make_label(left, "DEBUG", level="section").grid(
+            row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 6),
         )
+        _lrow += 1
 
         debug_var = tk.BooleanVar(value=bool(self.cfg.get("debug_mode", False)))
         debug_cb = ctk.CTkCheckBox(
-            card,
+            left,
             text="Debug mode (show debug/info messages)",
             variable=debug_var,
             onvalue=True,
@@ -1590,19 +1582,103 @@ class App:
             text_color=p.text_secondary,
             font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]),
         )
-        # Place on its own row so it doesn't overlap the updates checkbox
-        debug_cb.grid(row=18, column=1, columnspan=2, sticky="w", padx=4, pady=(8, 6))
+        debug_cb.grid(row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        _lrow += 1
 
-        # Inline validation error
+        # ── RIGHT COLUMN: Network + API Keys ─────────────────────────────
+        right = ctk.CTkFrame(body, fg_color="transparent")
+        right.grid(row=0, column=2, sticky="nsew")
+        right.grid_columnconfigure(0, weight=1)
+
+        _rrow = 0
+
+        # NETWORK section
+        theme.make_label(right, "NETWORK", level="section").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 6),
+        )
+        _rrow += 1
+
+        theme.make_label(right, "HTTPS Proxy", level="small").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 4),
+        )
+        _rrow += 1
+        proxy_entry = theme.make_entry(right, height=32)
+        proxy_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 2))
+        proxy_entry.insert(0, self.cfg.get("proxy_url", ""))
+        _rrow += 1
+        theme.make_label(
+            right, "e.g. http://127.0.0.1:7890  —  also reads HTTPS_PROXY env var",
+            level="tiny",
+        ).grid(row=_rrow, column=0, sticky="w", pady=(0, 8))
+        _rrow += 1
+
+        # Divider
+        theme.make_divider(right).grid(row=_rrow, column=0, sticky="ew", pady=(4, 10))
+        _rrow += 1
+
+        # API KEYS section
+        theme.make_label(right, "API KEYS", level="section").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 6),
+        )
+        _rrow += 1
+
+        # Google Cloud API key
+        theme.make_label(right, "Google Cloud API key", level="small").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 4),
+        )
+        _rrow += 1
+        google_key_entry = theme.make_entry(right, height=32)
+        google_key_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 2))
+        google_key_entry.insert(0, self.cfg.get("google_api_key", ""))
+        google_key_entry.configure(show="•")
+        _rrow += 1
+        theme.make_label(
+            right, "Optional — enables \"Google Cloud API\" engine.",
+            level="tiny",
+        ).grid(row=_rrow, column=0, sticky="w", pady=(0, 10))
+        _rrow += 1
+
+        # Baidu App ID
+        theme.make_label(right, "Baidu App ID", level="small").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 4),
+        )
+        _rrow += 1
+        baidu_id_entry = theme.make_entry(right, height=32)
+        baidu_id_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 10))
+        baidu_id_entry.insert(0, self.cfg.get("baidu_appid", ""))
+        _rrow += 1
+
+        # Baidu App Key
+        theme.make_label(right, "Baidu App Key", level="small").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 4),
+        )
+        _rrow += 1
+        baidu_key_entry = theme.make_entry(right, height=32)
+        baidu_key_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 2))
+        baidu_key_entry.insert(0, self.cfg.get("baidu_appkey", ""))
+        baidu_key_entry.configure(show="•")
+        _rrow += 1
+        theme.make_label(
+            right, "Get credentials at fanyi-api.baidu.com/choose — required for Baidu engine.",
+            level="tiny",
+        ).grid(row=_rrow, column=0, sticky="w", pady=(0, 8))
+        _rrow += 1
+
+        # ── Bottom row: error label + buttons ────────────────────────────
+        bottom = ctk.CTkFrame(card, fg_color="transparent")
+        bottom.grid(row=2, column=0, sticky="ew", padx=PAD, pady=(0, PAD))
+        bottom.grid_columnconfigure(0, weight=1)
+
+        # Inline validation error (spans full width)
         self._settings_error = theme.make_label(
-            card, "", level="tiny",
+            bottom, "", level="tiny",
             text_color=p.status_error,
         )
-        self._settings_error.grid(row=19, column=0, columnspan=3, sticky="w", padx=PAD, pady=(0, 2))
+        self._settings_error.grid(row=0, column=0, sticky="w", pady=(0, 6))
 
         # Button row
-        btn_frame = ctk.CTkFrame(card, fg_color="transparent")
-        btn_frame.grid(row=20, column=0, columnspan=3, pady=(4, PAD))
+        btn_frame = ctk.CTkFrame(bottom, fg_color="transparent")
+        btn_frame.grid(row=1, column=0, sticky="w", pady=(0, 0))
 
         def _save_and_close():
             inp = in_entry.get().strip()
