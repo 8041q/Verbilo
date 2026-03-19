@@ -1411,7 +1411,7 @@ class App:
         body.grid_columnconfigure(0, weight=1)
         body.grid_columnconfigure(1, weight=0, minsize=theme.scale(1))
         body.grid_columnconfigure(2, weight=1)
-        body.grid_rowconfigure(0, weight=1)
+        body.grid_rowconfigure(0, weight=0)
 
         # Vertical divider — use a plain tk.Frame so the fixed 1-px width is respected
         p_now = theme.get()
@@ -1421,26 +1421,27 @@ class App:
 
         # ── LEFT COLUMN: Folders + Appearance + Updates + Debug ──────────
         left = ctk.CTkFrame(body, fg_color="transparent")
-        left.grid(row=0, column=0, sticky="nsew")
+        # Anchor left column to north-west and avoid vertical stretching
+        left.grid(row=0, column=0, sticky="nw")
         left.grid_columnconfigure(0, weight=1)
 
         _lrow = 0
 
         # FOLDERS section
         theme.make_label(left, "FOLDERS", level="section").grid(
-            row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 6),
+            row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4),
         )
         _lrow += 1
 
         # Default input folder
         theme.make_label(left, "Default input folder", level="small").grid(
-            row=_lrow, column=0, sticky="w", pady=(0, 4),
+            row=_lrow, column=0, sticky="w", pady=(0, 2),
         )
         _lrow += 1
         _input_row = ctk.CTkFrame(left, fg_color="transparent")
-        _input_row.grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(0, 2))
+        _input_row.grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(0, 1))
         _input_row.grid_columnconfigure(0, weight=1)
-        in_entry = theme.make_entry(_input_row, height=32)
+        in_entry = theme.make_entry(_input_row, height=28)
         in_entry.grid(row=0, column=0, sticky="ew")
         in_entry.insert(0, self.cfg.get("default_input", ""))
 
@@ -1465,13 +1466,13 @@ class App:
 
         # Default output folder
         theme.make_label(left, "Default output folder", level="small").grid(
-            row=_lrow, column=0, sticky="w", pady=(8, 4),
+            row=_lrow, column=0, sticky="w", pady=(6, 4),
         )
         _lrow += 1
         _output_row = ctk.CTkFrame(left, fg_color="transparent")
-        _output_row.grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(0, 2))
+        _output_row.grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(0, 1))
         _output_row.grid_columnconfigure(0, weight=1)
-        out_entry = theme.make_entry(_output_row, height=32)
+        out_entry = theme.make_entry(_output_row, height=28)
         out_entry.grid(row=0, column=0, sticky="ew")
         out_entry.insert(0, self.cfg.get("default_output", DEFAULT_OUTPUT_FOLDER))
 
@@ -1494,12 +1495,12 @@ class App:
         _lrow += 1
 
         # Divider
-        theme.make_divider(left).grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(14, 10))
+        theme.make_divider(left).grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(10, 8))
         _lrow += 1
 
         # APPEARANCE section
         theme.make_label(left, "APPEARANCE", level="section").grid(
-            row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 6),
+            row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4),
         )
         _lrow += 1
 
@@ -1517,7 +1518,7 @@ class App:
             text_color=p.text_secondary,
             font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]),
         )
-        mode_switch.grid(row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        mode_switch.grid(row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 2))
         _lrow += 1
 
         def _on_mode_switch(*_):
@@ -1528,16 +1529,16 @@ class App:
         theme.make_label(
             left, "Appearance changes require a restart to take effect.",
             level="tiny",
-        ).grid(row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ).grid(row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 2))
         _lrow += 1
 
         # Divider
-        theme.make_divider(left).grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(14, 10))
+        theme.make_divider(left).grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(10, 8))
         _lrow += 1
 
         # UPDATES section
         theme.make_label(left, "UPDATES", level="section").grid(
-            row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 6),
+            row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4),
         )
         _lrow += 1
 
@@ -1555,16 +1556,16 @@ class App:
             text_color=p.text_secondary,
             font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]),
         )
-        auto_updates_cb.grid(row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        auto_updates_cb.grid(row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4))
         _lrow += 1
 
         # Divider
-        theme.make_divider(left).grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(14, 10))
+        theme.make_divider(left).grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(10, 8))
         _lrow += 1
 
         # DEBUG section
         theme.make_label(left, "DEBUG", level="section").grid(
-            row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 6),
+            row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4),
         )
         _lrow += 1
 
@@ -1582,7 +1583,7 @@ class App:
             text_color=p.text_secondary,
             font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]),
         )
-        debug_cb.grid(row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        debug_cb.grid(row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4))
         _lrow += 1
 
         # ── RIGHT COLUMN: Network + API Keys ─────────────────────────────
@@ -1602,8 +1603,8 @@ class App:
             row=_rrow, column=0, sticky="w", pady=(0, 4),
         )
         _rrow += 1
-        proxy_entry = theme.make_entry(right, height=32)
-        proxy_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 2))
+        proxy_entry = theme.make_entry(right, height=28)
+        proxy_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 1))
         proxy_entry.insert(0, self.cfg.get("proxy_url", ""))
         _rrow += 1
         theme.make_label(
@@ -1613,7 +1614,7 @@ class App:
         _rrow += 1
 
         # Divider
-        theme.make_divider(right).grid(row=_rrow, column=0, sticky="ew", pady=(4, 10))
+        theme.make_divider(right).grid(row=_rrow, column=0, sticky="ew", pady=(4, 8))
         _rrow += 1
 
         # API KEYS section
@@ -1627,46 +1628,52 @@ class App:
             row=_rrow, column=0, sticky="w", pady=(0, 4),
         )
         _rrow += 1
-        google_key_entry = theme.make_entry(right, height=32)
-        google_key_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 2))
+        google_key_entry = theme.make_entry(right, height=28)
+        google_key_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 1))
         google_key_entry.insert(0, self.cfg.get("google_api_key", ""))
         google_key_entry.configure(show="•")
         _rrow += 1
-        theme.make_label(
-            right, "Optional — enables \"Google Cloud API\" engine.",
+
+        lbl1 = theme.make_label(
+            right, "Get credentials at cloud.google.com/translate\n500k chars free/month",
             level="tiny",
-        ).grid(row=_rrow, column=0, sticky="w", pady=(0, 10))
+        )
+        lbl1.configure(anchor="w", justify="left")
+        lbl1.grid(row=_rrow, column=0, sticky="w", pady=(0, 8))
         _rrow += 1
 
         # Baidu App ID
         theme.make_label(right, "Baidu App ID", level="small").grid(
-            row=_rrow, column=0, sticky="w", pady=(0, 4),
+            row=_rrow, column=0, sticky="w", pady=(0, 2),
         )
         _rrow += 1
-        baidu_id_entry = theme.make_entry(right, height=32)
-        baidu_id_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 10))
+        baidu_id_entry = theme.make_entry(right, height=28)
+        baidu_id_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 2))
         baidu_id_entry.insert(0, self.cfg.get("baidu_appid", ""))
         _rrow += 1
 
         # Baidu App Key
         theme.make_label(right, "Baidu App Key", level="small").grid(
-            row=_rrow, column=0, sticky="w", pady=(0, 4),
+            row=_rrow, column=0, sticky="w", pady=(0, 2),
         )
         _rrow += 1
-        baidu_key_entry = theme.make_entry(right, height=32)
-        baidu_key_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 2))
+        baidu_key_entry = theme.make_entry(right, height=28)
+        baidu_key_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 1))
         baidu_key_entry.insert(0, self.cfg.get("baidu_appkey", ""))
         baidu_key_entry.configure(show="•")
         _rrow += 1
-        theme.make_label(
-            right, "Get credentials at fanyi-api.baidu.com/choose — required for Baidu engine.",
+
+        lbl = theme.make_label(
+            right, "Get credentials at fanyi-api.baidu.com/choose -> 通用文本翻译 / 文本翻译 API \nUsage: 50k chars free/month\nThen: 49¥ per 1,000,000 chars - Auto-billing depends on Baidu account",
             level="tiny",
-        ).grid(row=_rrow, column=0, sticky="w", pady=(0, 8))
+        )
+        lbl.configure(anchor="w", justify="left")
+        lbl.grid(row=_rrow, column=0, sticky="w", pady=(0, 6))
         _rrow += 1
 
         # ── Bottom row: error label + buttons ────────────────────────────
         bottom = ctk.CTkFrame(card, fg_color="transparent")
-        bottom.grid(row=2, column=0, sticky="ew", padx=PAD, pady=(0, PAD))
+        bottom.grid(row=2, column=0, sticky="ew", padx=PAD, pady=(0, PAD//2))
         bottom.grid_columnconfigure(0, weight=1)
 
         # Inline validation error (spans full width)
@@ -1706,11 +1713,11 @@ class App:
             win.destroy()
 
         theme.make_button(btn_frame, "Save", command=_save_and_close, style="primary",
-                          height=32).pack(
-            side=tk.LEFT, padx=(0, 8),
+                          height=28).pack(
+            side=tk.LEFT, padx=(0, 6),
         )
         theme.make_button(btn_frame, "Cancel", command=win.destroy, style="secondary",
-                          height=32).pack(
+                          height=28).pack(
             side=tk.LEFT,
         )
 
