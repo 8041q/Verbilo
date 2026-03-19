@@ -1426,6 +1426,8 @@ class App:
 
         # Outer card wrapper — holds title + two-column body
         card = theme.make_card(win)
+        card.configure(width=theme.scale(820))
+        win.minsize(theme.scale(820), theme.scale(440))
         card.grid(row=0, column=0, sticky="nsew", padx=PAD, pady=PAD)
         card.grid_columnconfigure(0, weight=1)
 
@@ -1441,7 +1443,7 @@ class App:
         body = ctk.CTkFrame(card, fg_color="transparent")
         body.grid(row=1, column=0, sticky="nsew", padx=PAD, pady=(0, PAD))
         # col 0 = left, col 1 = vertical divider (fixed width), col 2 = right
-        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(0, weight=0, minsize=theme.scale(260))
         body.grid_columnconfigure(1, weight=0, minsize=theme.scale(1))
         body.grid_columnconfigure(2, weight=1)
         body.grid_rowconfigure(0, weight=0)
@@ -1456,6 +1458,7 @@ class App:
         left = ctk.CTkFrame(body, fg_color="transparent")
         # Anchor left column to north-west and avoid vertical stretching
         left.grid(row=0, column=0, sticky="nw")
+        
         left.grid_columnconfigure(0, weight=1)
 
         _lrow = 0
@@ -1620,7 +1623,15 @@ class App:
         _lrow += 1
 
         # ── RIGHT COLUMN: Network + API Keys ─────────────────────────────
-        right = ctk.CTkFrame(body, fg_color="transparent")
+        # Use a scrollable frame for the right column
+        try:
+            right = ctk.CTkScrollableFrame(body, fg_color="transparent")
+            try:
+                right.configure(height=theme.scale(350))
+            except Exception:
+                pass
+        except Exception:
+            right = ctk.CTkFrame(body, fg_color="transparent")
         right.grid(row=0, column=2, sticky="nsew")
         right.grid_columnconfigure(0, weight=1)
 
