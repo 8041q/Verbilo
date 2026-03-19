@@ -12,5 +12,10 @@ pytablericons==1.0.1
 platformdirs==4.9.4
 tomli==2.4.0
 
+# HTTP / imaging
+requests==2.31.0
+Pillow==9.5.0
+urllib3==2.0.6
+
 # To review
-google-cloud-translate==3.0.0
+# google-cloud-translate==3.0.0
