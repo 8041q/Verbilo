@@ -43,9 +43,9 @@ platformdirs = "==4.9.4"
 tomli = "==2.4.0"
 
 # HTTP / imaging
-requests = "^2.31"
-Pillow = "^9.5"
-urllib3 = "^2.0"
+requests = "==2.32.5"
+Pillow = "==9.5"
+urllib3 = "==2.6.2"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.0"
