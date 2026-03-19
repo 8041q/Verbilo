@@ -19,3 +19,18 @@ def resolve_output_path(input_path: Path | str, out_arg: str | None = None) -> s
 
     # Otherwise treat as file path
     return str(out_p)
+
+
+def format_bytes(n: int) -> str:
+    # Format bytes as human-readable string (B, KB, MB, GB).
+    try:
+        n = int(n or 0)
+    except Exception:
+        return "0 B"
+    if n < 1024:
+        return f"{n} B"
+    for unit in ("KB", "MB", "GB", "TB"):
+        n /= 1024.0
+        if n < 1024.0:
+            return f"{n:.1f} {unit}"
+    return f"{n:.1f} PB"

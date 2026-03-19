@@ -106,6 +106,21 @@ class BaiduTranslatorWrapper:
         self._instances: Dict[str, Any] = {}
         self._cache: Dict[str, Dict[str, str]] = {}
 
+    @property
+    def tier(self) -> str:
+        return self._tier
+
+    @tier.setter
+    def tier(self, value: str) -> None:
+        if value == self._tier:
+            return
+        logger.debug("Baidu tier changed: %s → %s; clearing cached instances", self._tier, value)
+        self._tier = value
+        # Update the engine key used for cache storage and usage tracking.
+        self._engine_name = "baidu-premium" if value == "premium" else "baidu"
+        self._instances.clear()
+        # L1 in-memory translation cache is intentionally kept
+    
     def _get_instance(self, target_lang: str):
         inst = self._instances.get(target_lang)
         if inst is None:

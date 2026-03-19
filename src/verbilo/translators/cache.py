@@ -191,6 +191,14 @@ class TranslationCache:
                     db.execute("DELETE FROM translations")
                 else:
                     db.execute("DELETE FROM translations WHERE engine=?", (engine,))
+                # Try to reclaim file space after deleting rows
+                try:
+                    # checkpoint WAL and then VACUUM to shrink file on disk
+                    db.execute("PRAGMA wal_checkpoint(FULL)")
+                    db.execute("VACUUM")
+                except Exception:
+                    # best-effort; ignore failures
+                    pass
         except Exception:
             logger.debug("Cache.clear failed", exc_info=True)
 
@@ -208,6 +216,26 @@ class TranslationCache:
             return row[0] if row else 0
         except Exception:
             return 0
+
+    def disk_usage_bytes(self) -> int:
+        """Return the approximate on-disk size, uses SQLite PRAGMA to compute `page_count * page_size`. Falls back to the file size on disk if PRAGMA fails."""
+        try:
+            db = self._get_conn()
+            pc_row = db.execute("PRAGMA page_count").fetchone()
+            ps_row = db.execute("PRAGMA page_size").fetchone()
+            if pc_row and ps_row:
+                page_count = int(pc_row[0] or 0)
+                page_size = int(ps_row[0] or 0)
+                if page_count and page_size:
+                    return page_count * page_size
+        except Exception:
+            logger.debug("Could not read PRAGMA page_count/page_size", exc_info=True)
+        try:
+            if self._db_path.exists():
+                return int(self._db_path.stat().st_size)
+        except Exception:
+            logger.debug("Could not stat cache DB file", exc_info=True)
+        return 0
 
 
 # ── Module-level singleton ────────────────────────────────────────────────────

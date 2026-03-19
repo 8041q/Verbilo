@@ -1353,6 +1353,12 @@ class App:
         self.file_table.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 2))
 
+        # Deselect when clicking on empty space in the table
+        def _on_table_click(event):
+            if not self.file_table.identify_row(event.y):
+                self.file_table.selection_set([])
+        self.file_table.bind("<Button-1>", _on_table_click, "+")
+
         # Status colour tags
         self.file_table.tag_configure("pending",   foreground=p.status_pending)
         self.file_table.tag_configure("started",   foreground=p.status_info)
@@ -1661,14 +1667,14 @@ class App:
         theme.make_divider(right).grid(row=_rrow, column=0, sticky="ew", pady=(4, 8))
         _rrow += 1
 
-        # API KEYS section
-        theme.make_label(right, "API KEYS", level="section").grid(
+        # Google Cloud section
+        theme.make_label(right, "GOOGLE CLOUD", level="section").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 6),
         )
         _rrow += 1
 
         # Google Cloud API key
-        theme.make_label(right, "Google Cloud API key", level="small").grid(
+        theme.make_label(right, "Google Cloud API key (v2)", level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 4),
         )
         _rrow += 1
@@ -1713,6 +1719,16 @@ class App:
         lbl_v3.grid(row=_rrow, column=0, sticky="w", pady=(0, 8))
         _rrow += 1
 
+        # Divider
+        theme.make_divider(right).grid(row=_rrow, column=0, sticky="ew", pady=(4, 8))
+        _rrow += 1
+
+        # Baidu section
+        theme.make_label(right, "BAIDU TRANSLATE", level="section").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 6),
+        )
+        _rrow += 1
+
         # Baidu App ID
         theme.make_label(right, "Baidu App ID", level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 2),
@@ -1744,16 +1760,51 @@ class App:
 
         # Baidu API tier selection
         theme.make_label(right, "API Tier", level="small").grid(
-            row=_rrow, column=0, sticky="w", pady=(0, 2),
+            row=_rrow, column=0, sticky="w", pady=(0, 4),
         )
         _rrow += 1
         baidu_tier_var = ctk.StringVar(value=self.cfg.get("baidu_tier", "standard"))
-        baidu_tier_seg = ctk.CTkSegmentedButton(
-            right,
-            values=["standard", "premium"],
-            variable=baidu_tier_var,
-        )
-        baidu_tier_seg.grid(row=_rrow, column=0, sticky="w", pady=(0, 6))
+
+        _tier_frame = ctk.CTkFrame(right, fg_color="transparent")
+        _tier_frame.grid(row=_rrow, column=0, sticky="w", pady=(0, 8))
+
+        def _make_tier_btn(parent, label, value):
+            def _select():
+                baidu_tier_var.set(value)
+                _refresh_tier_btns()
+            btn = ctk.CTkButton(
+                parent, text=label, width=90, height=28,
+                corner_radius=theme.BUTTON_CORNER_RADIUS,
+                border_width=1,
+                font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_SMALL[1]),
+                command=_select,
+            )
+            btn.pack(side=tk.LEFT, padx=(0, 6))
+            return btn
+
+        _tier_btn_standard = _make_tier_btn(_tier_frame, "Standard", "standard")
+        _tier_btn_premium  = _make_tier_btn(_tier_frame, "Premium",  "premium")
+
+        def _refresh_tier_btns():
+            p_now = theme.get()
+            selected = baidu_tier_var.get()
+            for btn, val in ((_tier_btn_standard, "standard"), (_tier_btn_premium, "premium")):
+                if val == selected:
+                    btn.configure(
+                        fg_color=p_now.accent,
+                        hover_color=p_now.accent_hover,
+                        text_color=p_now.text_on_accent,
+                        border_color=p_now.accent_pressed,
+                    )
+                else:
+                    btn.configure(
+                        fg_color="transparent",
+                        hover_color=p_now.bg_card,
+                        text_color=p_now.text_secondary,
+                        border_color=p_now.border,
+                    )
+
+        _refresh_tier_btns()
         _rrow += 1
 
         # Divider
@@ -1848,6 +1899,39 @@ class App:
         usage_lbl.grid(row=_rrow, column=0, sticky="w", pady=(0, 6))
         _rrow += 1
 
+        # Create a small row with the button and a ghost label beside it
+        try:
+            # compute initial text (always visible, even when 0)
+            from ..translators.cache import get_cache
+            from ..utils.io import format_bytes
+            n = get_cache().size()
+            b = get_cache().disk_usage_bytes()
+            initial_lbl = f"({n:,} entries, {format_bytes(b)})"
+        except Exception:
+            initial_lbl = "(0 entries, 0 B)"
+
+        _cache_row = ctk.CTkFrame(right, fg_color="transparent")
+        _cache_row.grid(row=_rrow, column=0, sticky="w", pady=(0, 4))
+
+        cache_lbl = theme.make_label(_cache_row, initial_lbl, level="tiny")
+        cache_lbl.configure(anchor="w", justify="left", text_color=p.text_secondary)
+
+        # Helper to compute and update the cache info label (entries + human-readable size)
+        def _update_cache_label():
+            try:
+                from ..translators.cache import get_cache
+                from ..utils.io import format_bytes
+                n = get_cache().size()
+                b = get_cache().disk_usage_bytes()
+                txt = f"({n:,} entries, {format_bytes(b)})"
+            except Exception:
+                txt = "(0 entries, 0 B)"
+            try:
+                cache_lbl.configure(text=txt)
+                cache_lbl.update_idletasks()
+            except Exception:
+                pass
+
         def _clear_cache():
             try:
                 from ..translators.cache import get_cache
@@ -1855,19 +1939,17 @@ class App:
                 self._log("Translation cache cleared.")
             except Exception as e:
                 self._log(f"Error clearing cache: {e}")
+            try:
+                _update_cache_label()
+            except Exception:
+                pass
 
-        cache_size_str = ""
-        try:
-            from ..translators.cache import get_cache
-            n = get_cache().size()
-            cache_size_str = f" ({n:,} entries)" if n else ""
-        except Exception:
-            pass
-
-        theme.make_button(
-            right, f"Clear translation cache{cache_size_str}",
+        clear_btn = theme.make_button(
+            _cache_row, "Clear translation cache",
             command=_clear_cache, style="secondary", height=26,
-        ).grid(row=_rrow, column=0, sticky="w", pady=(0, 4))
+        )
+        clear_btn.pack(side=tk.LEFT)
+        cache_lbl.pack(side=tk.LEFT, padx=(8, 0))
 
         # ── Bottom row: error label + buttons ────────────────────────────
         bottom = ctk.CTkFrame(card, fg_color="transparent")

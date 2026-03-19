@@ -31,7 +31,7 @@ Translating office documents should not mean losing formatting, tables, fonts, o
 
 ## Feature Highlights
 
-- **Multiple translation engines**: Google Translate (free), Google Cloud Translation API, and Baidu Translate.
+- **Multiple translation engines**: Google Translate (free), Google Cloud Translation API, Baidu, Azure, DeepL.
 - **Proxy & resilience**: All engines use a resilient HTTP session with retries, backoff, timeouts, and optional HTTPS/HTTP proxy.
 - **Selective Translation**: Translate only text in a specified source language (or use auto).
 - **Formatting Preserved**: DOCX run-level, XLSX cell and in-place PDF Editing are preserved. 
@@ -61,59 +61,23 @@ pip install customtkinter
 pip install pytablericons Pillow
 ```
 
-4. The command-line interface has been removed; use the GUI or the programmatic API (`translate_file()` in `verbilo/main.py`).
-
-
-<!-- CLI removed: use GUI or programmatic API -->
-
 ***
-
 
 ### GUI translation engines & network settings
 
 In the GUI sidebar you can choose the translation engine:
 
-- Google Translate (free) — default, no API key required.
-- Google Cloud API — requires a valid Google Cloud Translation API key.
-- Baidu Translate — requires Baidu App ID and App Key.
+- Google Translate (free) ~ default, no API key required.
+- Google Cloud Translation API ~ requires: API key for v2, Project ID & Account Credentials for v3.
+- Baidu Translate ~ requires Baidu App ID and App Key.
+- Microsoft Azure Translator ~ requires a Subscription Key and Region.
+- DeepL ~ requires a DeepL API key (Free or Pro).
 
 **Settings → Network & API keys** to configure
 
-If Baidu or Google Cloud is selected without credentials, the GUI will show a warning instead of starting the job.
+If any API method is selected without credentials, the GUI will show a warning instead of starting the job.
 
-## Programmatic API (quick example)
 
-Use the core API when embedding Verbilo into scripts. `translate_file()` is the project’s core helper available in `verbilo/main.py`.
-
-<details>
-<summary>Click to expand</summary>
-  
-```
-from verbilo.main import translate_file
-
-# Free Google (default)
-translate_file("input.docx", "es", "output", source_lang="auto")
-
-# Google Cloud API
-translate_file(
-    "input.docx", "es", "output",
-    source_lang="auto",
-    engine="google-cloud",
-    google_api_key="YOUR_GOOGLE_API_KEY",
-)
-
-# Baidu Translate behind a proxy
-translate_file(
-    "input.docx", "zh-CN", "output",
-    source_lang="auto",
-    engine="baidu",
-    baidu_appid="YOUR_BAIDU_APPID",
-    baidu_appkey="YOUR_BAIDU_APPKEY",
-    proxies={"https": "http://127.0.0.1:7890", "http": "http://127.0.0.1:7890"},
-)
-```
-
-(See `verbilo/main.py` for the exact function signature and options.)
 
 </details>
 
@@ -128,7 +92,7 @@ src/
   Origin/
   Output/
   verbilo/
-    _version.py
+    launch.py
     cli.py
     main.py         - `translate_file()` core API
     gui/
@@ -143,9 +107,14 @@ src/
       pdf_converter.py
     translators/
       base.py
-      dummy.py
+      azure.py
       google.py
+      baidu.py
+      cache.py
+      deepl.py
+      http_session.py
       lang_detect.py
+      usage.py
     assets/
       __init__.py
     utils/
@@ -213,13 +182,12 @@ Contributions are what makes open source great!
 - Found a bug? Open an issue with steps to reproduce and a sample file if possible.  
 - Want to add features? Fork, create a feature branch, and open a PR referencing the issue.  
 - PR checklist:
-  - Add tests for new behavior where practical. 
   - Keep changes focused and minimal. 
-  - Follow existing code style. Run linters/formatters before submitting. 
+  - Follow existing code style.
   - Describe the change and rationale in the PR body.
 - Development tips:
   - Use a virtual environment.  
-  - Run unit tests (if present) locally before opening a PR.  
+  - Run unit tests locally before opening a PR.
   - If changing translations or detectors, include small sample files demonstrating behavior.
 
 
@@ -227,8 +195,7 @@ Contributions are what makes open source great!
 
 - Tabler Icons / `pytablericons` for GUI icons.  
 - PyMuPDF for in-place PDF text editing.  
-- Lingua, FastText for language detection options.  
-- Google Translate (or the configured translation provider) for the translation backend.  
+- Lingua, FastText for language detection options.   
 - Everyone who files issues and contributes patches.
 
 
