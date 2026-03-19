@@ -86,6 +86,11 @@ def main():
 
         # ── Translation engine ───────────────────────────────────────────
         "--include-package=deep_translator",
+
+        # ── Local offline translation (OPUS-MT via CTranslate2) ──────────
+        "--include-package=ctranslate2",
+        "--include-package-data=ctranslate2",
+        "--include-package=sentencepiece",
         # ── System / runtime ────────────────────────────────────────────────
         "--include-package=platformdirs",
         # ── Document converters ──────────────────────────────────────────
@@ -108,6 +113,9 @@ def main():
 
         # ── FastText language detection model ────────────────────────────
         f"--include-data-files={os.path.join(models_abs_path, 'lid.176.bin')}=models/lid.176.bin",
+
+        # ── OPUS-MT models (include all converted model directories) ─────
+        f"--include-data-dir={os.path.join(models_abs_path, 'opus-mt')}=models/opus-mt",
         "--nofollow-import-to=fasttext.tests",
         "--nofollow-import-to=fasttext.tests.test_script",
 

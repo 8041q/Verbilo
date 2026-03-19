@@ -7,6 +7,8 @@ pymupdf-fonts==1.0.5
 deep-translator==1.11.4
 lingua-language-detector==2.1.1
 fast-langdetect==1.0.0
+ctranslate2>=4.0
+sentencepiece>=0.2
 customtkinter==5.2.2
 pytablericons==1.0.1
 platformdirs==4.9.4

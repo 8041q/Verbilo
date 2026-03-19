@@ -96,6 +96,7 @@ class Worker:
         baidu_tier: str = "standard",
         google_project_id: str = "",
         google_sa_json: str = "",
+        local_model_dir: str = "",
     ):
         if self._thread and self._thread.is_alive():
             raise RuntimeError("Worker already running")
@@ -110,6 +111,7 @@ class Worker:
                 engine, proxies, google_api_key, baidu_appid, baidu_appkey,
                 azure_key, azure_region, deepl_api_key,
                 baidu_tier, google_project_id, google_sa_json,
+                local_model_dir,
             ),
             daemon=True,
         )
@@ -121,7 +123,8 @@ class Worker:
     def _run(self, files, target_lang, output_dir, translator_name, progress_cb, log_cb, source_lang, detector,
              engine, proxies, google_api_key, baidu_appid, baidu_appkey,
              azure_key="", azure_region="", deepl_api_key="",
-             baidu_tier="standard", google_project_id="", google_sa_json=""):
+             baidu_tier="standard", google_project_id="", google_sa_json="",
+             local_model_dir=""):
         for f in files:
             if self._stop.is_set():
                 log_cb("Cancelled by user")
@@ -147,6 +150,7 @@ class Worker:
                     baidu_tier=baidu_tier,
                     google_project_id=google_project_id,
                     google_sa_json=google_sa_json,
+                    local_model_dir=local_model_dir,
                 )
                 elapsed = time.perf_counter() - t0
 

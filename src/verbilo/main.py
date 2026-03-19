@@ -1,6 +1,6 @@
 from pathlib import Path
 import threading
-from .translators.google import TranslatorFactory
+from .translators.factory import TranslatorFactory
 from .converters import docx_converter, xlsx_converter, pdf_converter
 from .utils.io import resolve_output_path
 from .utils import CancelledError
@@ -26,6 +26,7 @@ def translate_file(
     baidu_tier: str = "standard",
     google_project_id: str = "",
     google_sa_json: str = "",
+    local_model_dir: str = "",
 ):
     # source_lang="auto" translates everything; cancel_event raises CancelledError before saving
     p = Path(input_path)
@@ -47,6 +48,7 @@ def translate_file(
         baidu_tier=baidu_tier,
         google_project_id=google_project_id,
         google_sa_json=google_sa_json,
+        local_model_dir=local_model_dir,
     )
 
     # Validate target language early to avoid silent no-ops downstream

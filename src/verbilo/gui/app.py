@@ -121,6 +121,7 @@ _ENGINE_OPTIONS: list[tuple[str, str]] = [
     ("Baidu Translate",          "baidu"),
     ("Microsoft Azure",          "azure"),
     ("DeepL Free",               "deepl"),
+    ("Local (Offline)",          "local"),
 ]
 _ENGINE_DISPLAY = [name for name, _ in _ENGINE_OPTIONS]
 _ENGINE_MAP = {name: key for name, key in _ENGINE_OPTIONS}
@@ -1071,6 +1072,31 @@ class App:
         self._engine_usage_label.grid(row=row, column=0, sticky="w", padx=PAD, pady=(0, 6))
         row += 1
         self._update_usage_label(_ENGINE_MAP.get(default_engine_display, "google"))
+
+        # Local model directory — only visible when "Local (Offline)" engine selected
+        self._local_model_label = theme.make_label(
+            self.sidebar, "Model folder", level="small",
+        )
+        self._local_model_row = row
+        row += 1
+
+        saved_model_dir = self.cfg.get("local_model_dir", "")
+        self._local_model_entry = theme.make_entry(self.sidebar, height=32)
+        if saved_model_dir:
+            self._local_model_entry.insert(0, saved_model_dir)
+        self._local_model_entry_row = row
+        row += 1
+
+        browse_model_icon = get_icon("folder", size=16, on_accent=False)
+        self._local_model_browse_btn = theme.make_button(
+            self.sidebar, "Browse", command=self._select_model_dir, style="secondary",
+            image=browse_model_icon, height=30,
+        )
+        self._local_model_browse_row = row
+        row += 1
+
+        # Show/hide local model widgets based on current engine
+        self._toggle_local_model_widgets(saved_engine == "local")
 
         # Divider
         theme.make_divider(self.sidebar).grid(
@@ -2357,6 +2383,32 @@ class App:
         save_config(self.cfg)
         self._log(f"Translation engine changed to: {engine_key!r}")
         self._update_usage_label(engine_key)
+        self._toggle_local_model_widgets(engine_key == "local")
+
+    def _toggle_local_model_widgets(self, show: bool) -> None:
+        pad = theme.PADDING
+        if show:
+            self._local_model_label.grid(
+                row=self._local_model_row, column=0, sticky="w", padx=pad, pady=(6, 2))
+            self._local_model_entry.grid(
+                row=self._local_model_entry_row, column=0, sticky="ew", padx=pad, pady=(0, 4))
+            self._local_model_browse_btn.grid(
+                row=self._local_model_browse_row, column=0, sticky="ew", padx=pad, pady=(0, 8))
+        else:
+            self._local_model_label.grid_remove()
+            self._local_model_entry.grid_remove()
+            self._local_model_browse_btn.grid_remove()
+
+    def _select_model_dir(self):
+        current = self._local_model_entry.get().strip()
+        init = current if current and Path(current).is_dir() else None
+        d = filedialog.askdirectory(
+            title="Select OPUS-MT models folder", parent=self.root, initialdir=init)
+        if d:
+            self._local_model_entry.delete(0, tk.END)
+            self._local_model_entry.insert(0, d)
+            self.cfg["local_model_dir"] = d
+            save_config(self.cfg)
 
     def _update_usage_label(self, engine_key: str) -> None:
         # Update the small quota label below the engine dropdown
@@ -2489,6 +2541,7 @@ class App:
         azure_key = self.cfg.get("azure_key", "")
         azure_region = self.cfg.get("azure_region", "")
         deepl_api_key = self.cfg.get("deepl_api_key", "")
+        local_model_dir = self._local_model_entry.get().strip()
 
         # Validate credentials for engines that require them
         if engine == "baidu" and (not baidu_appid or not baidu_appkey):
@@ -2591,6 +2644,7 @@ class App:
             azure_key=azure_key,
             azure_region=azure_region,
             deepl_api_key=deepl_api_key,
+            local_model_dir=local_model_dir,
         )
 
     def _cancel(self):
