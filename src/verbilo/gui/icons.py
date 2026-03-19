@@ -1,4 +1,4 @@
-# icons.py — centralised icon loading via pytablericons (Tabler Icons, MIT)
+# icons.py — centralised icon loading via pytablericons (Tabler Icons)
 
 from __future__ import annotations
 import io

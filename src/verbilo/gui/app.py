@@ -943,6 +943,17 @@ class App:
         theme.make_label(
             title_frame, "Verbilo", level="heading",
         ).pack(side=tk.LEFT)
+        # Overlay badge for visual testing (non-clickable)
+        try:
+            title_badge = theme.make_label(title_frame, "(beta)", level="tiny", text_color=p.text_muted)
+            # Place at the far right of the title row without affecting layout
+            title_badge.place(relx=1.0, x=-8, rely=0.5, anchor="e")
+            try:
+                title_badge.configure(state="disabled")
+            except Exception:
+                pass
+        except Exception:
+            pass
         row += 1
 
         # TRANSLATION section
@@ -1101,13 +1112,11 @@ class App:
         about_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         about_frame.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, PAD))
         about_frame.grid_columnconfigure(0, weight=1)
-        theme.make_button(
+        about_btn = theme.make_button(
             about_frame, "About", command=self._open_about, style="ghost",
             anchor="w", image=info_icon,
-        ).grid(row=0, column=0, sticky="ew")
-        theme.make_label(
-            about_frame, "(beta)", level="tiny", text_color=p.text_muted,
-        ).grid(row=0, column=1, sticky="e", padx=(8, 0))
+        )
+        about_btn.grid(row=0, column=0, sticky="ew")
 
     # --- content area ---
 
@@ -1778,7 +1787,7 @@ class App:
 
         # --- Copyright ---
         theme.make_label(
-            card, "\u00a9 2026 crt_ (8041q) \u2014  Released under the MIT License",
+            card, "\u00a9 2026 crt_ (8041q) \u2014  Released under the AGPL-3.0 License",
             level="tiny",
         ).grid(row=3, column=0, sticky="w", padx=PAD, pady=(0, PAD))
 
