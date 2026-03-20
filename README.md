@@ -28,7 +28,6 @@ Translating office documents should not mean losing formatting, tables, fonts, o
 - Solution: Verbilo segments and selectively translates text while writing translations back into the original file structure (DOCX runs, XLSX cells, in-place PDF text).
 
 
-
 ## Feature Highlights
 
 - **Multiple translation engines**: Google Translate (free), Google Cloud Translation API, Baidu, Azure, DeepL.
@@ -72,6 +71,7 @@ In the GUI sidebar you can choose the translation engine:
 - Baidu Translate ~ requires Baidu App ID and App Key.
 - Microsoft Azure Translator ~ requires a Subscription Key and Region.
 - DeepL ~ requires a DeepL API key (Free or Pro).
+- Local (offline) ~ free and unlimited use, requires download of each language model source+target
 
 **Settings → Network & API keys** to configure
 
@@ -106,14 +106,16 @@ src/
       xlsx_converter.py
       pdf_converter.py
     translators/
-      base.py
       azure.py
-      google.py
       baidu.py
+      base.py
       cache.py
       deepl.py
+      factory.py
+      google.py
       http_session.py
       lang_detect.py
+      local.py
       usage.py
     assets/
       __init__.py
@@ -145,17 +147,11 @@ Notes:
 - For a final GUI build without a console window, pass the flag `--windows-console-mode=disable` to the underlying Nuitka command (the helper script already exposes this behavior when appropriate).
 - If build fails and you try with changes, clean the Nuitka cache at `%LOCALAPPDATA%\Nuitka\Nuitka\`
 
-Run the built GUI (console enabled example):
-
-```bash
-dist\nuitka\launch.dist\verbilo.exe --gui
-```
-
-Or run the `.exe` directly by double-clicking it in Explorer to launch without the console.
+Run the built GUI directly by double-clicking the `verbilo.exe` in Explorer to launch without the console.
 
 Troubleshooting:
 
-- You will need the language model used by fasttext detector, run `python scripts/download_models.py` to download `models/lid.176.bin`.
+- You will need the language model used by fasttext detector, run `download_models.py` to download `models/lid.176.bin`. For Local use, you will also need the OPUS-MT model, each language source+target is a diferent model.
 - If paths or behavior differ, confirm you executed the commands from the repository root and that your virtualenv has `nuitka` installed.
 
 
@@ -169,26 +165,23 @@ Troubleshooting:
   - FastText: very fast, good balance.
 
 Notes:
-- Scanned (image-only) PDFs are detected and skipped — they will be logged rather than producing broken output.  
+- Scanned (image-only) PDFs are detected and skipped - they will be logged rather than producing broken output.  
 - When a specific source language is set, local detection prevents unnecessary API translation calls.  
 - Verbilo batches segments to reduce API usage and avoid rate limits.
-
 
 
 ## Contributing
 
 Contributions are what makes open source great!
 
-- Found a bug? Open an issue with steps to reproduce and a sample file if possible.  
-- Want to add features? Fork, create a feature branch, and open a PR referencing the issue.  
+- Found a bug? Open an issue with steps to reproduce and a sample file if possible
+- Want to add features? Fork, create a feature branch, and open a PR referencing the issue
 - PR checklist:
-  - Keep changes focused and minimal. 
-  - Follow existing code style.
-  - Describe the change and rationale in the PR body.
+  - Keep changes focused and minimal
+  - Follow existing code style
 - Development tips:
-  - Use a virtual environment.  
-  - Run unit tests locally before opening a PR.
-  - If changing translations or detectors, include small sample files demonstrating behavior.
+  - Run unit tests locally before
+  - Any change needs to be documented, even if small
 
 
 ## Acknowledgments

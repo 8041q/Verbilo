@@ -1069,62 +1069,66 @@ class App:
 
         # Usage label — shows monthly quota for engines that have one
         self._engine_usage_label = theme.make_label(self.sidebar, "", level="tiny")
-        self._engine_usage_label.grid(row=row, column=0, sticky="w", padx=PAD, pady=(0, 6))
+        self._engine_usage_label_grid_kw = dict(row=row, column=0, sticky="w", padx=PAD, pady=(0, 6))
+        self._engine_usage_label.grid(**self._engine_usage_label_grid_kw)
         row += 1
         self._update_usage_label(_ENGINE_MAP.get(default_engine_display, "google"))
 
         # Local model directory — only visible when "Local (Offline)" engine selected
-        self._local_model_label = theme.make_label(
-            self.sidebar, "Model folder", level="small",
+        _lm_bg = p.bg_sidebar
+        self._local_model_frame = tk.Frame(
+            self.sidebar, bg=_lm_bg, bd=0, highlightthickness=0,
         )
-        self._local_model_row = row
+        self._local_model_frame.columnconfigure(0, weight=1)
+        self._local_model_frame.columnconfigure(1, weight=0)
+        self._local_model_frame_row = row
         row += 1
 
+        self._local_model_label = theme.make_label(
+            self._local_model_frame, "Model folder", level="small",
+        )
+        self._local_model_label.grid(row=0, column=0, columnspan=2, sticky="w", pady=(6, 2))
+
         saved_model_dir = self.cfg.get("local_model_dir", "")
-        self._local_model_entry = theme.make_entry(self.sidebar, height=32)
+        self._local_model_entry = theme.make_entry(self._local_model_frame, height=32)
         if saved_model_dir:
             self._local_model_entry.insert(0, saved_model_dir)
-        self._local_model_entry_row = row
-        row += 1
+        self._local_model_entry.grid(row=1, column=0, sticky="ew", pady=(0, 4))
 
         browse_model_icon = get_icon("folder", size=16, on_accent=False)
         self._local_model_browse_btn = theme.make_button(
-            self.sidebar, "Browse", command=self._select_model_dir, style="secondary",
-            image=browse_model_icon, height=30,
+            self._local_model_frame, "", command=self._select_model_dir, style="secondary",
+            image=browse_model_icon, height=30, width=40,
         )
-        self._local_model_browse_row = row
-        row += 1
+        self._local_model_browse_btn.grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(0, 4))
 
         # Show/hide local model widgets based on current engine
         self._toggle_local_model_widgets(saved_engine == "local")
-
-        # Divider
-        theme.make_divider(self.sidebar).grid(
-            row=row, column=0, sticky="ew", padx=PAD, pady=8,
-        )
+        
+        # Spacer row (pushes everything to bottom)
+        self.sidebar.grid_rowconfigure(row, weight=1)
         row += 1
 
         # OUTPUT section
-        theme.make_label(
-            self.sidebar, "Output", level="section",
-        ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(0, 6))
-        row += 1
-
         theme.make_label(
             self.sidebar, "Output folder", level="small",
         ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(2, 2))
         row += 1
 
-        self.output_entry = theme.make_entry(self.sidebar, height=32)
-        self.output_entry.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 4))
+        _out_frame = tk.Frame(self.sidebar, bg=p.bg_sidebar, bd=0, highlightthickness=0)
+        _out_frame.columnconfigure(0, weight=1)
+        _out_frame.columnconfigure(1, weight=0)
+        _out_frame.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 8))
         row += 1
+
+        self.output_entry = theme.make_entry(_out_frame, height=32)
+        self.output_entry.grid(row=0, column=0, sticky="ew", pady=(0, 0))
 
         browse_icon = get_icon("folder", size=16, on_accent=False)
         theme.make_button(
-            self.sidebar, "Browse", command=self._select_output, style="secondary",
-            image=browse_icon, height=30,
-        ).grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 8))
-        row += 1
+            _out_frame, "", command=self._select_output, style="secondary",
+            image=browse_icon, height=30, width=40,
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
         # Divider
         theme.make_divider(self.sidebar).grid(
@@ -1147,10 +1151,6 @@ class App:
             height=32, state="disabled", image=stop_icon,
         )
         self.cancel_btn.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 4))
-        row += 1
-
-        # Spacer row (pushes settings to bottom)
-        self.sidebar.grid_rowconfigure(row, weight=1)
         row += 1
 
         # Settings at the very bottom
@@ -2388,16 +2388,10 @@ class App:
     def _toggle_local_model_widgets(self, show: bool) -> None:
         pad = theme.PADDING
         if show:
-            self._local_model_label.grid(
-                row=self._local_model_row, column=0, sticky="w", padx=pad, pady=(6, 2))
-            self._local_model_entry.grid(
-                row=self._local_model_entry_row, column=0, sticky="ew", padx=pad, pady=(0, 4))
-            self._local_model_browse_btn.grid(
-                row=self._local_model_browse_row, column=0, sticky="ew", padx=pad, pady=(0, 8))
+            self._local_model_frame.grid(
+                row=self._local_model_frame_row, column=0, sticky="ew", padx=pad, pady=(0, 4))
         else:
-            self._local_model_label.grid_remove()
-            self._local_model_entry.grid_remove()
-            self._local_model_browse_btn.grid_remove()
+            self._local_model_frame.grid_remove()
 
     def _select_model_dir(self):
         current = self._local_model_entry.get().strip()
@@ -2424,6 +2418,7 @@ class App:
             text = tracker.format_usage(usage_key)
             if not text:
                 self._engine_usage_label.configure(text="")
+                self._engine_usage_label.grid_remove()
                 return
             p = theme.get()
             warning = tracker.check_warning(usage_key)
@@ -2436,6 +2431,7 @@ class App:
             else:
                 color = p.text_secondary
             self._engine_usage_label.configure(text=text, text_color=color)
+            self._engine_usage_label.grid(**self._engine_usage_label_grid_kw)
         except Exception:
             pass
 
@@ -2768,10 +2764,34 @@ def main():
         )
         return
 
-
     root = ctk.CTk()
     root.wm_attributes("-alpha", 0)  # keep compositor-invisible during CTk init
     root.withdraw()  # hide until centered to avoid visible position jump
+    
+    root.update_idletasks()
+
+    # --- responsive scaling ---
+    try:
+        from customtkinter.windows.widgets.scaling.scaling_tracker import ScalingTracker
+
+        # CTk's own DPI factor
+        ctk_dpi_scale = ScalingTracker.get_window_scaling(root)  # already-detected DPI factor
+
+        # Screen size in physical pixels; divide by CTk's DPI to get logical pixels
+        screen_w_logical = root.winfo_screenwidth()  / ctk_dpi_scale
+        screen_h_logical = root.winfo_screenheight() / ctk_dpi_scale
+
+        margin = 0.95
+        ratio_w = (screen_w_logical * margin) / theme.WINDOW_WIDTH
+        ratio_h = (screen_h_logical * margin) / theme.WINDOW_HEIGHT
+        layout_scale = min(1.0, ratio_w, ratio_h)
+
+        if layout_scale < 0.98:
+            ctk.set_widget_scaling(layout_scale)
+            ctk.set_window_scaling(layout_scale)
+    except Exception:
+        pass
+    
     theme.init_dpi(root)
     app = App(root)
 
