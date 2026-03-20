@@ -61,11 +61,11 @@ def translate_file(
     output_path = resolve_output_path(p, output_path)
 
     if suffix == ".docx":
-        docx_converter.translate_docx(str(p), str(output_path), translator, target_lang, cancel_event=cancel_event)
+        docx_converter.translate_docx(str(p), str(output_path), translator, target_lang, cancel_event=cancel_event, source_lang=source_lang)
     elif suffix in (".xls", ".xlsx"):
-        xlsx_converter.translate_xlsx(str(p), str(output_path), translator, target_lang, cancel_event=cancel_event)
+        xlsx_converter.translate_xlsx(str(p), str(output_path), translator, target_lang, cancel_event=cancel_event, source_lang=source_lang)
     elif suffix == ".pdf":
-        result = pdf_converter.translate_pdf(str(p), str(output_path), translator, target_lang, cancel_event=cancel_event)
+        result = pdf_converter.translate_pdf(str(p), str(output_path), translator, target_lang, cancel_event=cancel_event, source_lang=source_lang)
         if result == "skipped-ocr":
             return "skipped-ocr"
     else:

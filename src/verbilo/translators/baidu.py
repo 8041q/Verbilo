@@ -7,7 +7,7 @@ import threading
 import types
 from typing import Optional, Dict, Any
 from .base import Translator
-from .http_session import make_session, resolve_proxies
+from .http_session import make_session, resolve_proxies, is_transient_error
 from ..utils import CancelledError
 import logging
 
@@ -325,15 +325,21 @@ class BaiduTranslatorWrapper:
         for chunk in chunks:
             if cancel_event is not None and cancel_event.is_set():
                 raise CancelledError("Translation cancelled")
-            # Baidu's translate_batch is just a sequential loop internally,
-            # but we respect the QPS delay between items.
+
+            # Premium tier: translate entire chunk at once via newline-joined text
+            if self._tier == "premium":
+                self._translate_chunk_batch(
+                    chunk, translator, results, tgt_cache, target_lang, cancel_event,
+                )
+                continue
+
+            # Standard tier: sequential per-item with QPS delay
             for orig_text, indices in chunk:
                 if cancel_event is not None and cancel_event.is_set():
                     raise CancelledError("Translation cancelled")
                 try:
                     import time
-                    if self._tier == "standard":
-                        time.sleep(_BAIDU_QPS_DELAY)
+                    time.sleep(_BAIDU_QPS_DELAY)
 
                     def _do(text=orig_text):
                         return translator.translate(text)
@@ -353,10 +359,94 @@ class BaiduTranslatorWrapper:
                         pass
                 except CancelledError:
                     raise
-                except Exception:
+                except Exception as exc:
+                    if not is_transient_error(exc):
+                        raise
                     logger.exception("Baidu per-item translation failed")
 
         return results
+
+    def _translate_chunk_batch(
+        self,
+        chunk: list[tuple[str, list[int]]],
+        translator,
+        results: list[str],
+        tgt_cache: dict[str, str],
+        target_lang: str,
+        cancel_event=None,
+    ) -> None:
+        """Translate a chunk using newline-joined batch for Premium tier."""
+        chunk_texts = [t for t, _ in chunk]
+        separator = "\n"
+        joined = separator.join(chunk_texts)
+        try:
+            def _do(text=joined):
+                return translator.translate(text)
+
+            translated_joined = _run_cancellable(_do, cancel_event)
+            if translated_joined is None:
+                return
+            translated_parts = translated_joined.split(separator)
+            # If split count matches, distribute; otherwise fall back to per-item
+            if len(translated_parts) == len(chunk):
+                l2_pairs: list[tuple[str, str]] = []
+                chars_sent = 0
+                for (orig_text, indices), tr_text in zip(chunk, translated_parts):
+                    tr_text = post_process(tr_text) if tr_text else orig_text
+                    tgt_cache[orig_text] = tr_text
+                    for idx in indices:
+                        results[idx] = tr_text
+                    l2_pairs.append((orig_text, tr_text))
+                    chars_sent += len(orig_text)
+                try:
+                    from .cache import get_cache
+                    from .usage import get_tracker
+                    get_cache().put_batch(self._engine_name, l2_pairs, target_lang)
+                    get_tracker().record(self._engine_name, chars_sent)
+                except Exception:
+                    pass
+            else:
+                # Mismatch: fall back to per-item
+                logger.debug(
+                    "Baidu batch split mismatch: expected %d, got %d; per-item fallback",
+                    len(chunk), len(translated_parts),
+                )
+                for orig_text, indices in chunk:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise CancelledError("Translation cancelled")
+                    try:
+                        def _do_single(text=orig_text):
+                            return translator.translate(text)
+
+                        r = _run_cancellable(_do_single, cancel_event)
+                        r = post_process(r) if r else orig_text
+                        tgt_cache[orig_text] = r
+                        for idx in indices:
+                            results[idx] = r
+                    except CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception("Baidu per-item fallback failed")
+        except CancelledError:
+            raise
+        except Exception:
+            logger.exception("Baidu Premium batch failed; per-item fallback")
+            for orig_text, indices in chunk:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CancelledError("Translation cancelled")
+                try:
+                    def _do_single(text=orig_text):
+                        return translator.translate(text)
+
+                    r = _run_cancellable(_do_single, cancel_event)
+                    r = post_process(r) if r else orig_text
+                    tgt_cache[orig_text] = r
+                    for idx in indices:
+                        results[idx] = r
+                except CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Baidu per-item fallback also failed")
 
     @staticmethod
     def _make_chunks(items: list[tuple[str, list[int]]]) -> list[list[tuple[str, list[int]]]]:

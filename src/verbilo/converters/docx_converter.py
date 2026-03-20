@@ -40,8 +40,71 @@ def _paragraph_full_text(runs) -> str:
     return "".join(r.text for r in runs)
 
 
-def _redistribute_translated(runs, translated: str) -> None:
-    #Write *translated* back into *runs*, preserving formatting boundaries.
+# Tagged-run translation for mixed-format paragraphs
+
+_TAG_OPEN = "\u27E8"   # ⟨  MATHEMATICAL LEFT ANGLE BRACKET
+_TAG_CLOSE = "\u27E9"  # ⟩  MATHEMATICAL RIGHT ANGLE BRACKET
+_TAG_RE = re.compile(r'\u27E8r(\d+)\u27E9(.*?)\u27E8/r\1\u27E9', re.DOTALL)
+
+
+def _build_tagged_paragraph(runs: list) -> tuple[str, bool]:
+    """Build tagged or plain text for a paragraph's runs.
+
+    Returns (text, is_tagged).
+    - Uniform formatting or ≤1 text run → plain joined text, is_tagged=False.
+    - Mixed formatting → ``⟨rN⟩text⟨/rN⟩`` per content run, is_tagged=True.
+    """
+    text_runs = [(i, run) for i, run in enumerate(runs) if run.text and run.text.strip()]
+
+    if len(text_runs) <= 1 or _all_same_format([r for _, r in text_runs]):
+        return _paragraph_full_text(runs), False
+
+    parts: list[str] = []
+    for i, run in text_runs:
+        parts.append(
+            f"{_TAG_OPEN}r{i}{_TAG_CLOSE}{run.text}{_TAG_OPEN}/r{i}{_TAG_CLOSE}"
+        )
+    return "".join(parts), True
+
+
+def _parse_and_assign_tagged(runs: list, translated: str) -> bool:
+    """Try to parse tagged translation result and assign to runs.
+
+    Returns True if tags were found and applied, False if tags were
+    mangled (caller should fall back to proportional redistribution).
+    """
+    matches = list(_TAG_RE.finditer(translated))
+    if not matches:
+        return False
+
+    text_run_indices = {i for i, run in enumerate(runs) if run.text and run.text.strip()}
+    assigned: dict[int, str] = {}
+    for m in matches:
+        idx = int(m.group(1))
+        if 0 <= idx < len(runs):
+            assigned[idx] = m.group(2)
+
+    # Require at least half of text runs to be matched
+    if len(assigned) < max(1, len(text_run_indices) // 2):
+        return False
+
+    for i, run in enumerate(runs):
+        if i in assigned:
+            run.text = assigned[i]
+        elif i in text_run_indices:
+            run.text = ""
+        elif run.text and not run.text.strip():
+            run.text = ""
+
+    return True
+
+
+def _redistribute_translated(runs, translated: str, *, is_tagged: bool = False) -> None:
+    # Write *translated* back into *runs*, preserving formatting boundaries.
+    # If the paragraph was tagged, try to parse tags first.
+    if is_tagged and _parse_and_assign_tagged(runs, translated):
+        return
+
     # Identify runs that held actual (non-whitespace) text
     text_runs = [(i, run) for i, run in enumerate(runs) if run.text and run.text.strip()]
 
@@ -201,14 +264,79 @@ def _get_translatable_runs(para, runs: list) -> list:
 
 
 
+# Paragraph grouping for contextual translation
+
+# Separator used to group consecutive paragraphs into a single translation unit.
+_PARA_SEP = "\n\u27EASEP\u27EB\n"
+
+# Maximum paragraphs per group and maximum characters per group.
+_GROUP_MAX_PARAS = 10
+_GROUP_MAX_CHARS = 4000
+
+
+def _is_heading(para) -> bool:
+    """Return True if *para* is a heading style (acts as a group boundary)."""
+    try:
+        style_name = (para.style.name or "").lower()
+        return style_name.startswith("heading") or style_name.startswith("title")
+    except Exception:
+        return False
+
+
+def _group_paragraphs(
+    para_infos: list[tuple],
+    para_texts: list[str],
+) -> list[list[int]]:
+    """Return groups of paragraph indices for contextual translation.
+
+    Rules:
+    - Headings are always their own group (boundary).
+    - Consecutive non-heading paragraphs are grouped together.
+    - Groups are capped at _GROUP_MAX_PARAS items or _GROUP_MAX_CHARS total chars.
+    """
+    groups: list[list[int]] = []
+    current: list[int] = []
+    current_chars = 0
+
+    for i, (para, runs, full_text, is_tagged) in enumerate(para_infos):
+        text_len = len(para_texts[i])
+
+        # Heading → flush current group, then make heading its own group
+        if _is_heading(para):
+            if current:
+                groups.append(current)
+                current = []
+                current_chars = 0
+            groups.append([i])
+            continue
+
+        # Would exceed limits → flush current group first
+        if current and (
+            len(current) >= _GROUP_MAX_PARAS
+            or current_chars + text_len > _GROUP_MAX_CHARS
+        ):
+            groups.append(current)
+            current = []
+            current_chars = 0
+
+        current.append(i)
+        current_chars += text_len
+
+    if current:
+        groups.append(current)
+
+    return groups
+
+
 # Main entry point
 
-def translate_docx(input_path: str, output_path: str, translator: Any, target_lang: str, *, cancel_event: threading.Event | None = None):
-    # Batch-translate DOCX at paragraph level while preserving formatting
+def translate_docx(input_path: str, output_path: str, translator: Any, target_lang: str, *, cancel_event: threading.Event | None = None, source_lang: str = "auto"):
+    # Batch-translate DOCX with contextual paragraph grouping and formatting preservation.
+    # When source_lang=="auto" (multi-language mode) grouping is skipped so each paragraph
+    # is sent individually and the API can auto-detect per paragraph.
     doc = Document(input_path)
 
     # --- Collect paragraph texts (one entry per paragraph) ---
-    ParaInfo = tuple  # (paragraph, runs, full_text)
     para_infos: list[tuple] = []
     para_texts: list[str] = []
 
@@ -220,39 +348,80 @@ def translate_docx(input_path: str, output_path: str, translator: Any, target_la
         runs = _get_translatable_runs(para, all_runs)
         if not runs:
             continue
-        full_text = _paragraph_full_text(runs)
+        full_text, is_tagged = _build_tagged_paragraph(runs)
         if not full_text or not full_text.strip():
             continue
-        para_infos.append((para, runs, full_text))
+        para_infos.append((para, runs, full_text, is_tagged))
         para_texts.append(full_text)
 
     if not para_texts:
         doc.save(output_path)
         return
 
-    # --- Batch-translate all paragraph texts ---
+    # --- Group paragraphs for contextual translation ---
+    # In auto-detect mode do NOT group paragraphs — each paragraph is its own unit
+    # so the translation API sees one language at a time and can auto-detect correctly.
+    if source_lang == "auto":
+        groups = [[i] for i in range(len(para_infos))]
+    else:
+        groups = _group_paragraphs(para_infos, para_texts)
+
+    # Build translation units: join grouped paragraphs with separator
+    units: list[str] = []
+    for group in groups:
+        if len(group) == 1:
+            units.append(para_texts[group[0]])
+        else:
+            units.append(_PARA_SEP.join(para_texts[idx] for idx in group))
+
+    # --- Batch-translate all units ---
     try:
-        translated = translator.translate_batch(para_texts, target_lang, cancel_event=cancel_event)
+        translated_units = translator.translate_batch(units, target_lang, cancel_event=cancel_event)
     except CancelledError:
         raise
     except Exception:
         logger.exception("Batch translation failed for DOCX; falling back to per-item")
-        translated = []
-        for t in para_texts:
+        translated_units = []
+        for t in units:
             try:
                 r = translator.translate_text(t, target_lang)
-                translated.append(r if r is not None else t)
+                translated_units.append(r if r is not None else t)
             except Exception:
                 logger.exception("Per-item fallback also failed")
-                translated.append(t)
+                translated_units.append(t)
 
-    # --- Write results back into the runs ---
+    # --- Split grouped results and write back into runs ---
     errors = 0
-    for (para, runs, orig_text), tr in zip(para_infos, translated):
-        if tr is None:
-            tr = orig_text
+    for group, tr_unit in zip(groups, translated_units):
+        if tr_unit is None:
             errors += 1
-        _redistribute_translated(runs, tr)
+            continue
+
+        if len(group) == 1:
+            # Single paragraph — direct assignment
+            para, runs, orig_text, is_tagged = para_infos[group[0]]
+            _redistribute_translated(runs, tr_unit, is_tagged=is_tagged)
+        else:
+            # Split on separator to recover per-paragraph translations
+            parts = tr_unit.split(_PARA_SEP)
+            if len(parts) == len(group):
+                for idx, part in zip(group, parts):
+                    para, runs, orig_text, is_tagged = para_infos[idx]
+                    _redistribute_translated(runs, part.strip() if part else orig_text, is_tagged=is_tagged)
+            else:
+                # Separator mangled — fall back to individual paragraph translation
+                logger.debug(
+                    "DOCX paragraph separator mismatch: expected %d, got %d; per-para fallback",
+                    len(group), len(parts),
+                )
+                for idx in group:
+                    para, runs, orig_text, is_tagged = para_infos[idx]
+                    try:
+                        r = translator.translate_text(orig_text, target_lang)
+                        _redistribute_translated(runs, r if r is not None else orig_text, is_tagged=is_tagged)
+                    except Exception:
+                        logger.exception("Per-paragraph fallback failed")
+                        errors += 1
 
     # Check for cancellation before saving
     if cancel_event is not None and cancel_event.is_set():

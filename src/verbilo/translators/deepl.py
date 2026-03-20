@@ -12,8 +12,8 @@ import re
 import threading
 from typing import Optional, Dict
 
-from .base import Translator
-from .http_session import make_session
+from .base import Translator, has_inline_tags, unicode_tags_to_html, html_tags_to_unicode
+from .http_session import make_session, is_transient_error
 from ..utils import CancelledError
 import logging
 
@@ -170,11 +170,19 @@ class DeepLTranslatorWrapper:
     def _deepl_translate_texts(self, texts: list[str], target_lang: str) -> list[str]:
         # Call the DeepL translate endpoint and return one result per input text
         payload: dict = {
-            "text": texts,
             "target_lang": _deepl_target_lang(target_lang),
         }
         if self._source_lang != "auto":
             payload["source_lang"] = _deepl_source_lang(self._source_lang)
+
+        # Enable HTML tag handling when texts contain inline formatting tags
+        use_html = any(has_inline_tags(t) for t in texts)
+        if use_html:
+            payload["tag_handling"] = "html"
+            payload["text"] = [unicode_tags_to_html(t) for t in texts]
+        else:
+            payload["text"] = texts
+
         headers = {
             "Authorization": f"DeepL-Auth-Key {self._api_key}",
             "Content-Type": "application/json",
@@ -183,7 +191,12 @@ class DeepLTranslatorWrapper:
         resp.raise_for_status()
         data = resp.json()
         translations = data.get("translations", [])
-        return [t.get("text", orig) for t, orig in zip(translations, texts)]
+        results = [t.get("text", orig) for t, orig in zip(translations, texts)]
+
+        if use_html:
+            results = [html_tags_to_unicode(r) for r in results]
+
+        return results
 
     def _deepl_translate_single(self, text: str, target_lang: str) -> str:
         from .google import post_process
@@ -357,18 +370,61 @@ class DeepLTranslatorWrapper:
                     pass
             except CancelledError:
                 raise
-            except Exception:
-                logger.exception("DeepL batch failed; falling back to per-item")
-                for orig_text, indices in chunk:
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise CancelledError("Translation cancelled")
-                    try:
-                        r = self._deepl_translate_single(orig_text, target_lang)
-                        for idx in indices:
-                            results[idx] = r
-                    except Exception:
-                        logger.exception("DeepL per-item fallback also failed")
+            except Exception as exc:
+                if not is_transient_error(exc):
+                    raise
+                logger.exception("DeepL batch failed; falling back to sub-batches")
+                self._subbatch_fallback(
+                    chunk, target_lang, results, tgt_cache, cancel_event,
+                )
         return results
+
+    def _subbatch_fallback(
+        self,
+        chunk: list[tuple[str, list[int]]],
+        target_lang: str,
+        results: list[str],
+        tgt_cache: dict[str, str],
+        cancel_event=None,
+    ) -> None:
+        """Binary-halving fallback — split failing chunk until per-item."""
+        from .google import post_process, _run_cancellable
+
+        if len(chunk) <= 2:
+            for orig_text, indices in chunk:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CancelledError("Translation cancelled")
+                try:
+                    r = self._deepl_translate_single(orig_text, target_lang)
+                    for idx in indices:
+                        results[idx] = r
+                except CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("DeepL per-item fallback also failed")
+            return
+        mid = len(chunk) // 2
+        for half in (chunk[:mid], chunk[mid:]):
+            if cancel_event is not None and cancel_event.is_set():
+                raise CancelledError("Translation cancelled")
+            half_texts = [t for t, _ in half]
+            try:
+                translated = _run_cancellable(
+                    lambda texts=half_texts: self._deepl_translate_texts(texts, target_lang),
+                    cancel_event,
+                )
+                if translated is None:
+                    translated = half_texts
+                for (orig_text, i_list), tr_text in zip(half, translated):
+                    tr_text = post_process(tr_text) if tr_text else orig_text
+                    tgt_cache[orig_text] = tr_text
+                    for idx in i_list:
+                        results[idx] = tr_text
+            except CancelledError:
+                raise
+            except Exception:
+                logger.exception("DeepL sub-batch failed; recursing")
+                self._subbatch_fallback(half, target_lang, results, tgt_cache, cancel_event)
 
     @staticmethod
     def _make_chunks(

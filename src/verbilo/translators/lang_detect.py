@@ -19,8 +19,42 @@ logger = logging.getLogger(__name__)
 
 # Thresholds
 _MIN_DETECT_CHARS = 10
+_SHORT_DETECT_CHARS = 4     # minimum cleaned chars to attempt detection on short text
 _CONFIDENCE_THRESHOLD = 0.65
+_SHORT_CONFIDENCE_THRESHOLD = 0.40   # relaxed threshold for short text
 _LINGUA_MIN_RELATIVE_DISTANCE = 0.25
+
+# Script-based heuristic for short text that can't be reliably detected.
+# Maps ISO 639-1 language codes to Unicode ranges that strongly indicate that language family.
+_SCRIPT_RANGES: dict[str, re.Pattern] = {
+    "zh": re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]"),   # CJK Unified
+    "ja": re.compile(r"[\u3040-\u309f\u30a0-\u30ff]"),    # Hiragana + Katakana
+    "ko": re.compile(r"[\uac00-\ud7af\u1100-\u11ff]"),    # Hangul
+    "ar": re.compile(r"[\u0600-\u06ff]"),                  # Arabic
+    "hi": re.compile(r"[\u0900-\u097f]"),                  # Devanagari
+    "ru": re.compile(r"[\u0400-\u04ff]"),                  # Cyrillic
+    "uk": re.compile(r"[\u0400-\u04ff]"),
+    "el": re.compile(r"[\u0370-\u03ff]"),                  # Greek
+    "th": re.compile(r"[\u0e00-\u0e7f]"),                  # Thai
+    "he": re.compile(r"[\u0590-\u05ff]"),                  # Hebrew
+}
+
+# Latin-script languages that lack a distinctive Unicode block but can still be
+# detected by fasttext/lingua given a few characters (e.g. "Plastique" → fr).
+_LATIN_SCRIPT_LANGS: frozenset[str] = frozenset({
+    "af", "ca", "cs", "cy", "da", "de", "en", "es", "et", "eu",
+    "fi", "fr", "ga", "gl", "hr", "hu", "id", "is", "it", "lt",
+    "lv", "mg", "ms", "mt", "nl", "no", "pl", "pt", "ro", "sk",
+    "sl", "sq", "sv", "sw", "tl", "tr", "uz", "vi",
+})
+
+
+def _script_matches_lang(text: str, lang_code: str) -> bool:
+    """Return True if *text* contains characters from the script associated with *lang_code*."""
+    pat = _SCRIPT_RANGES.get(lang_code)
+    if pat is not None:
+        return bool(pat.search(text))
+    return False
 
 # ISO 639-1 language code aliases — some detectors return longer codes.
 _LANG_ALIASES: dict[str, str] = {
@@ -178,6 +212,25 @@ def is_source_language(
 
     cleaned = _clean_for_detection(text)
     if len(cleaned) < _MIN_DETECT_CHARS:
+        # Short text: use script-based heuristic when available.
+        # If the text contains characters from the expected source script,
+        # translate it even in strict mode (e.g. CJK labels).
+        if _script_matches_lang(text, src):
+            return True
+        # For Latin-script languages, attempt detection on the raw word if it
+        # is long enough for fasttext to produce a reliable result.  This fixes
+        # cases like "Plastique" (9 chars, French) being skipped in strict mode
+        # because the script heuristic has no Unicode-block pattern for Latin.
+        if src in _LATIN_SCRIPT_LANGS and len(cleaned) >= _SHORT_DETECT_CHARS:
+            fn = _DETECTORS.get(detector.lower(), _DETECTORS["fasttext"])
+            result = fn(cleaned)
+            if result is not None:
+                det_code, conf = result
+                if det_code == src and conf >= _SHORT_CONFIDENCE_THRESHOLD:
+                    return True
+                if det_code != "und" and det_code != src:
+                    # Clearly a different language — respect strict mode
+                    return not strict
         return not strict
 
     detected_code, confidence = detect_language(text, detector=detector)

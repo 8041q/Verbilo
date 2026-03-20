@@ -12,8 +12,8 @@ import re
 import threading
 from typing import Optional, Dict
 
-from .base import Translator
-from .http_session import make_session
+from .base import Translator, has_inline_tags, unicode_tags_to_html, html_tags_to_unicode
+from .http_session import make_session, is_transient_error
 from ..utils import CancelledError
 import logging
 
@@ -136,12 +136,21 @@ class AzureTranslatorWrapper:
         params: dict = {"api-version": _API_VERSION, "to": api_target}
         if self._source_lang != "auto":
             params["from"] = self._source_lang
+
+        # Enable HTML mode when texts contain inline formatting tags so that
+        # Azure preserves the <span class="rN"> elements we inject.
+        use_html = any(has_inline_tags(t) for t in texts)
+        if use_html:
+            params["textType"] = "html"
+            body = [{"Text": unicode_tags_to_html(t)} for t in texts]
+        else:
+            body = [{"Text": t} for t in texts]
+
         headers = {
             "Ocp-Apim-Subscription-Key": self._api_key,
             "Ocp-Apim-Subscription-Region": self._region,
             "Content-Type": "application/json",
         }
-        body = [{"Text": t} for t in texts]
         resp = self._session.post(_API_URL, params=params, json=body, headers=headers)
         resp.raise_for_status()
         data = resp.json()
@@ -149,6 +158,10 @@ class AzureTranslatorWrapper:
         for item, orig in zip(data, texts):
             translations = item.get("translations", [])
             results.append(translations[0].get("text", orig) if translations else orig)
+
+        if use_html:
+            results = [html_tags_to_unicode(r) for r in results]
+
         return results
 
     def _azure_translate_single(self, text: str, target_lang: str) -> str:
@@ -323,18 +336,61 @@ class AzureTranslatorWrapper:
                     pass
             except CancelledError:
                 raise
-            except Exception:
-                logger.exception("Azure batch failed; falling back to per-item")
-                for orig_text, indices in chunk:
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise CancelledError("Translation cancelled")
-                    try:
-                        r = self._azure_translate_single(orig_text, target_lang)
-                        for idx in indices:
-                            results[idx] = r
-                    except Exception:
-                        logger.exception("Azure per-item fallback also failed")
+            except Exception as exc:
+                if not is_transient_error(exc):
+                    raise
+                logger.exception("Azure batch failed; falling back to sub-batches")
+                self._subbatch_fallback(
+                    chunk, target_lang, results, tgt_cache, cancel_event,
+                )
         return results
+
+    def _subbatch_fallback(
+        self,
+        chunk: list[tuple[str, list[int]]],
+        target_lang: str,
+        results: list[str],
+        tgt_cache: dict[str, str],
+        cancel_event=None,
+    ) -> None:
+        """Binary-halving fallback — split failing chunk until per-item."""
+        from .google import post_process, _run_cancellable
+
+        if len(chunk) <= 2:
+            for orig_text, indices in chunk:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CancelledError("Translation cancelled")
+                try:
+                    r = self._azure_translate_single(orig_text, target_lang)
+                    for idx in indices:
+                        results[idx] = r
+                except CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Azure per-item fallback also failed")
+            return
+        mid = len(chunk) // 2
+        for half in (chunk[:mid], chunk[mid:]):
+            if cancel_event is not None and cancel_event.is_set():
+                raise CancelledError("Translation cancelled")
+            half_texts = [t for t, _ in half]
+            try:
+                translated = _run_cancellable(
+                    lambda texts=half_texts: self._azure_translate_texts(texts, target_lang),
+                    cancel_event,
+                )
+                if translated is None:
+                    translated = half_texts
+                for (orig_text, i_list), tr_text in zip(half, translated):
+                    tr_text = post_process(tr_text) if tr_text else orig_text
+                    tgt_cache[orig_text] = tr_text
+                    for idx in i_list:
+                        results[idx] = tr_text
+            except CancelledError:
+                raise
+            except Exception:
+                logger.exception("Azure sub-batch failed; recursing")
+                self._subbatch_fallback(half, target_lang, results, tgt_cache, cancel_event)
 
     @staticmethod
     def _make_chunks(

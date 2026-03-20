@@ -7,7 +7,7 @@ import types
 import threading
 from typing import Optional, Dict, Any
 from .base import Translator
-from .http_session import make_session, resolve_proxies
+from .http_session import make_session, resolve_proxies, is_transient_error
 from ..utils import CancelledError
 import logging
 
@@ -350,7 +350,9 @@ class DeepTranslatorWrapper:
                     pass
             except CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                if not is_transient_error(exc):
+                    raise
                 logger.exception("Batch translation failed; falling back to sub-batches")
                 self._subbatch_fallback(chunk, translator, results, tgt_cache, cancel_event)
 
@@ -658,18 +660,58 @@ class GoogleCloudTranslatorWrapper:
                     pass
             except CancelledError:
                 raise
-            except Exception:
-                logger.exception("Cloud batch failed; falling back to per-item")
-                for orig_text, indices in chunk:
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise CancelledError("Translation cancelled")
-                    try:
-                        r = self._cloud_translate_single(orig_text, target_lang)
-                        for idx in indices:
-                            results[idx] = r
-                    except Exception:
-                        logger.exception("Cloud per-item fallback also failed")
+            except Exception as exc:
+                if not is_transient_error(exc):
+                    raise
+                logger.exception("Cloud batch failed; falling back to sub-batches")
+                self._subbatch_fallback(
+                    chunk, target_lang, results, tgt_cache, cancel_event,
+                )
         return results
+
+    def _subbatch_fallback(
+        self,
+        chunk: list[tuple[str, list[int]]],
+        target_lang: str,
+        results: list[str],
+        tgt_cache: dict[str, str],
+        cancel_event=None,
+    ) -> None:
+        if len(chunk) <= 2:
+            for orig_text, indices in chunk:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CancelledError("Translation cancelled")
+                try:
+                    r = self._cloud_translate_single(orig_text, target_lang)
+                    for idx in indices:
+                        results[idx] = r
+                except CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Cloud per-item fallback also failed")
+            return
+        mid = len(chunk) // 2
+        for half in (chunk[:mid], chunk[mid:]):
+            if cancel_event is not None and cancel_event.is_set():
+                raise CancelledError("Translation cancelled")
+            half_texts = [t for t, _ in half]
+            try:
+                translated = _run_cancellable(
+                    lambda texts=half_texts: self._cloud_translate_texts(texts, target_lang),
+                    cancel_event,
+                )
+                if translated is None:
+                    translated = half_texts
+                for (orig_text, i_list), tr_text in zip(half, translated):
+                    tr_text = post_process(tr_text) if tr_text else orig_text
+                    tgt_cache[orig_text] = tr_text
+                    for idx in i_list:
+                        results[idx] = tr_text
+            except CancelledError:
+                raise
+            except Exception:
+                logger.exception("Cloud sub-batch failed; recursing")
+                self._subbatch_fallback(half, target_lang, results, tgt_cache, cancel_event)
 
 
 class GoogleCloudV3TranslatorWrapper:
@@ -933,15 +975,55 @@ class GoogleCloudV3TranslatorWrapper:
                     pass
             except CancelledError:
                 raise
-            except Exception:
-                logger.exception("Google Cloud v3 batch failed; falling back to per-item")
-                for orig_text, indices in chunk:
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise CancelledError("Translation cancelled")
-                    try:
-                        r = self._v3_translate_single(orig_text, target_lang)
-                        for idx in indices:
-                            results[idx] = r
-                    except Exception:
-                        logger.exception("Google Cloud v3 per-item fallback also failed")
+            except Exception as exc:
+                if not is_transient_error(exc):
+                    raise
+                logger.exception("Google Cloud v3 batch failed; falling back to sub-batches")
+                self._subbatch_fallback(
+                    chunk, target_lang, results, tgt_cache, cancel_event,
+                )
         return results
+
+    def _subbatch_fallback(
+        self,
+        chunk: list[tuple[str, list[int]]],
+        target_lang: str,
+        results: list[str],
+        tgt_cache: dict[str, str],
+        cancel_event=None,
+    ) -> None:
+        if len(chunk) <= 2:
+            for orig_text, indices in chunk:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CancelledError("Translation cancelled")
+                try:
+                    r = self._v3_translate_single(orig_text, target_lang)
+                    for idx in indices:
+                        results[idx] = r
+                except CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Google Cloud v3 per-item fallback also failed")
+            return
+        mid = len(chunk) // 2
+        for half in (chunk[:mid], chunk[mid:]):
+            if cancel_event is not None and cancel_event.is_set():
+                raise CancelledError("Translation cancelled")
+            half_texts = [t for t, _ in half]
+            try:
+                translated = _run_cancellable(
+                    lambda texts=half_texts: self._v3_translate_texts(texts, target_lang),
+                    cancel_event,
+                )
+                if translated is None:
+                    translated = half_texts
+                for (orig_text, i_list), tr_text in zip(half, translated):
+                    tr_text = post_process(tr_text) if tr_text else orig_text
+                    tgt_cache[orig_text] = tr_text
+                    for idx in i_list:
+                        results[idx] = tr_text
+            except CancelledError:
+                raise
+            except Exception:
+                logger.exception("Google Cloud v3 sub-batch failed; recursing")
+                self._subbatch_fallback(half, target_lang, results, tgt_cache, cancel_event)
