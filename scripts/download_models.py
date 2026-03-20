@@ -77,8 +77,17 @@ def _hf_file_exists(repo: str, filename: str) -> bool:
 def download(url: str, dest_path: str) -> None:
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     print(f"Downloading {url} -> {dest_path}")
-    with _open_url(url) as r, open(dest_path, "wb") as f:
-        f.write(r.read())
+    with _open_url(url) as r:
+        total = int(r.headers.get("Content-Length", 0))
+        received = 0
+        with open(dest_path, "wb") as f:
+            while True:
+                chunk = r.read(256 * 1024)  # 256 KB chunks
+                if not chunk:
+                    break
+                f.write(chunk)
+                received += len(chunk)
+                print(f"PROGRESS {received} {total}", flush=True)
 
 
 def _try_download(url: str, dest_path: str) -> bool:

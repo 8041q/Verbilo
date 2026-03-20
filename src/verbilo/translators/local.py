@@ -29,6 +29,29 @@ _BATCH_SIZE = 64
 _SENTINEL = "converted.ok"
 
 
+def list_downloaded_pairs(model_dir: str) -> list[tuple[str, str]]:
+    """Return sorted ``(src, tgt)`` tuples for every ready model on disk.
+
+    A subdirectory of *model_dir* counts as a valid pair when its name
+    contains exactly one ``-`` and a ``converted.ok`` sentinel is present.
+    No heavy imports required — pure filesystem scan.
+    """
+    root = Path(model_dir)
+    if not root.is_dir():
+        return []
+    pairs: list[tuple[str, str]] = []
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        parts = child.name.split("-", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            continue
+        if (child / _SENTINEL).exists():
+            pairs.append((parts[0], parts[1]))
+    pairs.sort()
+    return pairs
+
+
 class OpusMTTranslator:
     """Offline OPUS-MT translator backed by CTranslate2 + SentencePiece.
 

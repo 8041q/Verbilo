@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import sys
 import threading
 import urllib.request
 import urllib.error
@@ -254,6 +255,46 @@ def _get_language_options() -> list[tuple[str, str]]:
     result = sorted(fallback.items(), key=lambda x: x[1].lower())
     _cached_language_options = result
     return result
+
+
+# --- OPUS-MT model helpers (local engine) ---------------------------------
+
+# Map OPUS folder codes (2- or 3-letter) to ISO 639-1 codes used by the GUI.
+_OPUS_CODE_MAP: dict[str, str] = {
+    "eng": "en", "fra": "fr", "deu": "de", "spa": "es", "por": "pt",
+    "ita": "it", "nld": "nl", "rus": "ru", "zho": "zh", "jpn": "ja",
+    "jap": "ja", "kor": "ko", "ara": "ar", "pol": "pl", "tur": "tr",
+    "swe": "sv", "dan": "da", "fin": "fi", "ukr": "uk", "ces": "cs",
+    "ron": "ro", "hun": "hu", "nor": "no", "bul": "bg", "hrv": "hr",
+    "ell": "el", "heb": "he", "hin": "hi", "tha": "th", "vie": "vi",
+    "cat": "ca", "ind": "id", "msa": "ms", "slk": "sk", "slv": "sl",
+    "est": "et", "lav": "lv", "lit": "lt", "srp": "sr",
+}
+
+
+def _opus_code_to_iso(code: str) -> str:
+    """Convert an OPUS model code (e.g. ``eng``, ``fra``) to ISO 639-1."""
+    return _OPUS_CODE_MAP.get(code, code)
+
+
+def _get_default_model_dir() -> str:
+    """Return the default OPUS-MT models directory (same logic as factory.py)."""
+    return str(Path(__file__).resolve().parents[3] / "models" / "opus-mt")
+
+
+def _load_models_catalogue() -> list[dict]:
+    """Load the bundled models catalogue from assets/models_catalogue.json."""
+    cat_path = Path(__file__).resolve().parent.parent / "assets" / "models_catalogue.json"
+    try:
+        return json.loads(cat_path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("Could not load models catalogue from %s", cat_path)
+        return []
+
+
+def _get_local_model_dir_from_cfg(cfg: dict) -> str:
+    return cfg.get("local_model_dir", "").strip() or _get_default_model_dir()
+
 
 # --- searchable dropdown ---
 
@@ -1014,8 +1055,23 @@ class App:
         self.source_lang_box = SearchableComboBox(
             self.sidebar, source_values, self.source_lang_var,
         )
-        self.source_lang_box.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 6))
+        self.source_lang_box.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 2))
         row += 1
+
+        # Inline note — visible only when local engine + fixed source selected
+        self._local_pair_note = theme.make_label(
+            self.sidebar,
+            "One model per source\u2009\u2192\u2009target pair.",
+            level="tiny",
+            text_color=p.text_muted,
+        )
+        self._local_pair_note_row = row
+        row += 1
+        # Hidden by default
+        self._local_pair_note.grid_remove()
+
+        # Listen for source-language changes (filters target list for local engine)
+        self.source_lang_var.trace_add("write", self._on_source_lang_changed)
 
         # Target language
         theme.make_label(
@@ -1653,6 +1709,27 @@ class App:
         debug_cb.grid(row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4))
         _lrow += 1
 
+        # Divider
+        theme.make_divider(left).grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(10, 8))
+        _lrow += 1
+
+        # LOCAL MODELS section
+        theme.make_label(left, "LOCAL MODELS", level="section").grid(
+            row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4),
+        )
+        _lrow += 1
+
+        def _open_manager_from_settings():
+            win.destroy()
+            self.root.after(50, self._open_model_manager)
+
+        theme.make_button(
+            left, "Open Model Manager",
+            command=_open_manager_from_settings,
+            style="secondary", height=28,
+        ).grid(row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        _lrow += 1
+
         # ── RIGHT COLUMN: Network + API Keys ─────────────────────────────
         # Use a scrollable frame for the right column
         try:
@@ -2125,6 +2202,383 @@ class App:
         except Exception:
             pass
 
+    # --- model manager ---
+
+    _model_manager_open = False
+
+    def _open_model_manager(self):
+        """Open the Local Model Manager as a modal window."""
+        import shutil
+        import subprocess
+
+        if self._model_manager_open:
+            return
+        self._model_manager_open = True
+
+        from ..translators.local import list_downloaded_pairs
+
+        p = theme.get()
+        PAD = theme.PADDING
+
+        win = ctk.CTkToplevel(self.root)
+        win.wm_attributes("-alpha", 0)
+        apply_window_icon(win)
+        win.title("Local Model Manager")
+        win.transient(self.root)
+        win.grab_set()
+        win.configure(fg_color=p.bg_main)
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(0, weight=1)
+
+        model_dir = _get_local_model_dir_from_cfg(self.cfg)
+        catalogue = _load_models_catalogue()
+        scripts_dir = str(Path(__file__).resolve().parents[3] / "scripts")
+
+        # --- state ---
+        # dl_procs: canonical_name -> subprocess.Popen
+        dl_procs: dict[str, subprocess.Popen] = {}
+        # dl_state: canonical_name -> "idle"/"downloading"/"done"/"error"
+        dl_state: dict[str, str] = {}
+        row_widgets: dict[str, dict] = {}  # canonical_name -> widget dict
+        check_vars: dict[str, tk.BooleanVar] = {}
+
+        def _is_downloaded(canonical_name: str) -> bool:
+            """Check if a model pair is downloaded (by canonical name or ISO equivalent)."""
+            pair_dir = Path(model_dir) / canonical_name
+            if (pair_dir / "converted.ok").exists():
+                return True
+            # Also match via ISO-normalised codes (e.g. catalogue "en-fr" vs disk "eng-fra")
+            parts = canonical_name.split("-", 1)
+            if len(parts) == 2:
+                iso_src = _opus_code_to_iso(parts[0])
+                iso_tgt = _opus_code_to_iso(parts[1])
+                for s, t in list_downloaded_pairs(model_dir):
+                    if _opus_code_to_iso(s) == iso_src and _opus_code_to_iso(t) == iso_tgt:
+                        return True
+            return False
+
+        # --- outer card ---
+        card = theme.make_card(win)
+        card.configure(width=theme.scale(900))
+        win.minsize(theme.scale(900), theme.scale(560))
+        card.grid(row=0, column=0, sticky="nsew", padx=PAD, pady=PAD)
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_rowconfigure(2, weight=1)  # table area stretches
+
+        # --- header ---
+        hdr = ctk.CTkFrame(card, fg_color="transparent")
+        hdr.grid(row=0, column=0, sticky="w", padx=PAD, pady=(PAD, 4))
+        lang_icon = get_icon("language", size=20)
+        if lang_icon:
+            ctk.CTkLabel(hdr, text="", image=lang_icon, width=20).pack(side=tk.LEFT, padx=(0, 8))
+        theme.make_label(hdr, "Local Model Manager", level="heading").pack(side=tk.LEFT)
+
+        # --- info note ---
+        theme.make_label(
+            card,
+            "OPUS-MT models cover one source \u2192 target pair each. "
+            "Download the pairs you need below.",
+            level="small", text_color=p.text_muted,
+        ).grid(row=1, column=0, sticky="w", padx=PAD, pady=(0, 8))
+
+        # --- search bar ---
+        search_frame = ctk.CTkFrame(card, fg_color="transparent")
+        search_frame.grid(row=1, column=0, sticky="e", padx=PAD, pady=(0, 8))
+        search_var = tk.StringVar()
+        search_entry = theme.make_entry(search_frame, height=28, width=220)
+        search_entry.grid(row=0, column=0)
+        search_icon = get_icon("search", size=14)
+        if search_icon:
+            ctk.CTkLabel(search_frame, text="", image=search_icon, width=16).grid(
+                row=0, column=1, padx=(4, 0))
+
+        # --- scrollable table ---
+        try:
+            table_frame = ctk.CTkScrollableFrame(card, fg_color="transparent")
+            try:
+                table_frame.configure(height=theme.scale(340))
+            except Exception:
+                pass
+        except Exception:
+            table_frame = ctk.CTkFrame(card, fg_color="transparent")
+        table_frame.grid(row=2, column=0, sticky="nsew", padx=PAD, pady=(0, 4))
+        # Columns: checkbox(0) source(1) target(2) size(3) status(4) action(5)
+        for ci, w in enumerate([30, 1, 1, 80, 120, 160]):
+            weight = 0 if ci in (0, 3, 4, 5) else 1
+            table_frame.grid_columnconfigure(ci, weight=weight, minsize=w)
+
+        # Table header
+        _hdr_labels = ["", "Source", "Target", "Size (MB)", "Status", ""]
+        for ci, txt in enumerate(_hdr_labels):
+            if txt:
+                theme.make_label(table_frame, txt, level="section").grid(
+                    row=0, column=ci, sticky="w", padx=(4, 8), pady=(0, 6))
+
+        lang_opts_map = {code: name for code, name in _get_language_options()}
+
+        def _lang_display(code: str) -> str:
+            iso = _opus_code_to_iso(code)
+            name = lang_opts_map.get(iso, code)
+            return f"{name} ({iso})"
+
+        def _update_row_status(cname: str):
+            """Refresh the status label and action button for one row."""
+            rw = row_widgets.get(cname)
+            if not rw:
+                return
+            downloaded = _is_downloaded(cname)
+            state = dl_state.get(cname, "idle")
+
+            # Status label
+            if state == "downloading":
+                rw["status_label"].configure(text="Downloading\u2026", text_color=p.status_info)
+            elif state == "error":
+                rw["status_label"].configure(text="Error", text_color=p.status_error)
+            elif downloaded:
+                rw["status_label"].configure(text="Downloaded", text_color=p.status_success)
+            else:
+                rw["status_label"].configure(text="Not downloaded", text_color=p.text_muted)
+
+            # Action frame — clear and rebuild
+            for child in rw["action_frame"].winfo_children():
+                child.destroy()
+
+            if state == "downloading":
+                # Progress bar + cancel
+                prog = ctk.CTkProgressBar(rw["action_frame"], width=80, height=12,
+                                          progress_color=p.accent)
+                prog.grid(row=0, column=0, padx=(0, 4))
+                prog.set(0)
+                rw["progress_bar"] = prog
+                theme.make_button(
+                    rw["action_frame"], "Cancel",
+                    command=lambda cn=cname: _cancel_download(cn),
+                    style="ghost", height=22,
+                ).grid(row=0, column=1)
+            elif state == "error":
+                theme.make_button(
+                    rw["action_frame"], "Retry",
+                    command=lambda cn=cname: _start_download(cn),
+                    style="secondary", height=22,
+                ).grid(row=0, column=0)
+            elif downloaded:
+                theme.make_button(
+                    rw["action_frame"], "Delete",
+                    command=lambda cn=cname: _delete_model(cn),
+                    style="ghost", height=22,
+                ).grid(row=0, column=0)
+            else:
+                theme.make_button(
+                    rw["action_frame"], "Download",
+                    command=lambda cn=cname: _start_download(cn),
+                    style="primary", height=22,
+                ).grid(row=0, column=0)
+
+        def _build_rows():
+            # Clear existing rows (skip header at row 0)
+            for child in table_frame.winfo_children():
+                info = child.grid_info()
+                if info and int(info.get("row", 0)) > 0:
+                    child.destroy()
+            row_widgets.clear()
+            check_vars.clear()
+
+            query = search_var.get().strip().lower()
+            r = 1
+            for entry in catalogue:
+                cname = entry["canonical_name"]
+                src_display = _lang_display(entry["source"])
+                tgt_display = _lang_display(entry["target"])
+                if query and query not in src_display.lower() and query not in tgt_display.lower():
+                    continue
+
+                bg = p.bg_row_even if r % 2 == 0 else p.bg_row_odd
+
+                cv = tk.BooleanVar(value=False)
+                check_vars[cname] = cv
+                cb = ctk.CTkCheckBox(
+                    table_frame, text="", variable=cv, width=24,
+                    checkmark_color=p.bg_main, fg_color=p.accent,
+                    hover_color=p.accent_hover, border_color=p.border,
+                )
+                cb.grid(row=r, column=0, padx=(4, 0), pady=2)
+
+                theme.make_label(table_frame, src_display, level="body").grid(
+                    row=r, column=1, sticky="w", padx=(4, 8), pady=2)
+                theme.make_label(table_frame, tgt_display, level="body").grid(
+                    row=r, column=2, sticky="w", padx=(4, 8), pady=2)
+                theme.make_label(table_frame, str(entry.get("size_mb", "?")), level="body").grid(
+                    row=r, column=3, sticky="w", padx=(4, 8), pady=2)
+
+                status_lbl = theme.make_label(table_frame, "", level="small")
+                status_lbl.grid(row=r, column=4, sticky="w", padx=(4, 8), pady=2)
+
+                action_fr = ctk.CTkFrame(table_frame, fg_color="transparent")
+                action_fr.grid(row=r, column=5, sticky="w", padx=(4, 8), pady=2)
+
+                row_widgets[cname] = {
+                    "status_label": status_lbl,
+                    "action_frame": action_fr,
+                }
+                _update_row_status(cname)
+                r += 1
+
+        def _on_search(*_):
+            _build_rows()
+
+        search_var.trace_add("write", _on_search)
+
+        # --- download / delete / cancel actions ---
+
+        def _find_slug(cname: str) -> str:
+            for e in catalogue:
+                if e["canonical_name"] == cname:
+                    return e["slug"]
+            return cname
+
+        def _start_download(cname: str):
+            if dl_state.get(cname) == "downloading":
+                return
+            dl_state[cname] = "downloading"
+            _update_row_status(cname)
+
+            slug = _find_slug(cname)
+            cmd = [
+                sys.executable,
+                os.path.join(scripts_dir, "download_models.py"),
+                "opus-mt", slug, "--dest-dir", model_dir,
+            ]
+
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1,
+                )
+            except Exception as exc:
+                dl_state[cname] = "error"
+                _update_row_status(cname)
+                logger.error("Failed to start download for %s: %s", cname, exc)
+                return
+
+            dl_procs[cname] = proc
+
+            def _poll():
+                if cname not in dl_procs:
+                    return
+                p_obj = dl_procs[cname]
+                try:
+                    line = p_obj.stdout.readline()
+                except Exception:
+                    line = ""
+                if line:
+                    line = line.strip()
+                    if line.startswith("PROGRESS "):
+                        parts = line.split()
+                        if len(parts) == 3:
+                            try:
+                                received = int(parts[1])
+                                total = int(parts[2])
+                                if total > 0:
+                                    frac = min(1.0, received / total)
+                                    rw = row_widgets.get(cname)
+                                    if rw and "progress_bar" in rw:
+                                        rw["progress_bar"].set(frac)
+                            except ValueError:
+                                pass
+                rc = p_obj.poll()
+                if rc is None:
+                    win.after(100, _poll)
+                else:
+                    dl_procs.pop(cname, None)
+                    dl_state[cname] = "done" if rc == 0 else "error"
+                    _update_row_status(cname)
+                    if rc == 0:
+                        self._refresh_language_dropdowns()
+
+            win.after(100, _poll)
+
+        def _cancel_download(cname: str):
+            proc = dl_procs.pop(cname, None)
+            if proc:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+            dl_state[cname] = "idle"
+            _update_row_status(cname)
+
+        def _delete_model(cname: str):
+            # Delete the exact canonical dir first
+            pair_dir = Path(model_dir) / cname
+            if pair_dir.is_dir():
+                shutil.rmtree(pair_dir, ignore_errors=True)
+            # Also delete any ISO-equivalent dir (e.g. "eng-fra" for "en-fr")
+            parts = cname.split("-", 1)
+            if len(parts) == 2:
+                iso_src = _opus_code_to_iso(parts[0])
+                iso_tgt = _opus_code_to_iso(parts[1])
+                for s, t in list_downloaded_pairs(model_dir):
+                    if _opus_code_to_iso(s) == iso_src and _opus_code_to_iso(t) == iso_tgt:
+                        alt_dir = Path(model_dir) / f"{s}-{t}"
+                        if alt_dir.is_dir():
+                            shutil.rmtree(alt_dir, ignore_errors=True)
+            dl_state[cname] = "idle"
+            _update_row_status(cname)
+            self._refresh_language_dropdowns()
+
+        # --- batch action buttons ---
+        batch_frame = ctk.CTkFrame(card, fg_color="transparent")
+        batch_frame.grid(row=3, column=0, sticky="w", padx=PAD, pady=(4, PAD))
+
+        def _batch_download():
+            for cname, cv in check_vars.items():
+                if cv.get() and not _is_downloaded(cname):
+                    _start_download(cname)
+
+        def _batch_delete():
+            for cname, cv in check_vars.items():
+                if cv.get() and _is_downloaded(cname):
+                    _delete_model(cname)
+
+        theme.make_button(
+            batch_frame, "Download selected",
+            command=_batch_download, style="primary", height=28,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        theme.make_button(
+            batch_frame, "Delete selected",
+            command=_batch_delete, style="ghost", height=28,
+        ).pack(side=tk.LEFT)
+
+        # --- build initial rows ---
+        _build_rows()
+
+        # --- close handler ---
+        def _on_close():
+            # Terminate any running downloads
+            for cn, proc in list(dl_procs.items()):
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
+            dl_procs.clear()
+            self._model_manager_open = False
+            self._refresh_language_dropdowns()
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+        win.update_idletasks()
+
+        def _show_mm():
+            center_window(win, parent=self.root)
+            win.wm_attributes("-alpha", 1)
+        win.after(20, _show_mm)
+        try:
+            win.resizable(True, True)
+        except Exception:
+            pass
+
     # --- about dialog ---
 
     def _open_about(self):
@@ -2384,6 +2838,48 @@ class App:
         self._log(f"Translation engine changed to: {engine_key!r}")
         self._update_usage_label(engine_key)
         self._toggle_local_model_widgets(engine_key == "local")
+        self._update_local_pair_note()
+
+    def _on_source_lang_changed(self, *_) -> None:
+        """Re-filter the target list when source changes (local engine only)."""
+        engine_key = _ENGINE_MAP.get(self.engine_var.get(), "google")
+        if engine_key != "local":
+            self._update_local_pair_note()
+            return
+        from ..translators.local import list_downloaded_pairs
+        model_dir = _get_local_model_dir_from_cfg(self.cfg)
+        pairs = list_downloaded_pairs(model_dir)
+        lang_opts = _get_language_options()
+
+        source_code = self._source_lang_map.get(self.source_lang_var.get(), "auto")
+
+        if source_code == "auto":
+            # Show all targets from any pair
+            tgt_codes = {_opus_code_to_iso(t) for _, t in pairs}
+        else:
+            # Show only targets reachable from the selected source
+            tgt_codes = set()
+            for s, t in pairs:
+                if _opus_code_to_iso(s) == source_code:
+                    tgt_codes.add(_opus_code_to_iso(t))
+
+        tgt_filtered = [(c, n) for c, n in lang_opts if c in tgt_codes]
+        tgt_display = [f"{name} ({code})" for code, name in tgt_filtered]
+        self._lang_map = {f"{name} ({code})": code for code, name in tgt_filtered}
+        self.target_lang_box.update_values(tgt_display)
+        self._update_local_pair_note()
+
+    def _update_local_pair_note(self) -> None:
+        """Show/hide the 'one model per pair' note below the source dropdown."""
+        engine_key = _ENGINE_MAP.get(self.engine_var.get(), "google")
+        source_code = self._source_lang_map.get(self.source_lang_var.get(), "auto")
+        if engine_key == "local" and source_code != "auto":
+            self._local_pair_note.grid(
+                row=self._local_pair_note_row, column=0, sticky="w",
+                padx=theme.PADDING, pady=(0, 4),
+            )
+        else:
+            self._local_pair_note.grid_remove()
 
     def _toggle_local_model_widgets(self, show: bool) -> None:
         pad = theme.PADDING
@@ -2440,7 +2936,52 @@ class App:
         detector = (self.detector_var.get() or "fasttext").strip().lower()
         engine_key = _ENGINE_MAP.get(self.engine_var.get(), "google")
         lang_opts = _get_language_options()
+        lang_name_by_code = {code: name for code, name in lang_opts}
 
+        if engine_key == "local":
+            # Local engine: only show languages where a downloaded model exists
+            from ..translators.local import list_downloaded_pairs
+            model_dir = _get_local_model_dir_from_cfg(self.cfg)
+            pairs = list_downloaded_pairs(model_dir)
+            self._local_downloaded_pairs = pairs
+
+            # Build a map from ISO codes found on disk → display name
+            src_codes_set: set[str] = set()
+            tgt_codes_set: set[str] = set()
+            for s, t in pairs:
+                src_codes_set.add(_opus_code_to_iso(s))
+                tgt_codes_set.add(_opus_code_to_iso(t))
+
+            # Source list — languages which appear as source in at least one pair
+            src_filtered = [(c, n) for c, n in lang_opts if c in src_codes_set]
+            src_display = [f"{name} ({code})" for code, name in src_filtered]
+            source_values = ["Auto-detect (translate all)"] + src_display
+            self._source_lang_map = {"Auto-detect (translate all)": "auto"}
+            self._source_lang_map.update(
+                {f"{name} ({code})": code for code, name in src_filtered}
+            )
+            self.source_lang_box.update_values(source_values)
+            self._source_lang_label.configure(text=f"Source language ({len(src_display)})")
+
+            # Target list — all targets reachable from any source
+            tgt_filtered = [(c, n) for c, n in lang_opts if c in tgt_codes_set]
+            tgt_display = [f"{name} ({code})" for code, name in tgt_filtered]
+            self._lang_map = {f"{name} ({code})": code for code, name in tgt_filtered}
+            self.target_lang_box.update_values(tgt_display)
+
+            self._log(f"Language lists updated for engine={engine_key!r} "
+                      f"(target: {len(tgt_display)}, source: {len(src_display)}, "
+                      f"downloaded pairs: {len(pairs)})")
+
+            if not pairs and not getattr(self, "_model_manager_open", False):
+                self.root.after(100, lambda: messagebox.showinfo(
+                    "No local models",
+                    "No local OPUS-MT models found.\n\n"
+                    "Download models via Settings \u2192 Local Models.",
+                ))
+            return
+
+        # Non-local engines: original logic
         # Target: filter by engine only (detector doesn't restrict target)
         tgt_filtered = _filter_by_engine(lang_opts, engine_key)
         tgt_display = [f"{name} ({code})" for code, name in tgt_filtered]
@@ -2573,9 +3114,34 @@ class App:
             messagebox.showwarning(
                 "Missing API key",
                 "DeepL Free requires an API Key.\n"
-                "Please configure it in Settings → DeepL Free.",
+                "Please configure it in Settings \u2192 DeepL Free.",
             )
             return
+
+        # Local engine: verify required model is downloaded
+        if engine == "local":
+            from ..translators.local import list_downloaded_pairs
+            _lm_dir = local_model_dir or _get_default_model_dir()
+            _local_pairs = list_downloaded_pairs(_lm_dir)
+            if not _local_pairs:
+                if messagebox.askyesno(
+                    "No models downloaded",
+                    "No local OPUS-MT models found.\n\n"
+                    "Open Settings to download models?",
+                ):
+                    self._open_settings()
+                return
+            if source_lang != "auto":
+                _pair_set = {(_opus_code_to_iso(s), _opus_code_to_iso(t))
+                             for s, t in _local_pairs}
+                if (source_lang, lang) not in _pair_set:
+                    if messagebox.askyesno(
+                        "Missing model",
+                        f"No local model for {source_lang} \u2192 {lang}.\n\n"
+                        "Open Settings to download it?",
+                    ):
+                        self._open_settings()
+                    return
 
         # Warn if usage is close to or at the monthly limit.
         # For Baidu, the usage key depends on the configured tier.
