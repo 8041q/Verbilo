@@ -2208,8 +2208,10 @@ class App:
 
     def _open_model_manager(self):
         """Open the Local Model Manager as a modal window."""
+        import queue
         import shutil
         import subprocess
+        import threading
 
         if self._model_manager_open:
             return
@@ -2239,8 +2241,17 @@ class App:
         dl_procs: dict[str, subprocess.Popen] = {}
         # dl_state: canonical_name -> "idle"/"downloading"/"done"/"error"
         dl_state: dict[str, str] = {}
+        # dl_queues: canonical_name -> queue.Queue of stdout lines
+        dl_queues: dict[str, queue.Queue] = {}
+        # dl_cumulative: canonical_name -> {"last_received": int, "offset": int}
+        dl_cumulative: dict[str, dict] = {}
         row_widgets: dict[str, dict] = {}  # canonical_name -> widget dict
         check_vars: dict[str, tk.BooleanVar] = {}
+
+        # Build a lookup for catalogue size_mb by canonical_name
+        _cat_size_mb: dict[str, int] = {}
+        for _e in catalogue:
+            _cat_size_mb[_e["canonical_name"]] = _e.get("size_mb", 0)
 
         def _is_downloaded(canonical_name: str) -> bool:
             """Check if a model pair is downloaded (by canonical name or ISO equivalent)."""
@@ -2281,38 +2292,41 @@ class App:
             level="small", text_color=p.text_muted,
         ).grid(row=1, column=0, sticky="w", padx=PAD, pady=(0, 8))
 
-        # --- search bar ---
-        search_frame = ctk.CTkFrame(card, fg_color="transparent")
-        search_frame.grid(row=1, column=0, sticky="e", padx=PAD, pady=(0, 8))
-        search_var = tk.StringVar()
-        search_entry = theme.make_entry(search_frame, height=28, width=220)
-        search_entry.grid(row=0, column=0)
-        search_icon = get_icon("search", size=14)
-        if search_icon:
-            ctk.CTkLabel(search_frame, text="", image=search_icon, width=16).grid(
-                row=0, column=1, padx=(4, 0))
-
         # --- scrollable table ---
+        # --- table container with sticky header + scrollable body ---
+        table_container = ctk.CTkFrame(card, fg_color="transparent")
+        table_container.grid(row=2, column=0, sticky="nsew", padx=PAD, pady=(0, 4))
+        table_container.grid_columnconfigure(0, weight=1)
+        table_container.grid_rowconfigure(1, weight=1)
+
+        # Header row (fixed)
+        header_frame = ctk.CTkFrame(table_container, fg_color="transparent")
+        header_frame.grid(row=0, column=0, sticky="ew")
+        # column layout same as body
+        for ci, w in enumerate([30, 1, 1, 80, 120, 160]):
+            weight = 0 if ci in (0, 3, 4, 5) else 1
+            header_frame.grid_columnconfigure(ci, weight=weight, minsize=w)
+
+        _hdr_labels = ["", "Source", "Target", "Size (MB)", "Progress", ""]
+        for ci, txt in enumerate(_hdr_labels):
+            if txt:
+                theme.make_label(header_frame, txt, level="section").grid(
+                    row=0, column=ci, sticky="w", padx=(4, 8), pady=(0, 6))
+
+        # Scrollable body (model rows)
         try:
-            table_frame = ctk.CTkScrollableFrame(card, fg_color="transparent")
+            body_frame = ctk.CTkScrollableFrame(table_container, fg_color="transparent")
             try:
-                table_frame.configure(height=theme.scale(340))
+                body_frame.configure(height=theme.scale(340))
             except Exception:
                 pass
         except Exception:
-            table_frame = ctk.CTkFrame(card, fg_color="transparent")
-        table_frame.grid(row=2, column=0, sticky="nsew", padx=PAD, pady=(0, 4))
-        # Columns: checkbox(0) source(1) target(2) size(3) status(4) action(5)
+            body_frame = ctk.CTkFrame(table_container, fg_color="transparent")
+        body_frame.grid(row=1, column=0, sticky="nsew")
+        # Column layout for body also aligned with header
         for ci, w in enumerate([30, 1, 1, 80, 120, 160]):
             weight = 0 if ci in (0, 3, 4, 5) else 1
-            table_frame.grid_columnconfigure(ci, weight=weight, minsize=w)
-
-        # Table header
-        _hdr_labels = ["", "Source", "Target", "Size (MB)", "Status", ""]
-        for ci, txt in enumerate(_hdr_labels):
-            if txt:
-                theme.make_label(table_frame, txt, level="section").grid(
-                    row=0, column=ci, sticky="w", padx=(4, 8), pady=(0, 6))
+            body_frame.grid_columnconfigure(ci, weight=weight, minsize=w)
 
         lang_opts_map = {code: name for code, name in _get_language_options()}
 
@@ -2322,39 +2336,33 @@ class App:
             return f"{name} ({iso})"
 
         def _update_row_status(cname: str):
-            """Refresh the status label and action button for one row."""
+            """Refresh the progress label and action button for one row."""
             rw = row_widgets.get(cname)
             if not rw:
                 return
             downloaded = _is_downloaded(cname)
             state = dl_state.get(cname, "idle")
 
-            # Status label
+            # Progress label
             if state == "downloading":
-                rw["status_label"].configure(text="Downloading\u2026", text_color=p.status_info)
+                rw["progress_label"].configure(text="0%", text_color=p.status_info)
             elif state == "error":
-                rw["status_label"].configure(text="Error", text_color=p.status_error)
+                rw["progress_label"].configure(text="Error", text_color=p.status_error)
             elif downloaded:
-                rw["status_label"].configure(text="Downloaded", text_color=p.status_success)
+                rw["progress_label"].configure(text="100%", text_color=p.status_success)
             else:
-                rw["status_label"].configure(text="Not downloaded", text_color=p.text_muted)
+                rw["progress_label"].configure(text="\u2014", text_color=p.text_muted)
 
             # Action frame — clear and rebuild
             for child in rw["action_frame"].winfo_children():
                 child.destroy()
 
             if state == "downloading":
-                # Progress bar + cancel
-                prog = ctk.CTkProgressBar(rw["action_frame"], width=80, height=12,
-                                          progress_color=p.accent)
-                prog.grid(row=0, column=0, padx=(0, 4))
-                prog.set(0)
-                rw["progress_bar"] = prog
                 theme.make_button(
                     rw["action_frame"], "Cancel",
                     command=lambda cn=cname: _cancel_download(cn),
                     style="ghost", height=22,
-                ).grid(row=0, column=1)
+                ).grid(row=0, column=0)
             elif state == "error":
                 theme.make_button(
                     rw["action_frame"], "Retry",
@@ -2375,58 +2383,46 @@ class App:
                 ).grid(row=0, column=0)
 
         def _build_rows():
-            # Clear existing rows (skip header at row 0)
-            for child in table_frame.winfo_children():
-                info = child.grid_info()
-                if info and int(info.get("row", 0)) > 0:
-                    child.destroy()
+            # Clear existing rows from body_only (keep header fixed)
+            for child in body_frame.winfo_children():
+                child.destroy()
             row_widgets.clear()
             check_vars.clear()
 
-            query = search_var.get().strip().lower()
-            r = 1
+            r = 0
             for entry in catalogue:
                 cname = entry["canonical_name"]
                 src_display = _lang_display(entry["source"])
                 tgt_display = _lang_display(entry["target"])
-                if query and query not in src_display.lower() and query not in tgt_display.lower():
-                    continue
-
-                bg = p.bg_row_even if r % 2 == 0 else p.bg_row_odd
 
                 cv = tk.BooleanVar(value=False)
                 check_vars[cname] = cv
                 cb = ctk.CTkCheckBox(
-                    table_frame, text="", variable=cv, width=24,
+                    body_frame, text="", variable=cv, width=24,
                     checkmark_color=p.bg_main, fg_color=p.accent,
                     hover_color=p.accent_hover, border_color=p.border,
                 )
                 cb.grid(row=r, column=0, padx=(4, 0), pady=2)
 
-                theme.make_label(table_frame, src_display, level="body").grid(
+                theme.make_label(body_frame, src_display, level="body").grid(
                     row=r, column=1, sticky="w", padx=(4, 8), pady=2)
-                theme.make_label(table_frame, tgt_display, level="body").grid(
+                theme.make_label(body_frame, tgt_display, level="body").grid(
                     row=r, column=2, sticky="w", padx=(4, 8), pady=2)
-                theme.make_label(table_frame, str(entry.get("size_mb", "?")), level="body").grid(
+                theme.make_label(body_frame, str(entry.get("size_mb", "?")), level="body").grid(
                     row=r, column=3, sticky="w", padx=(4, 8), pady=2)
 
-                status_lbl = theme.make_label(table_frame, "", level="small")
-                status_lbl.grid(row=r, column=4, sticky="w", padx=(4, 8), pady=2)
+                progress_lbl = theme.make_label(body_frame, "", level="small")
+                progress_lbl.grid(row=r, column=4, sticky="w", padx=(4, 8), pady=2)
 
-                action_fr = ctk.CTkFrame(table_frame, fg_color="transparent")
+                action_fr = ctk.CTkFrame(body_frame, fg_color="transparent")
                 action_fr.grid(row=r, column=5, sticky="w", padx=(4, 8), pady=2)
 
                 row_widgets[cname] = {
-                    "status_label": status_lbl,
+                    "progress_label": progress_lbl,
                     "action_frame": action_fr,
                 }
                 _update_row_status(cname)
                 r += 1
-
-        def _on_search(*_):
-            _build_rows()
-
-        search_var.trace_add("write", _on_search)
 
         # --- download / delete / cancel actions ---
 
@@ -2440,6 +2436,7 @@ class App:
             if dl_state.get(cname) == "downloading":
                 return
             dl_state[cname] = "downloading"
+            dl_cumulative[cname] = {"last_received": 0, "offset": 0}
             _update_row_status(cname)
 
             slug = _find_slug(cname)
@@ -2462,15 +2459,37 @@ class App:
 
             dl_procs[cname] = proc
 
+            # Feed stdout lines into a queue via a daemon thread
+            # so _poll never blocks the GUI thread.
+            q: queue.Queue = queue.Queue()
+            dl_queues[cname] = q
+
+            def _reader():
+                try:
+                    for line in proc.stdout:
+                        q.put(line)
+                except Exception:
+                    pass
+                finally:
+                    q.put(None)  # sentinel: stream ended
+
+            t = threading.Thread(target=_reader, daemon=True)
+            t.start()
+
+            total_model_bytes = _cat_size_mb.get(cname, 0) * 1024 * 1024
+
             def _poll():
                 if cname not in dl_procs:
                     return
-                p_obj = dl_procs[cname]
-                try:
-                    line = p_obj.stdout.readline()
-                except Exception:
-                    line = ""
-                if line:
+                # Drain all available lines without blocking
+                while True:
+                    try:
+                        line = q.get_nowait()
+                    except queue.Empty:
+                        break
+                    if line is None:
+                        # Stream ended — process finishing
+                        break
                     line = line.strip()
                     if line.startswith("PROGRESS "):
                         parts = line.split()
@@ -2478,18 +2497,31 @@ class App:
                             try:
                                 received = int(parts[1])
                                 total = int(parts[2])
-                                if total > 0:
-                                    frac = min(1.0, received / total)
+                                cum = dl_cumulative.get(cname)
+                                if cum is not None:
+                                    # Detect new file: received drops
+                                    if received < cum["last_received"]:
+                                        cum["offset"] += cum["last_received"]
+                                    cum["last_received"] = received
+                                    total_received = cum["offset"] + received
+                                    denom = total_model_bytes if total_model_bytes > 0 else (total if total > 0 else 1)
+                                    pct = min(99, int(total_received / denom * 100))
                                     rw = row_widgets.get(cname)
-                                    if rw and "progress_bar" in rw:
-                                        rw["progress_bar"].set(frac)
+                                    if rw and "progress_label" in rw:
+                                        rw["progress_label"].configure(
+                                            text=f"{pct}%", text_color=p.status_info)
                             except ValueError:
                                 pass
+                p_obj = dl_procs.get(cname)
+                if p_obj is None:
+                    return
                 rc = p_obj.poll()
                 if rc is None:
                     win.after(100, _poll)
                 else:
                     dl_procs.pop(cname, None)
+                    dl_queues.pop(cname, None)
+                    dl_cumulative.pop(cname, None)
                     dl_state[cname] = "done" if rc == 0 else "error"
                     _update_row_status(cname)
                     if rc == 0:
@@ -2499,10 +2531,11 @@ class App:
 
         def _cancel_download(cname: str):
             proc = dl_procs.pop(cname, None)
+            dl_queues.pop(cname, None)
+            dl_cumulative.pop(cname, None)
             if proc:
                 try:
-                    proc.terminate()
-                    proc.wait(timeout=5)
+                    proc.kill()
                 except Exception:
                     pass
             dl_state[cname] = "idle"
@@ -2558,11 +2591,12 @@ class App:
             # Terminate any running downloads
             for cn, proc in list(dl_procs.items()):
                 try:
-                    proc.terminate()
-                    proc.wait(timeout=3)
+                    proc.kill()
                 except Exception:
                     pass
             dl_procs.clear()
+            dl_queues.clear()
+            dl_cumulative.clear()
             self._model_manager_open = False
             self._refresh_language_dropdowns()
             win.destroy()
@@ -2851,10 +2885,10 @@ class App:
         pairs = list_downloaded_pairs(model_dir)
         lang_opts = _get_language_options()
 
-        source_code = self._source_lang_map.get(self.source_lang_var.get(), "auto")
+        source_code = self._source_lang_map.get(self.source_lang_var.get())
 
-        if source_code == "auto":
-            # Show all targets from any pair
+        if not source_code:
+            # No source selected yet — show all targets from any pair
             tgt_codes = {_opus_code_to_iso(t) for _, t in pairs}
         else:
             # Show only targets reachable from the selected source
@@ -2872,8 +2906,7 @@ class App:
     def _update_local_pair_note(self) -> None:
         """Show/hide the 'one model per pair' note below the source dropdown."""
         engine_key = _ENGINE_MAP.get(self.engine_var.get(), "google")
-        source_code = self._source_lang_map.get(self.source_lang_var.get(), "auto")
-        if engine_key == "local" and source_code != "auto":
+        if engine_key == "local":
             self._local_pair_note.grid(
                 row=self._local_pair_note_row, column=0, sticky="w",
                 padx=theme.PADDING, pady=(0, 4),
@@ -2953,13 +2986,13 @@ class App:
                 tgt_codes_set.add(_opus_code_to_iso(t))
 
             # Source list — languages which appear as source in at least one pair
+            # No Auto-detect for local engine (each pair needs an explicit model)
             src_filtered = [(c, n) for c, n in lang_opts if c in src_codes_set]
             src_display = [f"{name} ({code})" for code, name in src_filtered]
-            source_values = ["Auto-detect (translate all)"] + src_display
-            self._source_lang_map = {"Auto-detect (translate all)": "auto"}
-            self._source_lang_map.update(
-                {f"{name} ({code})": code for code, name in src_filtered}
-            )
+            source_values = src_display
+            self._source_lang_map = {
+                f"{name} ({code})": code for code, name in src_filtered
+            }
             self.source_lang_box.update_values(source_values)
             self._source_lang_label.configure(text=f"Source language ({len(src_display)})")
 
@@ -2972,13 +3005,6 @@ class App:
             self._log(f"Language lists updated for engine={engine_key!r} "
                       f"(target: {len(tgt_display)}, source: {len(src_display)}, "
                       f"downloaded pairs: {len(pairs)})")
-
-            if not pairs and not getattr(self, "_model_manager_open", False):
-                self.root.after(100, lambda: messagebox.showinfo(
-                    "No local models",
-                    "No local OPUS-MT models found.\n\n"
-                    "Download models via Settings \u2192 Local Models.",
-                ))
             return
 
         # Non-local engines: original logic
@@ -3131,17 +3157,16 @@ class App:
                 ):
                     self._open_settings()
                 return
-            if source_lang != "auto":
-                _pair_set = {(_opus_code_to_iso(s), _opus_code_to_iso(t))
-                             for s, t in _local_pairs}
-                if (source_lang, lang) not in _pair_set:
-                    if messagebox.askyesno(
-                        "Missing model",
-                        f"No local model for {source_lang} \u2192 {lang}.\n\n"
-                        "Open Settings to download it?",
-                    ):
-                        self._open_settings()
-                    return
+            _pair_set = {(_opus_code_to_iso(s), _opus_code_to_iso(t))
+                         for s, t in _local_pairs}
+            if (source_lang, lang) not in _pair_set:
+                if messagebox.askyesno(
+                    "Missing model",
+                    f"No local model for {source_lang} \u2192 {lang}.\n\n"
+                    "Open Settings to download it?",
+                ):
+                    self._open_settings()
+                return
 
         # Warn if usage is close to or at the monthly limit.
         # For Baidu, the usage key depends on the configured tier.

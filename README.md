@@ -14,18 +14,16 @@
 </div>
 
 ### Verbilo — Portable
-<p align="center"><em>Translate DOCX, XLSX and PDF into 130+ languages while preserving layout, styles, and images.</em></p>
+<p align="center"><em>Translate DOCX, XLSX and PDF into languages while preserving layout, styles, and images.</em></p>
 
 ---
 
-## Why Verbilo?
+## How it works (high level)
 
- 
-Translating office documents should not mean losing formatting, tables, fonts, or images. Most translation tools export plain text or break layouts — Verbilo preserves the original file fidelity while translating only the text that needs translation (tries to :/).
-
-**Problem → Solution**  
-- Problem: Document translators commonly strip formatting, corrupt tables, or require manual rework.  
-- Solution: Verbilo segments and selectively translates text while writing translations back into the original file structure (DOCX runs, XLSX cells, in-place PDF text).
+- Converts document content into translation units (runs, spans, rows, paragraphs)
+- Sends grouped units in batches to translation backends with resilient HTTP retries and sub-batch fallbacks for large requests.
+- Uses API-aware inline tagging where supported to preserve run/span formatting across the round-trip.
+- Reconstructs translated text back into the original document structure, applying formatting where feasible.
 
 
 ## Feature Highlights
@@ -37,6 +35,12 @@ Translating office documents should not mean losing formatting, tables, fonts, o
 - **Multi-Engine Detection**: Lingua, FastText — choose your preferred engine. (quality / speed)
 - **Batching for Efficiency**: Segments are batched to reduce API calls and avoid rate limits.
 
+## Known limitations
+
+- Tag survival is API-dependent; inline tag preservation is not guaranteed on every backend.
+- Z-order guard is conservative: it avoids translating text entirely covered by opaque graphics rather than rewriting PDF content streams to change stacking order.
+- Very-short CJK tokens (1–2 characters) can behave inconsistently across translation APIs—prefer explicit source_lang to ensure correct source language.
+- Extremely complex layouts (heavy overlays, rotated text, or nonstandard encodings) can still produce visual artifacts - manual verification recommended for critical documents.
 
 ## Quick Start — For Developers
 
