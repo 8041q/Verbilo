@@ -375,7 +375,7 @@ class BaiduTranslatorWrapper:
         target_lang: str,
         cancel_event=None,
     ) -> None:
-        """Translate a chunk using newline-joined batch for Premium tier."""
+        # Translate a chunk using newline-joined batch for Premium tier
         chunk_texts = [t for t, _ in chunk]
         separator = "\n"
         joined = separator.join(chunk_texts)

@@ -51,12 +51,12 @@ def _is_ocr_required(doc: fitz.Document) -> bool:
 # Line-level span grouping helpers
 
 def _span_fmt_key(span: dict) -> tuple:
-    """Hashable formatting tuple for a span."""
+    # Hashable formatting tuple for a span
     return (span.get("size", 11), span.get("color", 0), span.get("flags", 0))
 
 
 def _line_is_bullet(text: str) -> bool:
-    """Return True if the line begins with a common bullet / list marker."""
+    # Return True if the line begins with a common bullet / list marker
     stripped = text.lstrip()
     if not stripped:
         return False
@@ -70,10 +70,9 @@ def _line_is_bullet(text: str) -> bool:
 
 
 def _collect_opaque_rects(page: fitz.Page) -> list[fitz.Rect]:
-    """Return rects of solid fully-opaque filled drawing elements on *page*.
-
-    These are used to detect text intentionally hidden under white/opaque shapes.
-    """
+    # Return rects of solid fully-opaque filled drawing elements on *page*.
+    # These are used to detect text intentionally hidden under white/opaque shapes.
+    
     opaque: list[fitz.Rect] = []
     try:
         for drawing in page.get_drawings():
@@ -91,7 +90,7 @@ def _collect_opaque_rects(page: fitz.Page) -> list[fitz.Rect]:
 
 
 def _rect_covered_by_drawing(rect: fitz.Rect, drawing_rects: list[fitz.Rect]) -> bool:
-    """Return True if *rect* is significantly covered by an opaque drawing rect."""
+    # Return True if *rect* is significantly covered by an opaque drawing rect
     area = rect.width * rect.height
     if area < 1.0:
         return False
@@ -286,7 +285,7 @@ def _span_style(
     *,
     underline: bool = False,
 ) -> str:
-    """Build an inline CSS style string for a single span."""
+    # Build an inline CSS style string for a single span
     hex_c = f"#{color:06x}" if isinstance(color, int) else "#000000"
     weight = "bold" if flags & _FLAG_BOLD else "normal"
     style = "italic" if flags & _FLAG_ITALIC else "normal"
@@ -301,7 +300,7 @@ def _span_style(
 
 
 def _infer_text_align(rect: fitz.Rect, page_width: float) -> str:
-    """Infer text alignment from the position of the line rect on the page."""
+    # Infer text alignment from the position of the line rect on the page
     if page_width <= 0:
         return "left"
     center_x = rect.x0 + rect.width / 2
@@ -323,7 +322,7 @@ def _build_html(
     underline: bool = False,
     text_align: str = "left",
 ) -> tuple[str, str]:
-    """Build an HTML snippet and CSS string for insert_htmlbox."""
+    # Build an HTML snippet and CSS string for insert_htmlbox
     inner_style = _span_style(fontsize, color, flags, underline=underline)
     safe_text = _html_escape(text)
     html = (

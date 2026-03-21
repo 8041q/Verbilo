@@ -39,12 +39,12 @@ _HTML_SPAN_TAG_RE = re.compile(
 
 
 def has_inline_tags(text: str) -> bool:
-    """Return True if *text* contains our Unicode bracket tags."""
+    # Return True if *text* contains our Unicode bracket tags
     return _TAG_OPEN in text and _TAG_CLOSE in text
 
 
 def unicode_tags_to_html(text: str) -> str:
-    """Convert ``⟨rN⟩...⟨/rN⟩`` to ``<span class="rN">...</span>``."""
+    # Convert ``⟨rN⟩...⟨/rN⟩`` to ``<span class="rN">...</span>``
     return _UNICODE_TAG_RE.sub(
         lambda m: f'<span class="{m.group(1)}">{m.group(2)}</span>',
         text,
@@ -52,7 +52,7 @@ def unicode_tags_to_html(text: str) -> str:
 
 
 def html_tags_to_unicode(text: str) -> str:
-    """Convert ``<span class="rN">...</span>`` back to ``⟨rN⟩...⟨/rN⟩``."""
+    # Convert ``<span class="rN">...</span>`` back to ``⟨rN⟩...⟨/rN⟩``
     return _HTML_SPAN_TAG_RE.sub(
         lambda m: f"{_TAG_OPEN}{m.group(1)}{_TAG_CLOSE}"
         f"{m.group(2)}"

@@ -24,11 +24,7 @@ NON_TRANSIENT_STATUS_CODES = frozenset({400, 401, 403, 404, 405, 413, 415, 422})
 
 
 def is_transient_error(exc: BaseException) -> bool:
-    """Return True if *exc* looks like a transient network/server error.
-
-    Non-transient errors (auth failures, bad requests, etc.) should raise
-    immediately rather than triggering slow per-item fallback paths.
-    """
+    # Return True if *exc* looks like a transient network/server error
     # requests-level HTTP errors with a response attached
     if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
         return exc.response.status_code not in NON_TRANSIENT_STATUS_CODES
@@ -63,8 +59,7 @@ def resolve_proxies(proxies: Optional[dict] = None) -> Optional[dict]:
 
 
 class _JitteredRetry(Retry):
-    """Retry subclass that adds random jitter to backoff delays and logs
-    each retry attempt at DEBUG level."""
+    # Retry subclass that adds random jitter to backoff delays and logs each retry attempt at DEBUG level
 
     def get_backoff_time(self) -> float:
         base = super().get_backoff_time()

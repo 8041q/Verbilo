@@ -66,7 +66,7 @@ class TranslationCache:
     # ── Connection management ─────────────────────────────────────────────────
 
     def _get_conn(self) -> sqlite3.Connection:
-        """Return (creating if necessary) the per-thread SQLite connection."""
+        # Return (creating if necessary) the per-thread SQLite connection
         conn: Optional[sqlite3.Connection] = getattr(self._local, "conn", None)
         if conn is None:
             self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -90,7 +90,7 @@ class TranslationCache:
     # ── Read API ──────────────────────────────────────────────────────────────
 
     def get(self, engine: str, text: str, target_lang: str) -> Optional[str]:
-        """Return the cached translation or ``None`` on a miss."""
+        # Return the cached translation or ``None`` on a miss
         if not text:
             return None
         try:
@@ -107,7 +107,7 @@ class TranslationCache:
     def get_batch(
         self, engine: str, texts: list[str], target_lang: str
     ) -> dict[str, str]:
-        """Return ``{source_text: translated_text}`` for every cached hit in *texts*."""
+        # Return ``{source_text: translated_text}`` for every cached hit in *texts*
         if not texts:
             return {}
         try:
@@ -127,7 +127,7 @@ class TranslationCache:
     def put(
         self, engine: str, text: str, target_lang: str, translated_text: str
     ) -> None:
-        """Store a single translation; silently overwrites existing entries."""
+        # Store a single translation; silently overwrites existing entries
         if not text or not translated_text:
             return
         try:
@@ -149,7 +149,7 @@ class TranslationCache:
         pairs: list[tuple[str, str]],   # (source_text, translated_text)
         target_lang: str,
     ) -> None:
-        """Bulk-insert translations; silently overwrites existing entries."""
+        # Bulk-insert translations; silently overwrites existing entries
         valid = [(src, tgt) for src, tgt in pairs if src and tgt]
         if not valid:
             return
@@ -169,7 +169,7 @@ class TranslationCache:
     # ── Maintenance ───────────────────────────────────────────────────────────
 
     def _maybe_evict(self, db: sqlite3.Connection) -> None:
-        """Remove the oldest rows if the cache exceeds *max_entries*."""
+        # Remove the oldest rows if the cache exceeds *max_entries*
         try:
             count = db.execute("SELECT COUNT(*) FROM translations").fetchone()[0]
             if count > self._max_entries:
@@ -183,7 +183,7 @@ class TranslationCache:
             logger.debug("Cache eviction failed", exc_info=True)
 
     def clear(self, engine: Optional[str] = None) -> None:
-        """Delete all cache entries, or only entries for *engine* if specified."""
+        # Delete all cache entries, or only entries for *engine* if specified
         try:
             with self._write_lock:
                 db = self._get_conn()
@@ -203,7 +203,7 @@ class TranslationCache:
             logger.debug("Cache.clear failed", exc_info=True)
 
     def size(self, engine: Optional[str] = None) -> int:
-        """Return the number of cached translations (optionally filtered to *engine*)."""
+        # Return the number of cached translations (optionally filtered to *engine*)
         try:
             if engine is None:
                 row = self._get_conn().execute(
@@ -218,7 +218,7 @@ class TranslationCache:
             return 0
 
     def disk_usage_bytes(self) -> int:
-        """Return the approximate on-disk size, uses SQLite PRAGMA to compute `page_count * page_size`. Falls back to the file size on disk if PRAGMA fails."""
+        # Return the approximate on-disk size, uses SQLite PRAGMA to compute `page_count * page_size`. Falls back to the file size on disk if PRAGMA fails
         try:
             db = self._get_conn()
             pc_row = db.execute("PRAGMA page_count").fetchone()
@@ -245,7 +245,7 @@ _cache_lock = threading.Lock()
 
 
 def get_cache() -> TranslationCache:
-    """Return the global :class:`TranslationCache` instance (created on first call)."""
+    # Return the global :class:`TranslationCache` instance (created on first call)
     global _cache
     if _cache is None:
         with _cache_lock:

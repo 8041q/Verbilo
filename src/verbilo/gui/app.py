@@ -273,17 +273,17 @@ _OPUS_CODE_MAP: dict[str, str] = {
 
 
 def _opus_code_to_iso(code: str) -> str:
-    """Convert an OPUS model code (e.g. ``eng``, ``fra``) to ISO 639-1."""
+    # Convert an OPUS model code (e.g. ``eng``, ``fra``) to ISO 639-1
     return _OPUS_CODE_MAP.get(code, code)
 
 
 def _get_default_model_dir() -> str:
-    """Return the default OPUS-MT models directory (same logic as factory.py)."""
+    # Return the default OPUS-MT models directory (same logic as factory.py)
     return str(Path(__file__).resolve().parents[3] / "models" / "opus-mt")
 
 
 def _load_models_catalogue() -> list[dict]:
-    """Load the bundled models catalogue from assets/models_catalogue.json."""
+    # Load the bundled models catalogue from assets/models_catalogue.json
     cat_path = Path(__file__).resolve().parent.parent / "assets" / "models_catalogue.json"
     try:
         return json.loads(cat_path.read_text(encoding="utf-8"))
@@ -2207,7 +2207,7 @@ class App:
     _model_manager_open = False
 
     def _open_model_manager(self):
-        """Open the Local Model Manager as a modal window."""
+        # Open the Local Model Manager as a modal window
         import queue
         import shutil
         import subprocess
@@ -2254,7 +2254,7 @@ class App:
             _cat_size_mb[_e["canonical_name"]] = _e.get("size_mb", 0)
 
         def _is_downloaded(canonical_name: str) -> bool:
-            """Check if a model pair is downloaded (by canonical name or ISO equivalent)."""
+            # Check if a model pair is downloaded (by canonical name or ISO equivalent)
             pair_dir = Path(model_dir) / canonical_name
             if (pair_dir / "converted.ok").exists():
                 return True
@@ -2336,7 +2336,7 @@ class App:
             return f"{name} ({iso})"
 
         def _update_row_status(cname: str):
-            """Refresh the progress label and action button for one row."""
+            # Refresh the progress label and action button for one row
             rw = row_widgets.get(cname)
             if not rw:
                 return
@@ -2875,7 +2875,7 @@ class App:
         self._update_local_pair_note()
 
     def _on_source_lang_changed(self, *_) -> None:
-        """Re-filter the target list when source changes (local engine only)."""
+        # Re-filter the target list when source changes (local engine only)
         engine_key = _ENGINE_MAP.get(self.engine_var.get(), "google")
         if engine_key != "local":
             self._update_local_pair_note()
@@ -2904,7 +2904,7 @@ class App:
         self._update_local_pair_note()
 
     def _update_local_pair_note(self) -> None:
-        """Show/hide the 'one model per pair' note below the source dropdown."""
+        # Show/hide the 'one model per pair' note below the source dropdown
         engine_key = _ENGINE_MAP.get(self.engine_var.get(), "google")
         if engine_key == "local":
             self._local_pair_note.grid(
@@ -3355,34 +3355,38 @@ def main():
         )
         return
 
-    root = ctk.CTk()
-    root.wm_attributes("-alpha", 0)  # keep compositor-invisible during CTk init
-    root.withdraw()  # hide until centered to avoid visible position jump
-    
-    root.update_idletasks()
-
-    # --- responsive scaling ---
+    # --- responsive scaling (MUST run before ctk.CTk() is instantiated) ---
     try:
         from customtkinter.windows.widgets.scaling.scaling_tracker import ScalingTracker
 
-        # CTk's own DPI factor
-        ctk_dpi_scale = ScalingTracker.get_window_scaling(root)  # already-detected DPI factor
+        _probe = tk.Tk()
+        _probe.withdraw()
+        _dpi            = _probe.winfo_fpixels("1i")   # physical pixels per inch
+        _screen_w_phys  = _probe.winfo_screenwidth()
+        _screen_h_phys  = _probe.winfo_screenheight()
+        _probe.destroy()
+        del _probe
 
-        # Screen size in physical pixels; divide by CTk's DPI to get logical pixels
-        screen_w_logical = root.winfo_screenwidth()  / ctk_dpi_scale
-        screen_h_logical = root.winfo_screenheight() / ctk_dpi_scale
+        ctk_dpi_scale    = _dpi / 96.0                 # 96 dpi == 100 %
+        screen_w_logical = _screen_w_phys / ctk_dpi_scale
+        screen_h_logical = _screen_h_phys / ctk_dpi_scale
 
-        margin = 0.95
-        ratio_w = (screen_w_logical * margin) / theme.WINDOW_WIDTH
-        ratio_h = (screen_h_logical * margin) / theme.WINDOW_HEIGHT
+        margin    = 0.95
+        ratio_w   = (screen_w_logical * margin) / theme.WINDOW_WIDTH
+        ratio_h   = (screen_h_logical * margin) / theme.WINDOW_HEIGHT
         layout_scale = min(1.0, ratio_w, ratio_h)
 
         if layout_scale < 0.98:
-            ctk.set_widget_scaling(layout_scale)
-            ctk.set_window_scaling(layout_scale)
+            # Write directly to the class-level attributes
+            ScalingTracker.widget_scaling = max(layout_scale, 0.4)
+            ScalingTracker.window_scaling = max(layout_scale, 0.4)
     except Exception:
         pass
-    
+
+    root = ctk.CTk()
+    root.wm_attributes("-alpha", 0)  # keep invisible until centered
+    root.withdraw()
+
     theme.init_dpi(root)
     app = App(root)
 

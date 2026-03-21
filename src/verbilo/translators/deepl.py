@@ -387,7 +387,7 @@ class DeepLTranslatorWrapper:
         tgt_cache: dict[str, str],
         cancel_event=None,
     ) -> None:
-        """Binary-halving fallback — split failing chunk until per-item."""
+        # Binary-halving fallback — split failing chunk until per-item
         from .google import post_process, _run_cancellable
 
         if len(chunk) <= 2:
