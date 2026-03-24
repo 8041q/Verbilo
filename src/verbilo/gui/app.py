@@ -178,7 +178,7 @@ def _get_language_options() -> list[tuple[str, str]]:
         "af": "Afrikaans", "sq": "Albanian", "am": "Amharic", "ar": "Arabic",
         "hy": "Armenian", "az": "Azerbaijani", "eu": "Basque", "be": "Belarusian",
         "bn": "Bengali", "bs": "Bosnian", "bg": "Bulgarian", "ca": "Catalan",
-        "ceb": "Cebuano", "zh-CN": "Chinese (Simplified)", "zh-TW": "Chinese (Traditional)",
+        "ceb": "Cebuano", "zh": "Chinese (Simplified)",
         "co": "Corsican", "hr": "Croatian", "cs": "Czech", "da": "Danish",
         "nl": "Dutch", "en": "English", "eo": "Esperanto", "et": "Estonian",
         "fi": "Finnish", "fr": "French", "fy": "Frisian", "gl": "Galician",

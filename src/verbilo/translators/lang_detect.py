@@ -88,6 +88,9 @@ _NON_LETTER_RE = re.compile(r"[^a-zA-Z\u00C0-\u024F\u0400-\u04FF"
 def _clean_for_detection(text: str) -> str:
     # Strip numbers, punctuation, URLs, emails — keep only 'letter' content
     text = unicodedata.normalize("NFC", text)
+    # Strip DOCX run-format tags ⟨rN⟩…⟨/rN⟩ and ⟨/rN⟩ before anything else,
+    # so their "r" characters don't pollute language detection for short text.
+    text = re.sub(r'[\u27E8\u27E9]/?r\d*[\u27E8\u27E9]?', '', text)
     # remove URLs
     text = re.sub(r"https?://\S+", " ", text)
     # remove emails

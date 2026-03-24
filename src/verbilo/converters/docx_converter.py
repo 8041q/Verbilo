@@ -44,7 +44,33 @@ def _paragraph_full_text(runs) -> str:
 
 _TAG_OPEN = "\u27E8"   # ⟨  MATHEMATICAL LEFT ANGLE BRACKET
 _TAG_CLOSE = "\u27E9"  # ⟩  MATHEMATICAL RIGHT ANGLE BRACKET
-_TAG_RE = re.compile(r'\u27E8r(\d+)\u27E9(.*?)\u27E8/r\1\u27E9', re.DOTALL)
+
+# BUG FIX #1 — Google Translate removes the ⟩ after the tag name (e.g. ⟨r0⟩ → ⟨r0 ).
+# The old strict regex ⟨r(\d+)⟩ ... ⟨/r\1⟩ never matched the corrupted form.
+# New regex:
+#   \u27E9?  — make the opening ⟩ optional
+#    ?       — absorb the single extra space Google inserts in place of the ⟩
+#   (.*?)    — capture run content non-greedily (preserves meaningful trailing
+#              whitespace that was part of the original run text)
+#   \u27E9?  — make the closing ⟩ optional
+# Using a single optional space (not \s+) avoids eating meaningful leading
+# spaces that are part of run content, while still handling the corruption.
+# The regex still works perfectly on properly-formed tags.
+_TAG_RE = re.compile(r'\u27E8r(\d+)\u27E9? ?(.*?)\u27E8/r\1\u27E9?', re.DOTALL)
+
+# Pattern used to strip any ⟨…⟩ tag artefacts that survive after a failed parse
+# (e.g. when the translator mangles the tag structure beyond what the lenient
+# regex can recover).
+_TAG_ARTIFACT_RE = re.compile(
+    r'\u27E8/?r\d+\u27E9?'   # ⟨rN⟩, ⟨/rN⟩, or corruption variants missing ⟩
+    r'|\u27E9'                # stray ⟩ left over
+    r'|\u27E8'                # stray ⟨ left over
+)
+
+
+def _strip_tag_artifacts(text: str) -> str:
+    """Remove any leftover ⟨rN⟩ / ⟨/rN⟩ tag markers from translated text."""
+    return _TAG_ARTIFACT_RE.sub('', text)
 
 
 def _build_tagged_paragraph(runs: list) -> tuple[str, bool]:
@@ -102,8 +128,14 @@ def _parse_and_assign_tagged(runs: list, translated: str) -> bool:
 def _redistribute_translated(runs, translated: str, *, is_tagged: bool = False) -> None:
     # Write *translated* back into *runs*, preserving formatting boundaries.
     # If the paragraph was tagged, try to parse tags first.
-    if is_tagged and _parse_and_assign_tagged(runs, translated):
-        return
+    if is_tagged:
+        if _parse_and_assign_tagged(runs, translated):
+            return
+        # BUG FIX #1 (continued) — tags were too mangled for even the lenient
+        # regex to recover.  Strip any leftover ⟨⟩ artefacts before falling
+        # back to proportional redistribution so they don't appear in the
+        # final document text.
+        translated = _strip_tag_artifacts(translated)
 
     # Identify runs that held actual (non-whitespace) text
     text_runs = [(i, run) for i, run in enumerate(runs) if run.text and run.text.strip()]
@@ -161,69 +193,45 @@ def _redistribute_translated(runs, translated: str, *, is_tagged: bool = False) 
 # Paragraph collectors
 
 def _iter_all_paragraphs(doc):
-    # Yield every paragraph in the document: body, tables, headers, footers, text boxes
-    # Track yielded paragraph element ids to avoid duplicates
+    """
+    An aggressive XML-based iterator that finds paragraphs in:
+    1. The main body
+    2. Tables (including nested tables)
+    3. Text boxes (including those in shapes/groups)
+    4. Headers/Footers
+    5. Content Controls (SDTs)
+    """
     seen: set[int] = set()
 
-    def _track_and_yield(para):
-        pid = id(para._p)
-        if pid not in seen:
-            seen.add(pid)
-            return True
-        return False
+    # Define the tags we are looking for
+    P_TAG = qn('w:p')
+    TXBX_TAG = qn('w:txbxContent')
+    SDT_TAG = qn('w:sdtContent')
 
-    # Body paragraphs
-    for para in doc.paragraphs:
-        if _track_and_yield(para):
-            yield para
-
-    # Table cell paragraphs
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for para in cell.paragraphs:
-                    if _track_and_yield(para):
-                        yield para
-
-    # Headers and footers in every section
-    for section in doc.sections:
-        for hf in (section.header, section.footer,
-                    section.first_page_header, section.first_page_footer,
-                    section.even_page_header, section.even_page_footer):
-            try:
-                if hf is None or hf.is_linked_to_previous:
-                    continue
-                for para in hf.paragraphs:
-                    if _track_and_yield(para):
-                        yield para
-                for table in hf.tables:
-                    for row in table.rows:
-                        for cell in row.cells:
-                            for para in cell.paragraphs:
-                                if _track_and_yield(para):
-                                    yield para
-                # Text boxes inside header/footer
-                for txbx in hf._element.iter(qn('w:txbxContent')):
-                    for p_elem in txbx.findall(qn('w:p')):
-                        if id(p_elem) not in seen:
-                            seen.add(id(p_elem))
-                            try:
-                                yield _DocxParagraph(p_elem, doc.part)
-                            except Exception:
-                                pass
-            except Exception:
-                continue
-
-    # Text boxes anywhere in the main document body
-    for txbx in doc.element.iter(qn('w:txbxContent')):
-        for p_elem in txbx.findall(qn('w:p')):
-            if id(p_elem) not in seen:
-                seen.add(id(p_elem))
+    def _yield_from_element(parent_elt):
+        for p_elem in parent_elt.iter(P_TAG):
+            pid = id(p_elem)
+            if pid not in seen:
+                seen.add(pid)
                 try:
                     yield _DocxParagraph(p_elem, doc.part)
                 except Exception:
-                    pass
+                    continue
 
+    # 1. Process Main Body (including Tables and SDTs)
+    yield from _yield_from_element(doc.element.body)
+
+    # 2. Process Headers and Footers 
+    for section in doc.sections:
+        for hf_type in ['header', 'footer', 'first_page_header', 'first_page_footer', 'even_page_header', 'even_page_footer']:
+            hf = getattr(section, hf_type, None)
+            if hf and not (hasattr(hf, 'is_linked_to_previous') and hf.is_linked_to_previous):
+                yield from _yield_from_element(hf._element)
+
+    # 3. Deep search for Text Boxes/Shapes that might be outside the standard flow
+    # This catches text boxes wrapped in VML or DrawingML tags
+    for txbx in doc.element.iter(TXBX_TAG):
+        yield from _yield_from_element(txbx)
 
 # TOC / structural paragraph helpers
 
@@ -332,7 +340,7 @@ def _group_paragraphs(
 
 def translate_docx(input_path: str, output_path: str, translator: Any, target_lang: str, *, cancel_event: threading.Event | None = None, source_lang: str = "auto"):
     # Batch-translate DOCX with contextual paragraph grouping and formatting preservation.
-    # When source_lang=="auto" (multi-language mode) grouping is skipped so each paragraph
+    # When source_lang==="auto" (multi-language mode) grouping is skipped so each paragraph
     # is sent individually and the API can auto-detect per paragraph.
     doc = Document(input_path)
 
