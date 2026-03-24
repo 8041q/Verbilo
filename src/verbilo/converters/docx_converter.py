@@ -1,13 +1,40 @@
-from docx.api import Document
-from docx.oxml.ns import qn
-from docx.text.paragraph import Paragraph as _DocxParagraph
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Callable
 import logging
 import re
 import threading
+
+from lxml import etree
+from docx.api import Document
+from docx.oxml.ns import qn
+from docx.text.paragraph import Paragraph as _DocxParagraph
+
 from ..utils import CancelledError
 
 logger = logging.getLogger(__name__)
+
+
+# ── XML namespace URIs (for lxml-level access to non-python-docx content) ──────
+_NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_NS_VML = "urn:schemas-microsoft-com:vml"
+_REL_FOOTNOTES = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes"
+)
+_REL_ENDNOTES = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes"
+)
+_DIAGRAM_DATA_CT = (
+    "application/vnd.openxmlformats-officedocument.drawingml.diagramData+xml"
+)
+
+
+@dataclass
+class _TranslationUnit:
+    """Uniform container for a text segment to be translated, regardless of origin."""
+    source_text: str
+    is_tagged: bool = False
+    is_heading: bool = False
+    write_back: Callable[[str], None] = field(default=lambda t: None, repr=False)
 
 
 # Run-formatting helpers
@@ -271,6 +298,283 @@ def _get_translatable_runs(para, runs: list) -> list:
     return result if result else runs  # fallback to all runs if no tab found
 
 
+# ── Ancestor helper ────────────────────────────────────────────────────────────
+
+def _has_ancestor_tag(elem, tag) -> bool:
+    """Return True if *elem* has an ancestor element with the given *tag*."""
+    parent = elem.getparent()
+    while parent is not None:
+        if parent.tag == tag:
+            return True
+        parent = parent.getparent()
+    return False
+
+
+# ── Content Collectors ─────────────────────────────────────────────────────────
+# Each collector returns a list of _TranslationUnit objects.  Collectors that
+# access non-XmlPart OPC parts also return a list of (Part, lxml_root) "dirty"
+# pairs whose blobs must be serialised back before Document.save().
+
+def _collect_paragraph_units(doc) -> list[_TranslationUnit]:
+    """Collect TranslationUnits from standard python-docx paragraphs."""
+    units: list[_TranslationUnit] = []
+    for para in _iter_all_paragraphs(doc):
+        all_runs = list(para.runs)
+        if not all_runs:
+            continue
+        runs = _get_translatable_runs(para, all_runs)
+        if not runs:
+            continue
+        full_text, is_tagged = _build_tagged_paragraph(runs)
+        if not full_text or not full_text.strip():
+            continue
+
+        def _make_wb(r, t):
+            return lambda translated: _redistribute_translated(r, translated, is_tagged=t)
+
+        units.append(_TranslationUnit(
+            source_text=full_text,
+            is_tagged=is_tagged,
+            is_heading=_is_heading(para),
+            write_back=_make_wb(runs, is_tagged),
+        ))
+    return units
+
+
+def _collect_footnote_endnote_units(doc):
+    """Collect TranslationUnits from footnotes and endnotes.
+
+    Returns ``(units, dirty_parts)``; *dirty_parts* is a list of
+    ``(Part, lxml_root)`` tuples whose blobs must be serialised before save
+    when the part is a plain OPC Part (not an XmlPart with a live element tree).
+    """
+    units: list[_TranslationUnit] = []
+    dirty_parts: list[tuple] = []
+
+    for rel_type in (_REL_FOOTNOTES, _REL_ENDNOTES):
+        try:
+            part = doc.part.part_related_by(rel_type)
+        except (KeyError, ValueError):
+            continue
+
+        # Live XML tree (XmlPart) or parsed from blob (plain Part)
+        root = getattr(part, '_element', None)
+        if root is None:
+            blob = getattr(part, 'blob', None)
+            if not blob:
+                continue
+            root = etree.fromstring(blob)
+            dirty_parts.append((part, root))
+
+        W_P = qn('w:p')
+        W_ID = qn('w:id')
+
+        for note_elem in root:
+            note_id = note_elem.get(W_ID)
+            if note_id in ('0', '1', '-1'):
+                continue  # separator / continuation separator
+
+            for p_elem in note_elem.iter(W_P):
+                try:
+                    para = _DocxParagraph(p_elem, doc.part)
+                except Exception:
+                    continue
+
+                all_runs = list(para.runs)
+                if not all_runs:
+                    continue
+                full_text, is_tagged = _build_tagged_paragraph(all_runs)
+                if not full_text or not full_text.strip():
+                    continue
+
+                def _make_wb(r, t):
+                    return lambda translated: _redistribute_translated(
+                        r, translated, is_tagged=t,
+                    )
+
+                units.append(_TranslationUnit(
+                    source_text=full_text,
+                    is_tagged=is_tagged,
+                    write_back=_make_wb(all_runs, is_tagged),
+                ))
+
+    return units, dirty_parts
+
+
+def _collect_drawingml_units(doc) -> list[_TranslationUnit]:
+    """Collect TranslationUnits from DrawingML ``<a:p>`` paragraphs.
+
+    Skips any ``<a:p>`` inside ``<w:txbxContent>`` (already handled by
+    the python-docx paragraph pipeline).
+    """
+    units: list[_TranslationUnit] = []
+    A_P_TAG = f'{{{_NS_A}}}p'
+    A_T_TAG = f'{{{_NS_A}}}t'
+    TXBX_TAG = qn('w:txbxContent')
+
+    seen: set[int] = set()
+
+    search_roots = [doc.element]
+    for section in doc.sections:
+        for hf_type in ('header', 'footer', 'first_page_header', 'first_page_footer',
+                         'even_page_header', 'even_page_footer'):
+            hf = getattr(section, hf_type, None)
+            if hf and not (hasattr(hf, 'is_linked_to_previous') and hf.is_linked_to_previous):
+                search_roots.append(hf._element)
+
+    for root_elem in search_roots:
+        for ap_elem in root_elem.iter(A_P_TAG):
+            ap_id = id(ap_elem)
+            if ap_id in seen:
+                continue
+            seen.add(ap_id)
+
+            if _has_ancestor_tag(ap_elem, TXBX_TAG):
+                continue
+
+            all_at = list(ap_elem.iter(A_T_TAG))
+            if not all_at:
+                continue
+            full_text = "".join((e.text or "") for e in all_at)
+            if not full_text.strip():
+                continue
+
+            text_at = [e for e in all_at if e.text and e.text.strip()]
+            orig_lens = [max(len((e.text or "").strip()), 1) for e in text_at]
+
+            def _make_wb(t_elems, a_elems, olens):
+                def wb(translated):
+                    if len(t_elems) <= 1:
+                        target = t_elems[0] if t_elems else (a_elems[0] if a_elems else None)
+                        if target is not None:
+                            target.text = translated
+                        for e in a_elems:
+                            if e is not target:
+                                e.text = ""
+                    else:
+                        words = translated.split()
+                        if not words:
+                            for e in t_elems:
+                                e.text = ""
+                            return
+                        total = sum(olens)
+                        assigned = 0
+                        for j, e in enumerate(t_elems):
+                            if j == len(t_elems) - 1:
+                                e.text = " ".join(words[assigned:])
+                            else:
+                                prop = olens[j] / total
+                                n = max(1, round(prop * len(words)))
+                                end = min(assigned + n, len(words))
+                                e.text = " ".join(words[assigned:end])
+                                if end < len(words):
+                                    e.text += " "
+                                assigned = end
+                        for e in a_elems:
+                            if e not in t_elems:
+                                e.text = ""
+                return wb
+
+            units.append(_TranslationUnit(
+                source_text=full_text,
+                write_back=_make_wb(text_at, all_at, orig_lens),
+            ))
+
+    return units
+
+
+def _collect_smartart_units(doc):
+    """Collect TranslationUnits from SmartArt diagram data parts.
+
+    Returns ``(units, dirty_parts)``.
+    """
+    units: list[_TranslationUnit] = []
+    dirty_parts: list[tuple] = []
+    A_T_TAG = f'{{{_NS_A}}}t'
+
+    try:
+        parts_iter = doc.part.package.iter_parts()
+    except Exception:
+        return units, dirty_parts
+
+    for part in parts_iter:
+        ct = getattr(part, 'content_type', '')
+        if ct != _DIAGRAM_DATA_CT:
+            continue
+
+        root = getattr(part, '_element', None)
+        if root is None:
+            blob = getattr(part, 'blob', None)
+            if not blob:
+                continue
+            root = etree.fromstring(blob)
+            dirty_parts.append((part, root))
+
+        for at_elem in root.iter(A_T_TAG):
+            text = at_elem.text
+            if not text or not text.strip():
+                continue
+
+            def _make_wb(e):
+                def wb(translated):
+                    e.text = translated
+                return wb
+
+            units.append(_TranslationUnit(
+                source_text=text,
+                write_back=_make_wb(at_elem),
+            ))
+
+    return units, dirty_parts
+
+
+def _collect_vml_units(doc) -> list[_TranslationUnit]:
+    """Collect TranslationUnits from legacy VML ``<v:textpath>`` elements.
+
+    Skips elements inside ``<w:txbxContent>`` (already handled by the
+    python-docx paragraph pipeline).
+    """
+    units: list[_TranslationUnit] = []
+    TEXTPATH_TAG = f'{{{_NS_VML}}}textpath'
+    TXBX_TAG = qn('w:txbxContent')
+
+    seen: set[int] = set()
+
+    search_roots = [doc.element]
+    for section in doc.sections:
+        for hf_type in ('header', 'footer', 'first_page_header', 'first_page_footer',
+                         'even_page_header', 'even_page_footer'):
+            hf = getattr(section, hf_type, None)
+            if hf and not (hasattr(hf, 'is_linked_to_previous') and hf.is_linked_to_previous):
+                search_roots.append(hf._element)
+
+    for root_elem in search_roots:
+        for tp_elem in root_elem.iter(TEXTPATH_TAG):
+            tp_id = id(tp_elem)
+            if tp_id in seen:
+                continue
+            seen.add(tp_id)
+
+            if _has_ancestor_tag(tp_elem, TXBX_TAG):
+                continue
+
+            text = tp_elem.get('string', '')
+            if not text or not text.strip():
+                continue
+
+            def _make_wb(e):
+                def wb(translated):
+                    e.set('string', translated)
+                return wb
+
+            units.append(_TranslationUnit(
+                source_text=text,
+                write_back=_make_wb(tp_elem),
+            ))
+
+    return units
+
+
 
 # Paragraph grouping for contextual translation
 
@@ -336,102 +640,205 @@ def _group_paragraphs(
     return groups
 
 
-# Main entry point
+def _group_units(
+    units: list[_TranslationUnit],
+    *,
+    auto_detect: bool,
+) -> list[list[int]]:
+    """Group TranslationUnit indices for contextual translation.
 
-def translate_docx(input_path: str, output_path: str, translator: Any, target_lang: str, *, cancel_event: threading.Event | None = None, source_lang: str = "auto"):
-    # Batch-translate DOCX with contextual paragraph grouping and formatting preservation.
-    # When source_lang==="auto" (multi-language mode) grouping is skipped so each paragraph
-    # is sent individually and the API can auto-detect per paragraph.
-    doc = Document(input_path)
+    Same rules as ``_group_paragraphs`` but operates on ``_TranslationUnit``
+    objects instead of raw tuples.
+    """
+    if auto_detect:
+        return [[i] for i in range(len(units))]
 
-    # --- Collect paragraph texts (one entry per paragraph) ---
-    para_infos: list[tuple] = []
-    para_texts: list[str] = []
+    groups: list[list[int]] = []
+    current: list[int] = []
+    current_chars = 0
 
-    for para in _iter_all_paragraphs(doc):
-        all_runs = list(para.runs)
-        if not all_runs:
+    for i, unit in enumerate(units):
+        text_len = len(unit.source_text)
+
+        if unit.is_heading:
+            if current:
+                groups.append(current)
+                current = []
+                current_chars = 0
+            groups.append([i])
             continue
-        # For TOC entries, only translate runs before the tab+page-number
-        runs = _get_translatable_runs(para, all_runs)
-        if not runs:
-            continue
-        full_text, is_tagged = _build_tagged_paragraph(runs)
-        if not full_text or not full_text.strip():
-            continue
-        para_infos.append((para, runs, full_text, is_tagged))
-        para_texts.append(full_text)
 
-    if not para_texts:
-        doc.save(output_path)
-        return
+        if current and (
+            len(current) >= _GROUP_MAX_PARAS
+            or current_chars + text_len > _GROUP_MAX_CHARS
+        ):
+            groups.append(current)
+            current = []
+            current_chars = 0
 
-    # --- Group paragraphs for contextual translation ---
-    # In auto-detect mode do NOT group paragraphs — each paragraph is its own unit
-    # so the translation API sees one language at a time and can auto-detect correctly.
-    if source_lang == "auto":
-        groups = [[i] for i in range(len(para_infos))]
-    else:
-        groups = _group_paragraphs(para_infos, para_texts)
+        current.append(i)
+        current_chars += text_len
 
-    # Build translation units: join grouped paragraphs with separator
-    units: list[str] = []
+    if current:
+        groups.append(current)
+
+    return groups
+
+
+def _translate_and_writeback(
+    units: list[_TranslationUnit],
+    groups: list[list[int]],
+    translator,
+    target_lang: str,
+    cancel_event: threading.Event | None,
+) -> int:
+    """Translate grouped units via *translator* and invoke each unit's write_back.
+
+    Returns the number of failed paragraphs.
+    """
+    # Build translation strings (join grouped units with separator)
+    batch: list[str] = []
     for group in groups:
         if len(group) == 1:
-            units.append(para_texts[group[0]])
+            batch.append(units[group[0]].source_text)
         else:
-            units.append(_PARA_SEP.join(para_texts[idx] for idx in group))
+            batch.append(_PARA_SEP.join(units[idx].source_text for idx in group))
 
-    # --- Batch-translate all units ---
+    # Batch translate
     try:
-        translated_units = translator.translate_batch(units, target_lang, cancel_event=cancel_event)
+        translated = translator.translate_batch(
+            batch, target_lang, cancel_event=cancel_event,
+        )
     except CancelledError:
         raise
     except Exception:
-        logger.exception("Batch translation failed for DOCX; falling back to per-item")
-        translated_units = []
-        for t in units:
+        logger.exception("Batch translation failed; falling back to per-item")
+        translated = []
+        for t in batch:
             try:
                 r = translator.translate_text(t, target_lang)
-                translated_units.append(r if r is not None else t)
+                translated.append(r if r is not None else t)
             except Exception:
                 logger.exception("Per-item fallback also failed")
-                translated_units.append(t)
+                translated.append(t)
 
-    # --- Split grouped results and write back into runs ---
+    # Write back translated text into the document
     errors = 0
-    for group, tr_unit in zip(groups, translated_units):
-        if tr_unit is None:
+    for group, tr_text in zip(groups, translated):
+        if tr_text is None:
             errors += 1
             continue
 
         if len(group) == 1:
-            # Single paragraph — direct assignment
-            para, runs, orig_text, is_tagged = para_infos[group[0]]
-            _redistribute_translated(runs, tr_unit, is_tagged=is_tagged)
+            units[group[0]].write_back(tr_text)
         else:
-            # Split on separator to recover per-paragraph translations
-            parts = tr_unit.split(_PARA_SEP)
+            parts = tr_text.split(_PARA_SEP)
             if len(parts) == len(group):
                 for idx, part in zip(group, parts):
-                    para, runs, orig_text, is_tagged = para_infos[idx]
-                    _redistribute_translated(runs, part.strip() if part else orig_text, is_tagged=is_tagged)
+                    units[idx].write_back(
+                        part.strip() if part else units[idx].source_text,
+                    )
             else:
-                # Separator mangled — fall back to individual paragraph translation
                 logger.debug(
-                    "DOCX paragraph separator mismatch: expected %d, got %d; per-para fallback",
+                    "Separator mismatch: expected %d, got %d; per-unit fallback",
                     len(group), len(parts),
                 )
                 for idx in group:
-                    para, runs, orig_text, is_tagged = para_infos[idx]
                     try:
-                        r = translator.translate_text(orig_text, target_lang)
-                        _redistribute_translated(runs, r if r is not None else orig_text, is_tagged=is_tagged)
+                        r = translator.translate_text(
+                            units[idx].source_text, target_lang,
+                        )
+                        units[idx].write_back(
+                            r if r is not None else units[idx].source_text,
+                        )
                     except Exception:
-                        logger.exception("Per-paragraph fallback failed")
+                        logger.exception("Per-unit fallback failed")
                         errors += 1
 
-    # Check for cancellation before saving
+    return errors
+
+
+# Main entry point
+
+def translate_docx(input_path: str, output_path: str, translator: Any, target_lang: str, *, cancel_event: threading.Event | None = None, source_lang: str = "auto"):
+    """Batch-translate DOCX with formatting preservation.
+
+    Extracts text from paragraphs (incl. tables, headers/footers, text boxes),
+    footnotes/endnotes, DrawingML shapes, SmartArt diagrams, and legacy VML.
+    When ``source_lang=="auto"`` grouping is skipped so each unit is sent
+    individually and the API can auto-detect per unit.
+    """
+    doc = Document(input_path)
+    auto_detect = source_lang == "auto"
+
+    # ── Phase 1: python-docx paragraphs (body, tables, headers, text boxes) ──
+    pdocx_units = _collect_paragraph_units(doc)
+
+    # ── Phases 2–5: lxml-level content (isolated error handling) ─────────────
+    lxml_pools: list[list[_TranslationUnit]] = []
+    dirty_parts: list[tuple] = []  # (Part, lxml_root) to serialise before save
+
+    for collector_name, collector_fn in (
+        ("footnotes/endnotes", lambda: _collect_footnote_endnote_units(doc)),
+        ("SmartArt", lambda: _collect_smartart_units(doc)),
+    ):
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError("Translation cancelled during extraction")
+        try:
+            pool, dp = collector_fn()
+            if pool:
+                lxml_pools.append(pool)
+            dirty_parts.extend(dp)
+        except CancelledError:
+            raise
+        except Exception:
+            logger.warning("Failed to extract %s; skipping", collector_name, exc_info=True)
+
+    for collector_name, collector_fn in (
+        ("DrawingML", lambda: _collect_drawingml_units(doc)),
+        ("VML", lambda: _collect_vml_units(doc)),
+    ):
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError("Translation cancelled during extraction")
+        try:
+            pool = collector_fn()
+            if pool:
+                lxml_pools.append(pool)
+        except CancelledError:
+            raise
+        except Exception:
+            logger.warning("Failed to extract %s; skipping", collector_name, exc_info=True)
+
+    # ── Nothing to translate → save unchanged ────────────────────────────────
+    if not pdocx_units and not lxml_pools:
+        doc.save(output_path)
+        return
+
+    errors = 0
+
+    # ── Translate python-docx paragraph units ────────────────────────────────
+    if pdocx_units:
+        groups = _group_units(pdocx_units, auto_detect=auto_detect)
+        errors += _translate_and_writeback(
+            pdocx_units, groups, translator, target_lang, cancel_event,
+        )
+
+    # ── Translate each lxml pool separately ──────────────────────────────────
+    for pool in lxml_pools:
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError("Translation cancelled between pools")
+        groups = _group_units(pool, auto_detect=auto_detect)
+        errors += _translate_and_writeback(
+            pool, groups, translator, target_lang, cancel_event,
+        )
+
+    # ── Serialise modified non-XmlPart blobs back to their OPC parts ─────────
+    for part, root in dirty_parts:
+        part._blob = etree.tostring(
+            root, xml_declaration=True, encoding="UTF-8", standalone=True,
+        )
+
+    # ── Final cancellation check before saving ───────────────────────────────
     if cancel_event is not None and cancel_event.is_set():
         raise CancelledError("Translation cancelled before saving DOCX")
 

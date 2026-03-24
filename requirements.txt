@@ -1,6 +1,7 @@
 # Generated from pyproject.toml via: poetry export -f requirements.txt --without dev --output requirements.txt
 # Do not edit manually.
 python-docx==0.8.11
+lxml>=4.9
 openpyxl==3.1.2
 PyMuPDF==1.27.2
 pymupdf-fonts==1.0.5
