@@ -106,7 +106,7 @@ _AZURE_LANG_CODES: frozenset[str] = frozenset({
     "zh", "zu", "zh-CN", "zh-TW",
 })
 
-# ISO 639-1 codes supported by DeepL Free.
+# ISO 639-1 codes supported by DeepL
 _DEEPL_LANG_CODES: frozenset[str] = frozenset({
     "ar", "bg", "cs", "da", "de", "el", "en", "es", "et", "fi",
     "fr", "hu", "id", "it", "ja", "ko", "lt", "lv", "nb", "no",
@@ -121,7 +121,7 @@ _ENGINE_OPTIONS: list[tuple[str, str]] = [
     ("Google Cloud API (v3)",    "google-cloud-v3"),
     ("Baidu Translate",          "baidu"),
     ("Microsoft Azure",          "azure"),
-    ("DeepL Free",               "deepl"),
+    ("DeepL",               "deepl"),
     ("Local (Offline)",          "local"),
 ]
 _ENGINE_DISPLAY = [name for name, _ in _ENGINE_OPTIONS]
@@ -151,7 +151,6 @@ def _filter_by_engine(
         "baidu-premium":   _BAIDU_LANG_CODES,
         "azure":           _AZURE_LANG_CODES,
         "deepl":           _DEEPL_LANG_CODES,
-        "deepl-free":      _DEEPL_LANG_CODES,
         "deepl-pro":       _DEEPL_LANG_CODES,
     }
     codes = _ENGINE_CODES.get(engine)
@@ -1058,18 +1057,6 @@ class App:
         self.source_lang_box.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 2))
         row += 1
 
-        # Inline note — visible only when local engine + fixed source selected
-        self._local_pair_note = theme.make_label(
-            self.sidebar,
-            "One model per source\u2009\u2192\u2009target pair.",
-            level="tiny",
-            text_color=p.text_muted,
-        )
-        self._local_pair_note_row = row
-        row += 1
-        # Hidden by default
-        self._local_pair_note.grid_remove()
-
         # Listen for source-language changes (filters target list for local engine)
         self.source_lang_var.trace_add("write", self._on_source_lang_changed)
 
@@ -1129,38 +1116,7 @@ class App:
         self._engine_usage_label.grid(**self._engine_usage_label_grid_kw)
         row += 1
         self._update_usage_label(_ENGINE_MAP.get(default_engine_display, "google"))
-
-        # Local model directory — only visible when "Local (Offline)" engine selected
-        _lm_bg = p.bg_sidebar
-        self._local_model_frame = tk.Frame(
-            self.sidebar, bg=_lm_bg, bd=0, highlightthickness=0,
-        )
-        self._local_model_frame.columnconfigure(0, weight=1)
-        self._local_model_frame.columnconfigure(1, weight=0)
-        self._local_model_frame_row = row
-        row += 1
-
-        self._local_model_label = theme.make_label(
-            self._local_model_frame, "Model folder", level="small",
-        )
-        self._local_model_label.grid(row=0, column=0, columnspan=2, sticky="w", pady=(6, 2))
-
-        saved_model_dir = self.cfg.get("local_model_dir", "")
-        self._local_model_entry = theme.make_entry(self._local_model_frame, height=32)
-        if saved_model_dir:
-            self._local_model_entry.insert(0, saved_model_dir)
-        self._local_model_entry.grid(row=1, column=0, sticky="ew", pady=(0, 4))
-
-        browse_model_icon = get_icon("folder", size=16, on_accent=False)
-        self._local_model_browse_btn = theme.make_button(
-            self._local_model_frame, "", command=self._select_model_dir, style="secondary",
-            image=browse_model_icon, height=30, width=40,
-        )
-        self._local_model_browse_btn.grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(0, 4))
-
-        # Show/hide local model widgets based on current engine
-        self._toggle_local_model_widgets(saved_engine == "local")
-        
+      
         # Spacer row (pushes everything to bottom)
         self.sidebar.grid_rowconfigure(row, weight=1)
         row += 1
@@ -1950,7 +1906,7 @@ class App:
         _rrow += 1
 
         # DeepL section
-        theme.make_label(right, "DEEPL FREE", level="section").grid(
+        theme.make_label(right, "DeepL", level="section").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 6),
         )
         _rrow += 1
@@ -2871,15 +2827,9 @@ class App:
         save_config(self.cfg)
         self._log(f"Translation engine changed to: {engine_key!r}")
         self._update_usage_label(engine_key)
-        self._toggle_local_model_widgets(engine_key == "local")
-        self._update_local_pair_note()
 
     def _on_source_lang_changed(self, *_) -> None:
         # Re-filter the target list when source changes (local engine only)
-        engine_key = _ENGINE_MAP.get(self.engine_var.get(), "google")
-        if engine_key != "local":
-            self._update_local_pair_note()
-            return
         from ..translators.local import list_downloaded_pairs
         model_dir = _get_local_model_dir_from_cfg(self.cfg)
         pairs = list_downloaded_pairs(model_dir)
@@ -2901,37 +2851,6 @@ class App:
         tgt_display = [f"{name} ({code})" for code, name in tgt_filtered]
         self._lang_map = {f"{name} ({code})": code for code, name in tgt_filtered}
         self.target_lang_box.update_values(tgt_display)
-        self._update_local_pair_note()
-
-    def _update_local_pair_note(self) -> None:
-        # Show/hide the 'one model per pair' note below the source dropdown
-        engine_key = _ENGINE_MAP.get(self.engine_var.get(), "google")
-        if engine_key == "local":
-            self._local_pair_note.grid(
-                row=self._local_pair_note_row, column=0, sticky="w",
-                padx=theme.PADDING, pady=(0, 4),
-            )
-        else:
-            self._local_pair_note.grid_remove()
-
-    def _toggle_local_model_widgets(self, show: bool) -> None:
-        pad = theme.PADDING
-        if show:
-            self._local_model_frame.grid(
-                row=self._local_model_frame_row, column=0, sticky="ew", padx=pad, pady=(0, 4))
-        else:
-            self._local_model_frame.grid_remove()
-
-    def _select_model_dir(self):
-        current = self._local_model_entry.get().strip()
-        init = current if current and Path(current).is_dir() else None
-        d = filedialog.askdirectory(
-            title="Select OPUS-MT models folder", parent=self.root, initialdir=init)
-        if d:
-            self._local_model_entry.delete(0, tk.END)
-            self._local_model_entry.insert(0, d)
-            self.cfg["local_model_dir"] = d
-            save_config(self.cfg)
 
     def _update_usage_label(self, engine_key: str) -> None:
         # Update the small quota label below the engine dropdown
@@ -3104,7 +3023,7 @@ class App:
         azure_key = self.cfg.get("azure_key", "")
         azure_region = self.cfg.get("azure_region", "")
         deepl_api_key = self.cfg.get("deepl_api_key", "")
-        local_model_dir = self._local_model_entry.get().strip()
+        local_model_dir = _get_local_model_dir_from_cfg(self.cfg)
 
         # Validate credentials for engines that require them
         if engine == "baidu" and (not baidu_appid or not baidu_appkey):
@@ -3139,8 +3058,8 @@ class App:
         if engine == "deepl" and not deepl_api_key:
             messagebox.showwarning(
                 "Missing API key",
-                "DeepL Free requires an API Key.\n"
-                "Please configure it in Settings \u2192 DeepL Free.",
+                "DeepL requires an API Key.\n"
+                "Please configure it in Settings \u2192 DeepL.",
             )
             return
 
