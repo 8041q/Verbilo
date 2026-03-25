@@ -40,11 +40,14 @@ DEFAULT_INPUT_FOLDER = "Input"
 
 
 def _try_make_relative(absolute_path: str) -> str:
-    # Return a path relative to cwd if possible, otherwise return the original.
+    repo_root = Path(__file__).resolve().parents[3]
     try:
-        return str(Path(absolute_path).relative_to(Path.cwd()))
-    except ValueError:
-        return absolute_path
+        return str(Path(absolute_path).resolve().relative_to(repo_root))
+    except Exception:
+        try:
+            return os.path.relpath(str(Path(absolute_path).resolve()), str(repo_root))
+        except Exception:
+            return absolute_path
 
 # --- language helpers ---
 
@@ -921,6 +924,12 @@ class App:
                 if f not in self.files:
                     self._add_file_to_table(f)
 
+        # Apply saved translation engine so language dropdowns reflect it
+        try:
+            self._on_engine_changed()
+        except Exception:
+            logger.exception("Failed to apply saved translation engine on startup")
+
     # --- directory helpers ---
 
     def _set_button_disabled(self, button: object, disabled: bool) -> None:
@@ -933,16 +942,24 @@ class App:
             pass
 
     def _initialdir_for_input(self) -> str:
+        repo_root = Path(__file__).resolve().parents[3]
+        candidate = None
         try:
-            if self.files:
-                return str(Path(self.files[0]).parent.resolve())
+            if hasattr(self, "output_entry"):
+                val = self.output_entry.get().strip()
+                if val:
+                    p = Path(val)
+                    candidate = p.resolve() if p.is_absolute() else (repo_root / p).resolve()
         except Exception:
             pass
-        if self.cfg.get("default_input"):
-            val = self.cfg["default_input"]
-            p = Path(val)
-            return str(p.resolve() if p.is_absolute() else (Path.cwd() / p).resolve())
-        return str(Path.cwd())
+        if candidate is None and self.cfg.get("default_output"):
+            candidate = (repo_root / self.cfg["default_output"]).resolve()
+        if candidate is None:
+            candidate = repo_root
+        # Walk up to the nearest existing ancestor so the file dialog has a valid start dir.
+        while not candidate.exists() and candidate.parent != candidate:
+            candidate = candidate.parent
+        return str(candidate)
 
     def _initialdir_for_output(self) -> str:
         candidate = None
@@ -2050,6 +2067,14 @@ class App:
             self.cfg["azure_region"] = azure_region_entry.get().strip()
             self.cfg["deepl_api_key"] = deepl_key_entry.get().strip()
             save_config(self.cfg)
+
+            # Refresh engine-dependent UI after config changes
+            try:
+                self._refresh_language_dropdowns()
+                self._update_usage_label(_ENGINE_MAP.get(self.engine_var.get(), "google"))
+            except Exception:
+                logger.exception("Failed to refresh language dropdowns after saving settings")
+
             try:
                 self._apply_debug_mode()
             except Exception:
@@ -2829,7 +2854,11 @@ class App:
         self._update_usage_label(engine_key)
 
     def _on_source_lang_changed(self, *_) -> None:
-        # Re-filter the target list when source changes (local engine only)
+        # Only local engine uses source-based target filtering.
+        engine_key = _ENGINE_MAP.get(self.engine_var.get(), "google")
+        if engine_key != "local":
+            return
+
         from ..translators.local import list_downloaded_pairs
         model_dir = _get_local_model_dir_from_cfg(self.cfg)
         pairs = list_downloaded_pairs(model_dir)
@@ -2838,10 +2867,8 @@ class App:
         source_code = self._source_lang_map.get(self.source_lang_var.get())
 
         if not source_code:
-            # No source selected yet — show all targets from any pair
             tgt_codes = {_opus_code_to_iso(t) for _, t in pairs}
         else:
-            # Show only targets reachable from the selected source
             tgt_codes = set()
             for s, t in pairs:
                 if _opus_code_to_iso(s) == source_code:
@@ -2992,11 +3019,12 @@ class App:
             source_lang = self._source_lang_map.get(typed, "auto")
 
         # Resolve output path; relative paths are resolved against cwd and auto-created
+        repo_root = Path(__file__).resolve().parents[3]
         output = self.output_entry.get().strip() or DEFAULT_OUTPUT_FOLDER
         out_path = Path(output)
         is_relative = not out_path.is_absolute()
         if is_relative:
-            out_path = Path.cwd() / out_path
+            out_path = (repo_root / out_path).resolve()
         if not out_path.exists():
             if is_relative:
                 out_path.mkdir(parents=True, exist_ok=True)

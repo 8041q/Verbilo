@@ -304,28 +304,46 @@ def _fix_table_row_heights(root: etree._Element) -> None:
 
 
 def _fix_textbox_autofit(root: etree._Element) -> None:
-    """Enable auto-fit (``spAutoFit``) on text-box body properties where the
-    translated text might overflow the original fixed size.
+    """Enable shape auto-fit (``spAutoFit``) on text-box body properties where
+    the translated text might overflow the original fixed size.
 
-    A ``<a:bodyPr>`` with no resize child — or with ``<a:noAutofit/>`` — will
-    clip text that is longer than the box.  We replace ``noAutofit`` with
-    ``normAutofit`` so the text box grows vertically to fit its translated
-    content.  We leave ``spAutoFit`` (shape auto-fit) alone because it already
-    works correctly.
+    Handles both ``<a:bodyPr>`` (DrawingML shapes / SmartArt) and
+    ``<wps:bodyPr>`` (modern Word text boxes via the wordprocessingShape
+    namespace).  Each can carry one of three resize-mode children:
+
+    * ``<a:noAutofit/>``  — clip text to the fixed box size  ← fixed ✗
+    * ``<a:normAutofit/>`` — shrink font to fit the box        ← shrinks text ✗
+    * ``<a:spAutoFit/>``  — grow the shape to fit the text    ← correct ✓
+    * (no child)           — Word defaults to clip behaviour  ← also fixed ✗
+
+    We replace ``noAutofit`` / ``normAutofit`` with ``spAutoFit`` and inject
+    ``spAutoFit`` where no child exists, so the text box always expands to
+    accommodate the (usually longer) translated text.
     """
+    _NS_WPS      = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
     A_BODY_PR    = f'{{{_NS_A}}}bodyPr'
+    WPS_BODY_PR  = f'{{{_NS_WPS}}}bodyPr'
     A_NO_AUTOFIT = f'{{{_NS_A}}}noAutofit'
     A_NORM_AUTO  = f'{{{_NS_A}}}normAutofit'
     A_SP_AUTO    = f'{{{_NS_A}}}spAutoFit'
+    _AUTOFIT_TAGS = {A_NO_AUTOFIT, A_NORM_AUTO, A_SP_AUTO}
 
-    for body_pr in root.iter(A_BODY_PR):
-        no_fit = body_pr.find(A_NO_AUTOFIT)
-        if no_fit is not None:
-            idx = list(body_pr).index(no_fit)
-            body_pr.remove(no_fit)
-            norm = etree.Element(A_NORM_AUTO)
-            body_pr.insert(idx, norm)
-            logger.debug("Replaced noAutofit → normAutofit in text-box bodyPr")
+    for body_pr in [*root.iter(A_BODY_PR), *root.iter(WPS_BODY_PR)]:
+        # Find any existing autofit child
+        existing = next(
+            (child for child in body_pr if child.tag in _AUTOFIT_TAGS), None
+        )
+        if existing is None:
+            # No autofit child — Word silently clips.  Inject spAutoFit.
+            body_pr.append(etree.Element(A_SP_AUTO))
+            logger.debug("Injected spAutoFit into text-box bodyPr (was missing)")
+        elif existing.tag == A_SP_AUTO:
+            pass  # Already correct
+        else:
+            idx = list(body_pr).index(existing)
+            body_pr.remove(existing)
+            body_pr.insert(idx, etree.Element(A_SP_AUTO))
+            logger.debug("Replaced %s → spAutoFit in text-box bodyPr", existing.tag)
 
 
 def _fix_frame_autosize(root: etree._Element) -> None:
@@ -340,6 +358,229 @@ def _fix_frame_autosize(root: etree._Element) -> None:
         if fp.get(H_RULE, '').lower() == 'exact':
             fp.set(H_RULE, 'atLeast')
             logger.debug("Relaxed framePr exact height → atLeast")
+
+
+def _fix_vml_textbox_autosize(root: etree._Element) -> None:
+    """Allow legacy VML text boxes to grow to fit translated (longer) text.
+
+    VML shapes use a ``style`` attribute on ``<v:shape>`` that carries
+    CSS-like ``key:value`` pairs separated by semicolons.  The property
+    ``mso-fit-shape-to-text:t`` tells Word to expand the shape height to fit
+    its content.  If it is absent or set to ``f`` (false) the shape clips.
+
+    We walk up from every ``<v:textbox>`` to its parent ``<v:shape>`` and
+    set / insert ``mso-fit-shape-to-text:t``.
+    """
+    V_TEXTBOX = f'{{{_NS_VML}}}textbox'
+    V_SHAPE   = f'{{{_NS_VML}}}shape'
+
+    for textbox in root.iter(V_TEXTBOX):
+        shape = textbox.getparent()
+        if shape is None or shape.tag != V_SHAPE:
+            continue
+
+        style = shape.get('style', '')
+        # Parse into an ordered list of (key, value) pairs
+        parts = [p.strip() for p in style.split(';') if p.strip()]
+        pairs: list[tuple[str, str]] = []
+        for part in parts:
+            if ':' in part:
+                k, _, v = part.partition(':')
+                pairs.append((k.strip(), v.strip()))
+            else:
+                pairs.append((part, ''))
+
+        # Replace or append mso-fit-shape-to-text
+        updated = False
+        new_pairs: list[tuple[str, str]] = []
+        for k, v in pairs:
+            if k.lower() == 'mso-fit-shape-to-text':
+                new_pairs.append((k, 't'))
+                updated = True
+            else:
+                new_pairs.append((k, v))
+        if not updated:
+            new_pairs.append(('mso-fit-shape-to-text', 't'))
+
+        new_style = ';'.join(
+            f'{k}:{v}' if v else k for k, v in new_pairs
+        )
+        shape.set('style', new_style)
+        logger.debug("Set mso-fit-shape-to-text:t on VML shape")
+
+
+def _expand_textbox_widths(root: etree._Element, expansion_ratio: float = 1.0) -> None:
+    """Widen label-sized DrawingML/WPS text boxes to reduce unwanted line-wrapping.
+
+    For CJK→Latin translation a phrase like "使用说明书" (5 chars) becomes
+    "User instructions" (17 chars).  Because CJK characters render at ~1 em
+    width and Latin characters at ~0.55 em on average, the translated text
+    needs roughly ``expansion_ratio × 0.45`` times the original box width.
+    ``spAutoFit`` handles vertical overflow when text wraps, but widening the
+    box first lets short labels stay on a single line.
+
+    Only narrow boxes (≤ ~2.2 in / 2 000 000 EMU) are widened — these are
+    labels and callouts.  Wide content boxes already have room and rely on
+    ``spAutoFit`` for vertical growth.
+
+    Shapes covered:
+    * ``<wps:wsp>`` containing ``<wps:txbx>`` — modern Word text boxes
+    * ``<a:sp>`` containing ``<a:txBody>``    — DrawingML shapes with text
+
+    Both the shape extents and the enclosing ``<wp:anchor>``/``<wp:inline>``
+    ``<wp:extent cx>`` are updated so Word does not clip at the container boundary.
+    """
+    _NS_WPS    = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
+    WPS_WSP    = f'{{{_NS_WPS}}}wsp'
+    WPS_SPR    = f'{{{_NS_WPS}}}spPr'
+    WPS_TXB    = f'{{{_NS_WPS}}}txbx'
+    A_SP       = f'{{{_NS_A}}}sp'
+    A_TXBOD    = f'{{{_NS_A}}}txBody'
+    A_SP_PR    = f'{{{_NS_A}}}spPr'
+    A_XFRM     = f'{{{_NS_A}}}xfrm'
+    A_EXT      = f'{{{_NS_A}}}ext'
+    WP_ANCHOR  = f'{{{_WP_NS}}}anchor'
+    WP_INLINE  = f'{{{_WP_NS}}}inline'
+    WP_EXT     = f'{{{_WP_NS}}}extent'
+
+    # Only expand label-sized boxes; large content boxes grow vertically instead.
+    LABEL_MAX_CX = 2_000_000   # ~2.2 inches in EMU
+    MAX_INCREASE = 1_200_000   # ~1.3 inches maximum extra width
+
+    # Width expansion factor.
+    # At expansion_ratio=1 (no change) the factor stays at 1.0 (no expansion).
+    # For CJK→Latin with typical ratio 2.5–3.5 this gives factor ~1.7–2.0,
+    # i.e. up to double the original width for small labels.
+    if expansion_ratio <= 1.0:
+        return  # Nothing to expand
+    width_factor = min(1.0 + (expansion_ratio - 1.0) * 0.45, 2.0)
+
+    def _expand_cx(elem: etree._Element) -> None:
+        try:
+            cx = int(elem.get('cx', 0))
+        except ValueError:
+            return
+        if cx <= 0 or cx > LABEL_MAX_CX:
+            return  # Skip very large (content) boxes
+        increase = min(int(cx * (width_factor - 1.0)), MAX_INCREASE)
+        if increase > 0:
+            elem.set('cx', str(cx + increase))
+
+    def _container_extent(shape_elem: etree._Element) -> etree._Element | None:
+        """Walk up to the enclosing wp:anchor / wp:inline and return its extent."""
+        node = shape_elem.getparent()
+        while node is not None:
+            if node.tag in (WP_ANCHOR, WP_INLINE):
+                return node.find(WP_EXT)
+            node = node.getparent()
+        return None
+
+    # WPS text boxes: <wps:wsp> with <wps:txbx>
+    for wsp in root.iter(WPS_WSP):
+        if wsp.find(WPS_TXB) is None:
+            continue
+        spr = wsp.find(WPS_SPR)
+        if spr is None:
+            continue
+        xfrm = spr.find(A_XFRM)
+        if xfrm is None:
+            continue
+        ext = xfrm.find(A_EXT)
+        if ext is not None:
+            _expand_cx(ext)
+        c_ext = _container_extent(wsp)
+        if c_ext is not None:
+            _expand_cx(c_ext)
+
+    # DrawingML shapes with a text body: <a:sp> containing <a:txBody>
+    for sp in root.iter(A_SP):
+        if sp.find(A_TXBOD) is None:
+            continue
+        spr = sp.find(A_SP_PR)
+        if spr is None:
+            continue
+        xfrm = spr.find(A_XFRM)
+        if xfrm is None:
+            continue
+        ext = xfrm.find(A_EXT)
+        if ext is not None:
+            _expand_cx(ext)
+
+
+def _fix_anchor_wrapping(root: etree._Element) -> None:
+    """Convert explicit ``wrapNone`` on standalone floating images to
+    ``wrapTopAndBottom`` so that expanded translated text does not overlap them.
+
+    An anchor image with ``wrapNone`` stays at its absolute page position even
+    as translated text expands below it, causing visible overlap.  Changing the
+    wrap mode to ``wrapTopAndBottom`` keeps the image exactly where it is but
+    tells Word to push text above and below the image instead of behind it.
+
+    The following anchors are **left untouched** to avoid breaking diagram
+    layouts (labels, arrows, callout groups):
+
+    * ``behindDoc="1"`` — background / watermark / diagram-underlay images
+      whose overlap with text is intentional.
+    * ``<wp:positionV relativeFrom>`` is ``paragraph``, ``line``, or
+      ``character`` — the image is vertically anchored to the text flow, not
+      the page.  Changing the wrap mode for these elements disrupts the visual
+      grouping of diagram components (images + labels + arrows that all anchor
+      to the same paragraph).
+    * Anchors inside a ``<w:tc>`` table cell — cell-positioned images use
+      cell-relative coordinates.
+    * Anchors with no explicit ``<wp:wrapNone/>`` child — absence of a wrap
+      element is another indicator of a deliberately-composed diagram group.
+    * Anchors that already carry any non-None wrap mode.
+    """
+    W_TC         = qn('w:tc')
+    WP_ANCHOR    = f'{{{_WP_NS}}}anchor'
+    WP_POS_V     = f'{{{_WP_NS}}}positionV'
+    WP_WRAP_NONE = f'{{{_WP_NS}}}wrapNone'
+    WP_WRAP_TAB  = f'{{{_WP_NS}}}wrapTopAndBottom'
+    _EXISTING_WRAP_TAGS = {
+        f'{{{_WP_NS}}}wrapSquare',
+        f'{{{_WP_NS}}}wrapTight',
+        f'{{{_WP_NS}}}wrapThrough',
+        f'{{{_WP_NS}}}wrapTopAndBottom',
+    }
+    # These relativeFrom values mean the image is part of a diagram group tied
+    # to a specific paragraph/line/character in the text flow.
+    _TEXT_RELATIVE = {'paragraph', 'line', 'character'}
+
+    for anchor in root.iter(WP_ANCHOR):
+        # Skip background / watermark / diagram-underlay images
+        if anchor.get('behindDoc', '0') == '1':
+            continue
+
+        # Skip diagram elements: vertical position tied to the text flow
+        pos_v = anchor.find(WP_POS_V)
+        if pos_v is not None and pos_v.get('relativeFrom', '') in _TEXT_RELATIVE:
+            continue
+
+        # Skip anchors inside table cells
+        node = anchor.getparent()
+        in_tc = False
+        while node is not None:
+            if node.tag == W_TC:
+                in_tc = True
+                break
+            node = node.getparent()
+        if in_tc:
+            continue
+
+        children = list(anchor)
+        child_tags = {c.tag for c in children}
+        if child_tags & _EXISTING_WRAP_TAGS:
+            continue
+
+        # Only convert explicit wrapNone — anchors with no wrap child at all
+        # are diagram components with deliberate absolute positioning.
+        wrap_none = anchor.find(WP_WRAP_NONE)
+        if wrap_none is not None:
+            idx = children.index(wrap_none)
+            anchor.remove(wrap_none)
+            anchor.insert(idx, etree.Element(WP_WRAP_TAB))
+            logger.debug("Replaced wrapNone → wrapTopAndBottom on anchor")
 
 
 def _is_spacer_paragraph(para: etree._Element) -> bool:
@@ -411,8 +652,10 @@ def _compress_section_spacing(
     1. Spacer paragraphs (no text): compress ``w:before/after`` by
        ``1/expansion_ratio``, clamped to [0.25, 1.0].  This reclaims the
        vertical space that would otherwise push content onto the next page.
-    2. Content paragraphs: compress ``w:before/after`` more gently —
-       ``max(0.55, 1/expansion_ratio)`` — only when ratio > 1.3.
+    2. Content paragraphs: tiered compression based on expansion ratio:
+       - ratio ≤ 1.3  →  no compression
+       - 1.3 < ratio ≤ 2.0  →  ``max(0.50, 1/ratio)``
+       - ratio > 2.0  →  ``max(0.38, 1/ratio)`` (aggressive: typical CJK→Latin)
     3. ``w:lineRule="exact"`` is always relaxed to ``atLeast`` regardless of
        ratio, because Latin descenders clip under exact CJK-sized line heights.
     4. Never reduce a spacing value below 0.
@@ -424,7 +667,13 @@ def _compress_section_spacing(
         return
 
     spacer_compression  = max(0.25, 1.0 / expansion_ratio)
-    content_compression = max(0.55, 1.0 / expansion_ratio) if expansion_ratio > 1.3 else 1.0
+    # Tiered content compression: harder for very high CJK→Latin expansion ratios
+    if expansion_ratio > 2.0:
+        content_compression = max(0.38, 1.0 / expansion_ratio)
+    elif expansion_ratio > 1.3:
+        content_compression = max(0.50, 1.0 / expansion_ratio)
+    else:
+        content_compression = 1.0
 
     W_PPR     = qn('w:pPr')
     W_SPACING = qn('w:spacing')
@@ -499,6 +748,9 @@ def _apply_layout_fixes(root: etree._Element, expansion_ratio: float = 1.0) -> N
     _fix_table_row_heights(root)
     _fix_textbox_autofit(root)
     _fix_frame_autosize(root)
+    _fix_vml_textbox_autosize(root)
+    _expand_textbox_widths(root, expansion_ratio)
+    _fix_anchor_wrapping(root)
     _compress_spacer_spacing(root, expansion_ratio)
     _compress_paragraph_spacing(root, expansion_ratio)
 
