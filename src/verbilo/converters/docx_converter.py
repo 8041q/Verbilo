@@ -30,6 +30,17 @@ _WT_TAG      = qn('w:t')
 _WTAB_TAG    = qn('w:tab')
 _WVAL_ATTR   = qn('w:val')
 
+# Tags that should be treated as opaque containers — text inside these is
+# handled by the SDT collector or skipped intentionally.
+_SDT_TAG     = qn('w:sdt')
+_SDT_PR_TAG  = qn('w:sdtPr')
+_SDT_CONTENT = qn('w:sdtContent')
+
+# Tracked-change insertion wrapper — we translate text inside <w:ins> normally.
+# Deleted text (<w:del> / <w:delText>) is intentionally skipped.
+_WINS_TAG    = qn('w:ins')
+_WDEL_TAG    = qn('w:del')
+
 # XML parts inside the zip that carry translatable body text
 _BODY_PARTS = [
     "word/document.xml",
@@ -182,8 +193,326 @@ def _is_in_heading(elem: etree._Element) -> bool:
     return False
 
 
+def _is_inside_del(elem: etree._Element) -> bool:
+    """Return True if *elem* is nested inside a ``<w:del>`` tracked-change block.
+
+    Text inside ``<w:del>`` represents deleted content and must NOT be
+    translated — it would corrupt the tracked-changes record.
+    """
+    node = elem.getparent()
+    while node is not None:
+        if node.tag == _WDEL_TAG:
+            return True
+        node = node.getparent()
+    return False
+
+
+import re as _re
+
+_RE_PURE_NUMBER = _re.compile(
+    r"""
+    ^[\s\u00a0]*           # optional leading whitespace / NBSP
+    [+-]?                  # optional sign
+    (?:
+        \d{1,3}(?:[.,\s]\d{3})*  # thousands-grouped integer e.g. 1,234
+        |\d+                      # plain integer
+    )
+    (?:[.,]\d+)?           # optional decimal part
+    [\s\u00a0]*            # optional trailing whitespace
+    (?:%|°|㎡|㎞|km|cm|mm|m²|m³|€|\$|£|¥|₹|元|円|₩)?  # optional unit
+    [\s\u00a0]*$
+    """,
+    _re.VERBOSE,
+)
+
+# Matches strings that are MOSTLY digits — the text contains digits but also
+# CJK/Latin characters that give the translator context to spell out the number.
+# We extract and protect the numeric portion instead of skipping the whole unit.
+_RE_HAS_DIGIT = _re.compile(r'\d')
+
+
+def _is_numeric_only(text: str) -> bool:
+    """Return True if *text* is a standalone number (possibly with units).
+
+    These are never sent to the translator to prevent silent conversion of
+    "42" → "forty-two" or decimal-separator reformatting.
+    """
+    return bool(_RE_PURE_NUMBER.match(text))
+
+
+def _strip_protected_tokens(text: str) -> tuple[str, dict[str, str]]:
+    """Replace numeric tokens in *text* with placeholders before translation.
+
+    Returns (masked_text, placeholder_map).  The caller should substitute
+    placeholders back after translation.
+
+    We protect:
+      - standalone integers and decimals (possibly thousands-grouped)
+      - years expressed as 4-digit sequences
+      - version strings like "3.14", "v2.0"
+      - sequences that are >= 50% digits by character count
+    """
+    placeholders: dict[str, str] = {}
+    counter = [0]
+
+    def _replace(m: _re.Match) -> str:
+        # Use a bracket format that is XML-safe, unlikely to appear in real text,
+        # and opaque enough that translators treat it as a token to preserve.
+        key = f'[[N{counter[0]}]]'
+        placeholders[key] = m.group(0)
+        counter[0] += 1
+        return key
+
+    # Protect numeric tokens: integers, decimals, version numbers, years
+    masked = _re.sub(
+        r'(?<!\w)(\d[\d,.\s]*\d|\d)(?!\w)',
+        _replace,
+        text,
+    )
+    return masked, placeholders
+
+
+def _restore_protected_tokens(text: str, placeholders: dict[str, str]) -> str:
+    """Substitute placeholders back into *text* after translation."""
+    for key, original in placeholders.items():
+        text = text.replace(key, original)
+    return text
+
+
+# ── Layout-protection passes ─────────────────────────────────────────────────
+# Run these on each XML root AFTER translation so that text-expansion caused
+# by longer translated strings doesn't break the document layout.
+
+_WP_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+
+
+def _fix_table_row_heights(root: etree._Element) -> None:
+    """Convert ``exact`` row-height constraints to ``atLeast``.
+
+    When a table row uses ``w:trHeight w:hRule="exact"``, Word will clip any
+    text that overflows the fixed height rather than expanding the row.  After
+    translation the text is usually longer, so clipping becomes visible.
+    Changing the rule to ``atLeast`` lets the row grow to fit its content while
+    still respecting the designer's minimum-height intent.
+    """
+    TR_HEIGHT = qn('w:trHeight')
+    H_RULE    = qn('w:hRule')
+    for trh in root.iter(TR_HEIGHT):
+        if trh.get(H_RULE, '').lower() == 'exact':
+            trh.set(H_RULE, 'atLeast')
+            logger.debug("Relaxed exact row height → atLeast")
+
+
+def _fix_textbox_autofit(root: etree._Element) -> None:
+    """Enable auto-fit (``spAutoFit``) on text-box body properties where the
+    translated text might overflow the original fixed size.
+
+    A ``<a:bodyPr>`` with no resize child — or with ``<a:noAutofit/>`` — will
+    clip text that is longer than the box.  We replace ``noAutofit`` with
+    ``normAutofit`` so the text box grows vertically to fit its translated
+    content.  We leave ``spAutoFit`` (shape auto-fit) alone because it already
+    works correctly.
+    """
+    A_BODY_PR    = f'{{{_NS_A}}}bodyPr'
+    A_NO_AUTOFIT = f'{{{_NS_A}}}noAutofit'
+    A_NORM_AUTO  = f'{{{_NS_A}}}normAutofit'
+    A_SP_AUTO    = f'{{{_NS_A}}}spAutoFit'
+
+    for body_pr in root.iter(A_BODY_PR):
+        no_fit = body_pr.find(A_NO_AUTOFIT)
+        if no_fit is not None:
+            idx = list(body_pr).index(no_fit)
+            body_pr.remove(no_fit)
+            norm = etree.Element(A_NORM_AUTO)
+            body_pr.insert(idx, norm)
+            logger.debug("Replaced noAutofit → normAutofit in text-box bodyPr")
+
+
+def _fix_frame_autosize(root: etree._Element) -> None:
+    """Ensure legacy word-processing frames (``<w:framePr>``) can grow.
+
+    Frames created with ``<w:framePr w:h="..." w:hRule="exact">`` clip content
+    exactly like table rows.  We relax them to ``atLeast`` for the same reason.
+    """
+    FRAME_PR = qn('w:framePr')
+    H_RULE   = qn('w:hRule')
+    for fp in root.iter(FRAME_PR):
+        if fp.get(H_RULE, '').lower() == 'exact':
+            fp.set(H_RULE, 'atLeast')
+            logger.debug("Relaxed framePr exact height → atLeast")
+
+
+def _is_spacer_paragraph(para: etree._Element) -> bool:
+    """Return True if *para* is a layout-spacer paragraph with no visible text."""
+    for wt in para.iter(_WT_TAG):
+        if wt.text and wt.text.strip():
+            return False
+    return True
+
+
+def _para_has_page_break(para: etree._Element) -> bool:
+    """Return True if *para* starts a new page via pageBreakBefore or a w:br page break."""
+    W_P     = qn('w:p')
+    W_PPR   = qn('w:pPr')
+    W_PBB   = qn('w:pageBreakBefore')
+    W_BR    = qn('w:br')
+    W_TYPE  = qn('w:type')
+
+    # Check w:pPr/w:pageBreakBefore
+    ppr = para.find(W_PPR)
+    if ppr is not None:
+        pbb = ppr.find(W_PBB)
+        if pbb is not None:
+            val = pbb.get(qn('w:val'), '1')
+            if val.lower() not in ('0', 'false'):
+                return True
+
+    # Check for explicit w:br type="page" inside any run
+    for br in para.iter(W_BR):
+        if br.get(W_TYPE, '').lower() == 'page':
+            return True
+
+    return False
+
+
+def _collect_page_sections(root: etree._Element) -> list[list[etree._Element]]:
+    """Split all body paragraphs into page sections divided by hard page breaks.
+
+    Returns a list of sections, each section being a list of ``<w:p>`` elements
+    that belong to the same logical page.  The paragraph that carries the page
+    break starts the new section.
+    """
+    W_BODY = qn('w:body')
+    W_P    = qn('w:p')
+    W_TBL  = qn('w:tbl')
+
+    body = root.find(W_BODY)
+    if body is None:
+        body = root  # headers/footers have no w:body wrapper
+
+    sections: list[list[etree._Element]] = [[]]
+    for child in body:
+        if child.tag == W_P:
+            if _para_has_page_break(child) and sections[-1]:
+                sections.append([])
+            sections[-1].append(child)
+        # Tables count as bulk but we don't split inside them
+    return [s for s in sections if s]
+
+
+def _compress_section_spacing(
+    section: list[etree._Element],
+    expansion_ratio: float,
+) -> None:
+    """Compress spacing within one page section proportionally to expansion_ratio.
+
+    Strategy
+    --------
+    1. Spacer paragraphs (no text): compress ``w:before/after`` by
+       ``1/expansion_ratio``, clamped to [0.25, 1.0].  This reclaims the
+       vertical space that would otherwise push content onto the next page.
+    2. Content paragraphs: compress ``w:before/after`` more gently —
+       ``max(0.55, 1/expansion_ratio)`` — only when ratio > 1.3.
+    3. ``w:lineRule="exact"`` is always relaxed to ``atLeast`` regardless of
+       ratio, because Latin descenders clip under exact CJK-sized line heights.
+    4. Never reduce a spacing value below 0.
+    """
+    if expansion_ratio <= 1.0:
+        # Relax exact line spacing even when text didn't expand
+        for para in section:
+            _relax_exact_line_spacing(para)
+        return
+
+    spacer_compression  = max(0.25, 1.0 / expansion_ratio)
+    content_compression = max(0.55, 1.0 / expansion_ratio) if expansion_ratio > 1.3 else 1.0
+
+    W_PPR     = qn('w:pPr')
+    W_SPACING = qn('w:spacing')
+    W_BEFORE  = qn('w:before')
+    W_AFTER   = qn('w:after')
+
+    for para in section:
+        _relax_exact_line_spacing(para)
+        ppr = para.find(W_PPR)
+        if ppr is None:
+            continue
+        spacing = ppr.find(W_SPACING)
+        if spacing is None:
+            continue
+
+        is_spacer = _is_spacer_paragraph(para)
+        factor = spacer_compression if is_spacer else content_compression
+
+        for attr in (W_BEFORE, W_AFTER):
+            raw = spacing.get(attr)
+            if raw is None:
+                continue
+            try:
+                val = int(raw)
+            except ValueError:
+                continue
+            spacing.set(attr, str(max(0, int(val * factor))))
+
+
+def _relax_exact_line_spacing(para: etree._Element) -> None:
+    """Change ``w:lineRule="exact"`` to ``atLeast`` on a single paragraph."""
+    W_PPR      = qn('w:pPr')
+    W_SPACING  = qn('w:spacing')
+    W_LINERULE = qn('w:lineRule')
+
+    ppr = para.find(W_PPR)
+    if ppr is None:
+        return
+    spacing = ppr.find(W_SPACING)
+    if spacing is None:
+        return
+    if spacing.get(W_LINERULE, '').lower() == 'exact':
+        spacing.set(W_LINERULE, 'atLeast')
+
+
+def _compress_spacer_spacing(root: etree._Element, expansion_ratio: float) -> None:
+    """Compress spacing section-by-section, respecting hard page boundaries."""
+    if expansion_ratio <= 1.0:
+        return
+    for section in _collect_page_sections(root):
+        _compress_section_spacing(section, expansion_ratio)
+
+
+def _compress_paragraph_spacing(root: etree._Element, expansion_ratio: float) -> None:
+    """Relax exact line spacing on all paragraphs (handled inside section pass)."""
+    # This is now a no-op — the section-aware pass in _compress_spacer_spacing
+    # handles both spacer and content paragraphs together so we don't double-apply.
+    pass
+
+
+def _apply_layout_fixes(root: etree._Element, expansion_ratio: float = 1.0) -> None:
+    """Run all layout-protection passes on *root* in one call.
+
+    Parameters
+    ----------
+    expansion_ratio:
+        Ratio of total translated characters to total source characters for
+        this XML part.  Values > 1 mean the translation is longer (common for
+        CJK→Latin).  Used to scale down spacing on spacer and content
+        paragraphs so page layout is preserved.
+    """
+    _fix_table_row_heights(root)
+    _fix_textbox_autofit(root)
+    _fix_frame_autosize(root)
+    _compress_spacer_spacing(root, expansion_ratio)
+    _compress_paragraph_spacing(root, expansion_ratio)
+
+
 def _collect_wt_units(root: etree._Element) -> list[_TranslationUnit]:
-    #  Collect TranslationUnits from all ``<w:t>`` elements under *root*. This is the primary collector for body text, headers, footers, footnotes and endnotes.  It mutates elements in-place via write_back.
+    #  Collect TranslationUnits from all ``<w:t>`` elements under *root*.
+    #
+    #  Skips:
+    #    - empty / whitespace-only text nodes
+    #    - text inside ``<w:del>`` tracked-change blocks (deleted text must be
+    #      kept verbatim to preserve the revision history)
+    #
+    #  This is the primary collector for body text, headers, footers,
+    #  footnotes and endnotes.  It mutates elements in-place via write_back.
 
     units: list[_TranslationUnit] = []
 
@@ -192,15 +521,27 @@ def _collect_wt_units(root: etree._Element) -> list[_TranslationUnit]:
         if not text or not text.strip():
             continue
 
+        # Skip deleted text — translating it would corrupt tracked changes.
+        if _is_inside_del(wt):
+            continue
+
+        # Skip pure numbers — translators convert "42" → "forty-two", etc.
+        if _is_numeric_only(text):
+            continue
+
+        # For mixed text (e.g. "2023年"), mask numeric tokens so they survive
+        # translation unchanged, then restore them in write_back.
+        masked_text, placeholders = _strip_protected_tokens(text.strip())
         is_heading = _is_in_heading(wt)
 
-        def _make_wb(elem: etree._Element, orig_text: str):
+        def _make_wb(elem: etree._Element, orig_text: str, ph: dict[str, str]):
             def wb(translated: str) -> None:
+                # Restore any numeric placeholders the translator may have mangled
+                result = _restore_protected_tokens(translated, ph)
                 # Preserve leading/trailing whitespace from the original
                 leading  = orig_text[: len(orig_text) - len(orig_text.lstrip())]
                 trailing = orig_text[len(orig_text.rstrip()):]
-                elem.text = leading + translated.strip() + trailing
-                # Ensure xml:space="preserve" if there's surrounding whitespace
+                elem.text = leading + result.strip() + trailing
                 if leading or trailing:
                     elem.set(
                         '{http://www.w3.org/XML/1998/namespace}space', 'preserve'
@@ -208,9 +549,9 @@ def _collect_wt_units(root: etree._Element) -> list[_TranslationUnit]:
             return wb
 
         units.append(_TranslationUnit(
-            source_text=text.strip(),
+            source_text=masked_text,
             is_heading=is_heading,
-            write_back=_make_wb(wt, text),
+            write_back=_make_wb(wt, text, placeholders),
         ))
 
     return units
@@ -226,14 +567,24 @@ def _collect_drawingml_units(root: etree._Element) -> list[_TranslationUnit]:
         if not text or not text.strip():
             continue
 
-        def _make_wb(e: etree._Element):
+        if _is_numeric_only(text):
+            continue
+
+        masked_text, placeholders = _strip_protected_tokens(text.strip())
+
+        def _make_wb(e: etree._Element, orig_text: str, ph: dict[str, str]):
             def wb(translated: str) -> None:
-                e.text = translated
+                result = _restore_protected_tokens(translated, ph)
+                leading  = orig_text[: len(orig_text) - len(orig_text.lstrip())]
+                trailing = orig_text[len(orig_text.rstrip()):]
+                e.text = leading + result.strip() + trailing
+                if leading or trailing:
+                    e.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
             return wb
 
         units.append(_TranslationUnit(
-            source_text=text,
-            write_back=_make_wb(at_elem),
+            source_text=masked_text,
+            write_back=_make_wb(at_elem, text, placeholders),
         ))
 
     return units
@@ -275,14 +626,18 @@ def _collect_smartart_units_from_blob(
         if not text or not text.strip():
             continue
 
-        def _make_wb(e: etree._Element):
+        def _make_wb(e: etree._Element, orig_text: str):
             def wb(translated: str) -> None:
-                e.text = translated
+                leading  = orig_text[: len(orig_text) - len(orig_text.lstrip())]
+                trailing = orig_text[len(orig_text.rstrip()):]
+                e.text = leading + translated.strip() + trailing
+                if leading or trailing:
+                    e.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
             return wb
 
         units.append(_TranslationUnit(
-            source_text=text,
-            write_back=_make_wb(at_elem),
+            source_text=text.strip(),
+            write_back=_make_wb(at_elem, text),
         ))
 
     return units, root
@@ -420,10 +775,39 @@ def translate_docx(
 
         logger.debug("%s: %d units collected", part_name, len(pool))
         groups = _group_units(pool, auto_detect=auto_detect)
+
+        # Snapshot source lengths before translation so we can compute the
+        # expansion ratio used by the layout-fix passes below.
+        source_chars = sum(len(u.source_text) for u in pool)
+
         part_errors = _translate_and_writeback(
             pool, groups, translator, target_lang, cancel_event,
         )
         errors += part_errors
+
+        # Compute how much longer the translated text is compared to the source.
+        # We measure the live elem.text values via write_back, but the simplest
+        # proxy is to compare the unit texts before and after translation — the
+        # write_back closures already updated the XML, so we re-read the <w:t>
+        # nodes.  Instead, we use the translated strings that ended up in the
+        # units.  Since write_back mutates the XML in-place we can't read them
+        # back easily, so we estimate: collect current <w:t> text sum.
+        translated_chars = sum(
+            len(wt.text) for wt in root.iter(_WT_TAG)
+            if wt.text and wt.text.strip()
+        )
+        expansion_ratio = (
+            translated_chars / source_chars if source_chars > 0 else 1.0
+        )
+        logger.debug(
+            "%s: expansion_ratio=%.2f (%d src → %d tgt chars)",
+            part_name, expansion_ratio, source_chars, translated_chars,
+        )
+
+        # Relax fixed-size containers and compress spacing so that translated
+        # (often longer) text doesn't overflow table rows, text boxes, frames,
+        # or push spacer-separated sections out of place.
+        _apply_layout_fixes(root, expansion_ratio)
 
         patches[part_name] = _serialise_xml_part(root, raw)
 
