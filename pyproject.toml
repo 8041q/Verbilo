@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "verbilo"
-version = "1.10.6"
-build_date = "2026-03-24"
+version = "1.10.7"
+build_date = "2026-03-25"
 description = "Translate .docx, .pdf, .xlsx, .xls files while preserving formatting."
 authors = ["crt_ (8041q)"]
 packages = [{ include = "verbilo", from = "src" }]
@@ -21,7 +21,7 @@ python = ">=3.12,<3.13"
 
 # Document converters
 python-docx = "==0.8.11"
-lxml = ">=4.9"
+lxml = "==6.0.2"
 openpyxl = "==3.1.2"
 
 # PDF
