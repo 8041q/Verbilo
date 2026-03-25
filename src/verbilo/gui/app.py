@@ -1021,7 +1021,6 @@ class App:
         self.sidebar.grid(row=0, column=0, sticky="ns")
         self.sidebar.grid_propagate(False)
         self.sidebar.grid_columnconfigure(0, weight=1)
-
         row = 0
 
         # App title with icon
@@ -1317,6 +1316,13 @@ class App:
             foreground=p.text_secondary,
             fieldbackground=p.bg_card,
             borderwidth=0,
+            relief="flat",
+            # "clam" theme draws its border via these color keys even when
+            # borderwidth=0; setting them to the card background makes the
+            # outline invisible without removing any padding.
+            bordercolor=p.bg_card,
+            lightcolor=p.bg_card,
+            darkcolor=p.bg_card,
         )
         style.configure(
             "FileTable.Treeview.Heading",
@@ -1329,8 +1335,32 @@ class App:
         )
         style.map(
             "FileTable.Treeview",
-            background=[("selected", p.accent)],
-            foreground=[("selected", p.text_on_accent)],
+            background=[
+                ("selected", p.accent),
+                ("active", p.bg_card),
+                ("!active", p.bg_card),
+                ("focus", p.bg_card),
+            ],
+            foreground=[
+                ("selected", p.text_on_accent),
+                ("active", p.text_secondary),
+                ("!active", p.text_secondary),
+            ],
+            bordercolor=[
+                ("active", p.bg_card),
+                ("focus", p.bg_card),
+                ("!active", p.bg_card),
+            ],
+            lightcolor=[
+                ("active", p.bg_card),
+                ("focus", p.bg_card),
+                ("!active", p.bg_card),
+            ],
+            darkcolor=[
+                ("active", p.bg_card),
+                ("focus", p.bg_card),
+                ("!active", p.bg_card),
+            ],
         )
         style.map(
             "FileTable.Treeview.Heading",
@@ -1388,6 +1418,14 @@ class App:
             style="FileTable.Treeview",
             selectmode="browse",
         )
+        # Suppress the Tk-level focus-ring outline (drawn outside ttk style)
+        try:
+            self.file_table.configure(takefocus=False)
+            # highlightthickness is a raw Tk option not exposed by ttk but
+            # accessible via the underlying tk widget call
+            self.file_table.tk.call(str(self.file_table), "configure", "-highlightthickness", 0)
+        except Exception:
+            pass
         self.file_table.heading("status", text="Status", anchor="center")
         self.file_table.heading("time", text="Time", anchor="center")
 
@@ -1427,6 +1465,19 @@ class App:
         ext = Path(filepath).suffix.lower()
         return self._file_icons.get(ext, self._file_icons.get("_default"))
 
+    def _format_elapsed_time(self, elapsed: float | None) -> str:
+        if elapsed is None:
+            return ""
+        if elapsed < 60:
+            return f"{elapsed:.1f}s"
+        if elapsed < 3600:
+            mins = int(elapsed // 60)
+            secs = elapsed - mins * 60
+            return f"{mins}m {secs:.0f}s" if secs >= 1 else f"{mins}m"
+        hours = int(elapsed // 3600)
+        mins = int((elapsed - hours * 3600) // 60)
+        return f"{hours}h {mins}m" if mins else f"{hours}h"
+
     # --- table helpers ---
 
     def _add_file_to_table(self, filepath: str, status: str = "pending"):
@@ -1449,7 +1500,7 @@ class App:
         if iid is None:
             return
         name = os.path.basename(filepath)
-        time_str = f"{elapsed:.1f}s" if elapsed is not None else ""
+        time_str = self._format_elapsed_time(elapsed)
         idx = list(self._file_to_iid.keys()).index(filepath)
         row_tag = "even" if idx % 2 == 0 else "odd"
         self.file_table.item(iid, text=name, values=(status, time_str), tags=(status, row_tag))
@@ -2036,7 +2087,7 @@ class App:
             bottom, "", level="tiny",
             text_color=p.status_error,
         )
-        self._settings_error.grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self._settings_error.grid(row=1, column=2, sticky="w", pady=(0, 6))
 
         # Button row
         btn_frame = ctk.CTkFrame(bottom, fg_color="transparent")
@@ -2283,10 +2334,11 @@ class App:
         # Header row (fixed)
         header_frame = ctk.CTkFrame(table_container, fg_color="transparent")
         header_frame.grid(row=0, column=0, sticky="ew")
-        # column layout same as body
+        _SCROLLBAR_W = 16
         for ci, w in enumerate([30, 1, 1, 80, 120, 160]):
             weight = 0 if ci in (0, 3, 4, 5) else 1
             header_frame.grid_columnconfigure(ci, weight=weight, minsize=w)
+        header_frame.grid_columnconfigure(6, weight=0, minsize=_SCROLLBAR_W)
 
         _hdr_labels = ["", "Source", "Target", "Size (MB)", "Progress", ""]
         for ci, txt in enumerate(_hdr_labels):

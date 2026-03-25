@@ -6,6 +6,7 @@ from functools import lru_cache
 from typing import TYPE_CHECKING
 from pathlib import Path
 from importlib import resources
+from .theme import get_mode
 
 try:
     import customtkinter as ctk
@@ -70,6 +71,192 @@ def _accent_icon_colors() -> tuple[str, str]:
     return "#FFFFFF", "#FFFFFF"
 
 
+def _load_asset_image(filename: str, size: int | None = None):
+    if PILImage is None:
+        return None
+    # filesystem first
+    assets_dir = Path(__file__).resolve().parent.parent / "assets"
+    try:
+        p = assets_dir / filename
+        if p.exists():
+            pil = PILImage.open(p).convert("RGBA")
+            if size is not None and pil.size != (size, size):
+                try:
+                    resample = PILImage.Resampling.LANCZOS
+                except AttributeError:
+                    resample = PILImage.LANCZOS
+                pil = pil.resize((size, size), resample)
+            return pil
+    except Exception:
+        pass
+
+    # try any basename-*.png in assets (filesystem only — good for dev)
+    try:
+        basename = filename.rsplit(".", 1)[0]
+        for f in sorted(assets_dir.glob(f"{basename}-*.png")):
+            try:
+                pil = PILImage.open(f).convert("RGBA")
+                if size is not None and pil.size != (size, size):
+                    try:
+                        resample = PILImage.Resampling.LANCZOS
+                    except AttributeError:
+                        resample = PILImage.LANCZOS
+                    pil = pil.resize((size, size), resample)
+                return pil
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # packaged resource fallback (original logic)
+    try:
+        asset_trav = resources.files("verbilo.assets").joinpath(filename)
+        data = asset_trav.read_bytes()
+        pil = PILImage.open(io.BytesIO(data)).convert("RGBA")
+        if size is not None and pil.size != (size, size):
+            try:
+                resample = PILImage.Resampling.LANCZOS
+            except AttributeError:
+                resample = PILImage.LANCZOS
+            pil = pil.resize((size, size), resample)
+        return pil
+    except Exception:
+        pass
+
+    return None
+
+
+def _load_asset_pair(name: str, size: int | None = None) -> tuple[object | None, object | None]:
+    """Return (pil_light, pil_dark) for the given base name.
+
+    Tries filesystem first then packaged resources. If only a single image
+    exists (no -light/-dark variants), that image is returned for both
+    light and dark as a fallback.
+    """
+    if PILImage is None:
+        return None, None
+
+    assets_dir = Path(__file__).resolve().parent.parent / "assets"
+
+    def _open_file(p: Path):
+        try:
+            pil = PILImage.open(p).convert("RGBA")
+            if size is not None and pil.size != (size, size):
+                try:
+                    resample = PILImage.Resampling.LANCZOS
+                except AttributeError:
+                    resample = PILImage.LANCZOS
+                pil = pil.resize((size, size), resample)
+            return pil
+        except Exception:
+            return None
+
+    light = None
+    dark = None
+
+    # Filesystem explicit candidates
+    try:
+        # try size-specific then generic
+        if size is not None:
+            for fn in (f"{name}-{size}-light.png", f"{name}-light.png"):
+                p = assets_dir / fn
+                if p.exists():
+                    light = _open_file(p)
+                    break
+            for fn in (f"{name}-{size}-dark.png", f"{name}-dark.png"):
+                p = assets_dir / fn
+                if p.exists():
+                    dark = _open_file(p)
+                    break
+        else:
+            for fn in (f"{name}-light.png",):
+                p = assets_dir / fn
+                if p.exists():
+                    light = _open_file(p)
+                    break
+            for fn in (f"{name}-dark.png",):
+                p = assets_dir / fn
+                if p.exists():
+                    dark = _open_file(p)
+                    break
+
+        # glob-style fallback (basename-*-light.png / basename-*-dark.png)
+        if light is None:
+            for f in sorted(assets_dir.glob(f"{name}-*-light.png")):
+                light = _open_file(f)
+                if light is not None:
+                    break
+        if dark is None:
+            for f in sorted(assets_dir.glob(f"{name}-*-dark.png")):
+                dark = _open_file(f)
+                if dark is not None:
+                    break
+    except Exception:
+        pass
+
+    # Packaged resource fallback
+    try:
+        if light is None:
+            if size is not None:
+                for fn in (f"{name}-{size}-light.png", f"{name}-light.png"):
+                    try:
+                        asset_trav = resources.files("verbilo.assets").joinpath(fn)
+                        data = asset_trav.read_bytes()
+                        light = PILImage.open(io.BytesIO(data)).convert("RGBA")
+                        if size is not None and light.size != (size, size):
+                            try:
+                                resample = PILImage.Resampling.LANCZOS
+                            except AttributeError:
+                                resample = PILImage.LANCZOS
+                            light = light.resize((size, size), resample)
+                        break
+                    except Exception:
+                        continue
+            else:
+                try:
+                    asset_trav = resources.files("verbilo.assets").joinpath(f"{name}-light.png")
+                    data = asset_trav.read_bytes()
+                    light = PILImage.open(io.BytesIO(data)).convert("RGBA")
+                except Exception:
+                    pass
+
+        if dark is None:
+            if size is not None:
+                for fn in (f"{name}-{size}-dark.png", f"{name}-dark.png"):
+                    try:
+                        asset_trav = resources.files("verbilo.assets").joinpath(fn)
+                        data = asset_trav.read_bytes()
+                        dark = PILImage.open(io.BytesIO(data)).convert("RGBA")
+                        if size is not None and dark.size != (size, size):
+                            try:
+                                resample = PILImage.Resampling.LANCZOS
+                            except AttributeError:
+                                resample = PILImage.LANCZOS
+                            dark = dark.resize((size, size), resample)
+                        break
+                    except Exception:
+                        continue
+            else:
+                try:
+                    asset_trav = resources.files("verbilo.assets").joinpath(f"{name}-dark.png")
+                    data = asset_trav.read_bytes()
+                    dark = PILImage.open(io.BytesIO(data)).convert("RGBA")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # If we found neither light nor dark specifically, try single-file fallback
+    if light is None and dark is None:
+        for fn in ([f"{name}-{size}.png"] if size is not None else []) + [f"{name}.png"]:
+            pil = _load_asset_image(fn, size=size)
+            if pil is not None:
+                light = dark = pil
+                break
+
+    return light, dark
+    
+
 # Public API 
 
 @lru_cache(maxsize=256)
@@ -86,7 +273,22 @@ def get_icon(
     *,
     on_accent: bool = False,
 ) -> "CTkImage | None":
+    # prefer packaged/static asset variants (light + dark). Try size-specific
+    # then generic names. For the special `language` icon, also try the
+    # 2logo name.
+    cand_bases = ["2logo", "language"] if name == "language" else [name]
+    for base in cand_bases:
+        pil_light, pil_dark = _load_asset_pair(base, size=size)
+        if (pil_light is not None or pil_dark is not None) and ctk is not None:
+            # If only one variant exists, use it for both light and dark to
+            # preserve previous behaviour.
+            if pil_light is None:
+                pil_light = pil_dark
+            if pil_dark is None:
+                pil_dark = pil_light
+            return ctk.CTkImage(light_image=pil_light, dark_image=pil_dark, size=(size, size))
 
+    # existing guard (fallback to TablerIcons)
     if ctk is None or TablerIcons is None:
         return None
 
@@ -108,8 +310,29 @@ def get_icon(
     return ctk.CTkImage(light_image=light_img, dark_image=dark_img, size=(size, size))
 
 
-def get_photo_image(name: str, size: int = 18, color: str = "#C8CCD2") -> object | None:
-    # Return a tkinter PhotoImage for use in ttk widgets (single image)
+def get_photo_image(name: str, size: int = 18, color: str = "#C8CCD2", mode: str | None = None) -> object | None:
+    # prefer static asset for PhotoImage. PhotoImage is a single-image
+    # object, so pick the variant matching the current theme mode.
+    if mode is None:
+        try:
+            mode = get_mode()
+        except Exception:
+            mode = "Light"
+
+    cand_bases = ["2logo", "language"] if name == "language" else [name]
+    for base in cand_bases:
+        pil_light, pil_dark = _load_asset_pair(base, size=size)
+        if pil_light is not None or pil_dark is not None:
+            # choose by mode (prefer dark when mode contains 'dark')
+            mode_l = (mode or "").lower()
+            preferred = pil_dark if "dark" in mode_l else pil_light
+            if preferred is None:
+                preferred = pil_light or pil_dark
+            if preferred is not None and ImageTk is not None:
+                return ImageTk.PhotoImage(preferred)
+
+    # Return a tkinter PhotoImage for use in ttk widgets (single image) —
+    # fall back to TablerIcons rendering when no static asset found.
     if TablerIcons is None or PILImage is None or ImageTk is None:
         return None
 
@@ -214,4 +437,3 @@ def apply_window_icon(root: object, size: int = 64) -> bool:
         return True
     except Exception:
         return False
-    
