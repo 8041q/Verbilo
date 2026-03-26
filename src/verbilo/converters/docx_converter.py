@@ -508,9 +508,6 @@ def _expand_textbox_widths(root: etree._Element, expansion_ratio: float = 1.0) -
         ext = xfrm.find(A_EXT)
         if ext is not None:
             _expand_cx(ext)
-        c_ext = _container_extent(wsp)
-        if c_ext is not None:
-            _expand_cx(c_ext)
 
     # DrawingML shapes with a text body: <a:sp> containing <a:txBody>
     for sp in root.iter(A_SP):
@@ -774,6 +771,71 @@ def _compress_paragraph_spacing(root: etree._Element, expansion_ratio: float) ->
     pass
 
 
+def _ensure_list_indentation(root: etree._Element) -> None:
+    """Add standard Western indentation to list paragraphs that have none.
+
+    CJK source documents often format bullet/numbered lists without explicit
+    ``w:ind`` because CJK characters have fixed-width cells.  After translation
+    to Latin script the list items appear flush-left.  We apply standard Office
+    indentation (720 twips per indent level, 360-twip hanging) to any paragraph
+    that carries ``w:numPr`` but lacks a meaningful ``w:left`` indent
+    (< 360 twips / 0.25 inch).
+    """
+    W_P       = qn('w:p')
+    W_PPR     = qn('w:pPr')
+    W_NUMPR   = qn('w:numPr')
+    W_ILVL    = qn('w:ilvl')
+    W_IND     = qn('w:ind')
+    W_LEFT    = qn('w:left')
+    W_HANGING = qn('w:hanging')
+
+    TWIPS_PER_LEVEL = 720   # 0.5 inch per indent level (standard Office default)
+    HANGING         = 360   # 0.25 inch hanging indent for the bullet/number
+    MIN_EXISTING    = 360   # Only act when current left indent < this threshold
+
+    for para in root.iter(W_P):
+        ppr = para.find(W_PPR)
+        if ppr is None:
+            continue
+        numpr = ppr.find(W_NUMPR)
+        if numpr is None:
+            continue  # Not a list paragraph
+
+        # Determine indent level (0-based); default to 0 if absent
+        ilvl_elem = numpr.find(W_ILVL)
+        ilvl = 0
+        if ilvl_elem is not None:
+            try:
+                ilvl = int(ilvl_elem.get(_WVAL_ATTR, '0'))
+            except ValueError:
+                pass
+
+        desired_left = (ilvl + 1) * TWIPS_PER_LEVEL
+
+        ind = ppr.find(W_IND)
+        if ind is not None:
+            try:
+                current_left = int(ind.get(W_LEFT, '0'))
+            except ValueError:
+                current_left = 0
+            if current_left >= MIN_EXISTING:
+                continue  # Already has a meaningful indent — leave it alone
+            ind.set(W_LEFT, str(desired_left))
+            ind.set(W_HANGING, str(HANGING))
+        else:
+            # No w:ind at all — create one and insert right after w:numPr
+            ind = etree.Element(W_IND)
+            ind.set(W_LEFT, str(desired_left))
+            ind.set(W_HANGING, str(HANGING))
+            numpr_idx = list(ppr).index(numpr)
+            ppr.insert(numpr_idx + 1, ind)
+
+        logger.debug(
+            "Applied list indent: level=%d left=%d hanging=%d",
+            ilvl, desired_left, HANGING,
+        )
+
+
 def _apply_layout_fixes(root: etree._Element, expansion_ratio: float = 1.0) -> None:
     """Run all layout-protection passes on *root* in one call.
 
@@ -790,9 +852,9 @@ def _apply_layout_fixes(root: etree._Element, expansion_ratio: float = 1.0) -> N
     _fix_frame_autosize(root)
     _fix_vml_textbox_autosize(root)
     _expand_textbox_widths(root, expansion_ratio)
-    _fix_anchor_wrapping(root)
     _compress_spacer_spacing(root, expansion_ratio)
     _compress_paragraph_spacing(root, expansion_ratio)
+    _ensure_list_indentation(root)
 
 
 def _collect_wt_units(root: etree._Element) -> list[_TranslationUnit]:
@@ -1043,6 +1105,11 @@ def translate_docx(
         if 'diagrams/data' in name.lower() or 'diagramdata' in name.lower():
             smartart_parts.append(name)
 
+    # word/settings.xml — patched to suppress paragraph spacing at page tops
+    settings_part = next(
+        (n for n in all_xml_parts if n.lower() == "word/settings.xml"), None
+    )
+
     logger.debug("Text parts: %s", text_parts)
     logger.debug("SmartArt parts: %s", smartart_parts)
 
@@ -1050,7 +1117,8 @@ def translate_docx(
     patches: dict[str, bytes] = {}
 
     with zipfile.ZipFile(output_path, 'r') as zf:
-        raw_parts = {name: zf.read(name) for name in text_parts + smartart_parts}
+        _extra = [settings_part] if settings_part else []
+        raw_parts = {name: zf.read(name) for name in text_parts + smartart_parts + _extra}
 
     # --- text parts (w:t, a:t, VML) ---
     for part_name in text_parts:
@@ -1131,6 +1199,27 @@ def translate_docx(
             pool, groups, translator, target_lang, cancel_event,
         )
         patches[part_name] = _serialise_xml_part(root, raw)
+
+    # --- settings.xml: suppress first-paragraph spacing at page tops ---
+    if settings_part:
+        raw_settings = raw_parts.get(settings_part)
+        if raw_settings:
+            try:
+                settings_root = _parse_xml_part(raw_settings)
+                SUPPRESS_TAG = qn('w:suppressFirstParagraphSpacing')
+                if settings_root.find(SUPPRESS_TAG) is None:
+                    settings_root.append(etree.Element(SUPPRESS_TAG))
+                    patches[settings_part] = _serialise_xml_part(
+                        settings_root, raw_settings
+                    )
+                    logger.debug(
+                        "Injected w:suppressFirstParagraphSpacing into %s",
+                        settings_part,
+                    )
+            except Exception:
+                logger.warning(
+                    "Failed to patch %s", settings_part, exc_info=True
+                )
 
     # ── Step 4: write only modified parts back into the zip ──────────────────
     if patches:

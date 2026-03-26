@@ -667,20 +667,38 @@ class SearchableComboBox:
     # -- Entry event handlers ------------------------------------------
 
     def _on_focus_in(self, _event=None):
-        # Tab/programmatic focus: select-all and open.
         if self._suppress_open:
             return
-        if _event == "NotifyPointer":
-            return  # mouse click handled by _on_click instead
-        self._select_all()
-        self._open()
+        widget = getattr(_event, "widget", None) or self._tk_entry
+        def _do():
+            try:
+                self._select_all()
+                self._open()
+            except Exception:
+                pass
+        try:
+            widget.after_idle(_do)
+        except Exception:
+            _do()
 
     def _on_click(self, _event=None):
-        # Mouse click on entry (may already have focus).
         if self._suppress_open:
             return
-        self._select_all()
-        self._open()
+        widget = getattr(_event, "widget", None) or self._tk_entry
+        try:
+            widget.focus_set()
+        except Exception:
+            pass
+        def _do():
+            try:
+                self._select_all()
+                self._open()
+            except Exception:
+                pass
+        try:
+            widget.after_idle(_do)
+        except Exception:
+            _do()
 
     def _on_key(self, event=None):
         # Live filter and open/refresh popup on each keystroke.
