@@ -34,6 +34,18 @@ _BULLET_ASCII: tuple[str, ...] = ("-", "*", "–", "—")
 # line as intentionally hidden (z-order guard).
 _COVERAGE_THRESHOLD = 0.60
 
+# Font size scaling: minimum fraction of original size we'll shrink to before
+# accepting overflow (rather than truncating).
+_MIN_FONT_SCALE = 0.65
+
+# Extra vertical padding (points) added to every line rect so that slightly
+# taller translated text has breathing room before it touches the next line.
+_LINE_RECT_VPAD = 1.5
+
+# When a line rect is too narrow to hold the translated text even at minimum
+# font size, we allow the rect to grow downward by at most this many points.
+_MAX_RECT_EXPANSION = 40.0
+
 
 def _is_ocr_required(doc: fitz.Document) -> bool:
     # True if the PDF looks scanned (too few extractable chars per page)
@@ -72,7 +84,7 @@ def _line_is_bullet(text: str) -> bool:
 def _collect_opaque_rects(page: fitz.Page) -> list[fitz.Rect]:
     # Return rects of solid fully-opaque filled drawing elements on *page*.
     # These are used to detect text intentionally hidden under white/opaque shapes.
-    
+
     opaque: list[fitz.Rect] = []
     try:
         for drawing in page.get_drawings():
@@ -109,7 +121,8 @@ def _collect_underline_texts(page: fitz.Page) -> set[str]:
     Primary method: underline markup annotations.
     Fallback method: parse get_text("html") for <u>…</u> tags.
     """
-    underlined: set[str] = []
+    # FIX: was initialised as a list [] — must be a list before set() conversion
+    underlined: list[str] = []
     try:
         # Collect quads from underline annotations
         annot_quads: list[fitz.Quad] = []
@@ -267,7 +280,6 @@ def _group_lines_into_paragraphs(line_infos: list[dict]) -> list[list[int]]:
     return groups
 
 
-
 def _html_escape(text: str) -> str:
     return (
         text.replace("&", "&amp;")
@@ -322,7 +334,14 @@ def _build_html(
     underline: bool = False,
     text_align: str = "left",
 ) -> tuple[str, str]:
-    # Build an HTML snippet and CSS string for insert_htmlbox
+    # Build an HTML snippet and CSS string for insert_htmlbox.
+    #
+    # IMPORTANT — CSS cascade fix for bold/italic:
+    # The global `* { }` rule is applied by insert_htmlbox as a base style.
+    # If it only sets font-size, the renderer may still inherit bold/italic
+    # from its own UA stylesheet for elements like <b>/<strong>.  We must
+    # explicitly reset font-weight and font-style in `*` to "normal" so that
+    # only our per-span inline styles control those properties.
     inner_style = _span_style(fontsize, color, flags, underline=underline)
     safe_text = _html_escape(text)
     html = (
@@ -330,8 +349,10 @@ def _build_html(
         f'<span style="{inner_style}">{safe_text}</span>'
         f'</div>'
     )
-    # Global CSS provides a base font-size fallback for insert_htmlbox layout
-    css = f"* {{font-size:{fontsize:.1f}px; font-family: sans-serif;}}"
+    css = (
+        f"* {{font-size:{fontsize:.1f}px; font-family:sans-serif;"
+        f"font-weight:normal; font-style:normal; text-decoration:none;}}"
+    )
     return html, css
 
 
@@ -379,8 +400,274 @@ def _build_multi_span_html(
         + "".join(html_parts)
         + "</div>"
     )
-    css = f"* {{font-size:{max_size:.1f}px; font-family: sans-serif;}}"
+    # Same CSS reset as _build_html — critical for bold/italic correctness
+    css = (
+        f"* {{font-size:{max_size:.1f}px; font-family:sans-serif;"
+        f"font-weight:normal; font-style:normal; text-decoration:none;}}"
+    )
     return html, css
+
+
+def _build_html_at_size(
+    text: str,
+    fontsize: float,
+    color: int,
+    flags: int,
+    *,
+    underline: bool = False,
+    text_align: str = "left",
+) -> tuple[str, str]:
+    """Convenience wrapper: rebuild HTML+CSS at an explicit (smaller) font size."""
+    return _build_html(text, fontsize, color, flags, underline=underline, text_align=text_align)
+
+
+def _collect_obstacle_rects(page: fitz.Page) -> list[fitz.Rect]:
+    """Return all image and opaque-drawing rects on *page*.
+
+    These are the zones that translated text must never expand into.
+    Image blocks are always obstacles.  Filled drawings (coloured banners,
+    backgrounds) are included so that text doesn't bleed into them either.
+    Small decorative drawings (< 200 pt²) are ignored to avoid false positives
+    from bullets, borders, and hairlines.
+    """
+    obstacles: list[fitz.Rect] = []
+    # Image blocks
+    for block in page.get_text("dict")["blocks"]:
+        if block.get("type") == 1:
+            r = fitz.Rect(block["bbox"])
+            if not r.is_empty:
+                obstacles.append(r)
+    # Filled drawings (coloured bands, shaded boxes, etc.)
+    try:
+        for drawing in page.get_drawings():
+            if drawing.get("fill") is None:
+                continue
+            if drawing.get("fill_opacity", 1.0) < 0.1:
+                continue
+            r = fitz.Rect(drawing["rect"])
+            if r.is_empty:
+                continue
+            if r.width * r.height < 200:
+                continue
+            obstacles.append(r)
+    except Exception:
+        pass
+    return obstacles
+
+
+def _rect_clear_of_obstacles(
+    rect: fitz.Rect,
+    obstacles: list[fitz.Rect],
+    origin: fitz.Rect,
+) -> bool:
+    """Return True if *rect* does not overlap any obstacle in a meaningful way.
+
+    We allow overlap with the obstacle that already contained the *origin* rect
+    (i.e. the text was originally sitting on top of a coloured background — that
+    is intentional and should be preserved).  Any *new* obstacle introduced by
+    the expansion is a collision.
+    """
+    for obs in obstacles:
+        inter = rect & obs
+        if inter.is_empty:
+            continue
+        overlap_area = inter.width * inter.height
+        if overlap_area < 4:          # sub-pixel noise
+            continue
+        # Allow if the origin already overlapped this obstacle substantially
+        orig_inter = origin & obs
+        if not orig_inter.is_empty and (orig_inter.width * orig_inter.height) >= overlap_area * 0.5:
+            continue
+        return False
+    return True
+
+
+def _probe_fits(probe_doc: fitz.Document, rect: fitz.Rect, html: str, css: str) -> bool:
+    """Return True if *html* fits inside *rect* without text overflow.
+
+    Uses a throw-away document so the real page is never touched here.
+    """
+    try:
+        page = probe_doc[0]
+        page.set_mediabox(fitz.Rect(0, 0, max(rect.width, 1), max(rect.height, 1)))
+        shifted = fitz.Rect(0, 0, rect.width, rect.height)
+        result = page.insert_htmlbox(shifted, html, css=css)
+        page.clean_contents()
+        return result[0] >= 0
+    except Exception:
+        return False
+
+
+def _max_free_x1(
+    rect: fitz.Rect,
+    page_width: float,
+    obstacles: list[fitz.Rect],
+) -> float:
+    """Return the rightmost x1 we can reach from rect.x1 without hitting an obstacle."""
+    limit = page_width - 1.0
+    for obs in obstacles:
+        # Only obstacles that vertically overlap our rect row matter
+        if obs.y0 >= rect.y1 or obs.y1 <= rect.y0:
+            continue
+        # If the obstacle starts to the right of our current x1, it caps us
+        if obs.x0 > rect.x1 and obs.x0 < limit:
+            limit = obs.x0 - 1.0
+    return max(limit, rect.x1)
+
+
+def _max_free_x0(
+    rect: fitz.Rect,
+    obstacles: list[fitz.Rect],
+) -> float:
+    """Return the leftmost x0 we can reach from rect.x0 without hitting an obstacle."""
+    limit = 1.0
+    for obs in obstacles:
+        if obs.y0 >= rect.y1 or obs.y1 <= rect.y0:
+            continue
+        if obs.x1 < rect.x0 and obs.x1 > limit:
+            limit = obs.x1 + 1.0
+    return min(limit, rect.x0)
+
+
+def _max_free_y1(
+    rect: fitz.Rect,
+    page_height: float,
+    obstacles: list[fitz.Rect],
+    sibling_rects: list[fitz.Rect],
+) -> float:
+    """Return the lowest y1 we can reach downward without hitting an obstacle or sibling."""
+    limit = page_height - 1.0
+    for obs in obstacles:
+        if obs.x0 >= rect.x1 or obs.x1 <= rect.x0:
+            continue
+        if obs.y0 > rect.y1 and obs.y0 < limit:
+            limit = obs.y0 - 1.0
+    for sib in sibling_rects:
+        if sib.x0 >= rect.x1 or sib.x1 <= rect.x0:
+            continue
+        if sib.y0 > rect.y1 and sib.y0 < limit:
+            limit = sib.y0 - 1.0
+    return max(limit, rect.y1)
+
+
+def _try_fit_text(
+    rect: fitz.Rect,
+    html: str,
+    css: str,
+    fontsize: float,
+    color: int,
+    flags: int,
+    text: str,
+    *,
+    underline: bool = False,
+    text_align: str = "left",
+    page_width: float = 0.0,
+    page_height: float = 0.0,
+    obstacles: list[fitz.Rect] | None = None,
+    sibling_rects: list[fitz.Rect] | None = None,
+) -> tuple[fitz.Rect, str, str]:
+    """Determine the best (rect, html, css) to fit *text* without overflow or collision.
+
+    Strategy (in order — no writes to the real page happen here):
+
+    1. Original rect + small vertical padding.  If it fits, done.
+    2. Expand HORIZONTALLY in small steps, respecting obstacle/sibling
+       boundaries, until text fits or no more room remains.
+       • First expand right (most natural for LTR), then also left.
+    3. Shrink font size progressively (down to _MIN_FONT_SCALE × original)
+       on the widest obstacle-free rect found so far.
+    4. Expand VERTICALLY downward in small steps, checking obstacle and
+       sibling-line boundaries, until text fits or _MAX_RECT_EXPANSION reached.
+
+    All probes use a throw-away document so the real page is never written.
+    The caller does exactly ONE insert_htmlbox call with the returned result.
+    """
+    _obstacles = obstacles or []
+    _siblings = sibling_rects or []
+
+    probe_doc = fitz.open()
+    probe_doc.new_page(width=max(rect.width, 1), height=max(rect.height, 1))
+
+    # Step 0: small vertical padding so ascenders/descenders breathe
+    safe_y1 = rect.y1 + _LINE_RECT_VPAD
+    if page_height > 0:
+        safe_y1 = min(safe_y1, page_height - 1.0)
+    padded_rect = fitz.Rect(rect.x0, rect.y0, rect.x1, safe_y1)
+
+    if _probe_fits(probe_doc, padded_rect, html, css):
+        probe_doc.close()
+        return padded_rect, html, css
+
+    # Step 1: horizontal expansion — grow right then left in small steps,
+    # stopping at the first obstacle or page edge.
+    h_rect = fitz.Rect(padded_rect)
+
+    if page_width > 0:
+        free_x1 = _max_free_x1(h_rect, page_width, _obstacles)
+        free_x0 = _max_free_x0(h_rect, _obstacles)
+
+        # Expand right in ~10 pt steps so we use only as much as needed
+        step_h = max((free_x1 - h_rect.x1) / 8, 2.0)
+        candidate_x1 = h_rect.x1
+        while candidate_x1 < free_x1 - 0.5:
+            candidate_x1 = min(candidate_x1 + step_h, free_x1)
+            candidate = fitz.Rect(h_rect.x0, h_rect.y0, candidate_x1, h_rect.y1)
+            if _probe_fits(probe_doc, candidate, html, css):
+                probe_doc.close()
+                return candidate, html, css
+            h_rect = candidate  # keep widest reached so far
+
+        # Expand left in ~10 pt steps
+        step_h = max((h_rect.x0 - free_x0) / 8, 2.0)
+        candidate_x0 = h_rect.x0
+        while candidate_x0 > free_x0 + 0.5:
+            candidate_x0 = max(candidate_x0 - step_h, free_x0)
+            candidate = fitz.Rect(candidate_x0, h_rect.y0, h_rect.x1, h_rect.y1)
+            if _probe_fits(probe_doc, candidate, html, css):
+                probe_doc.close()
+                return candidate, html, css
+            h_rect = candidate
+
+    # Step 2: shrink font size on the widest obstacle-free rect
+    min_size = max(4.0, fontsize * _MIN_FONT_SCALE)
+    n_steps = 6
+    step_size = (fontsize - min_size) / n_steps
+    current_size = fontsize - step_size
+    best_html, best_css = html, css
+
+    while current_size >= min_size - 0.1:
+        h, c = _build_html_at_size(
+            text, current_size, color, flags,
+            underline=underline, text_align=text_align,
+        )
+        if _probe_fits(probe_doc, h_rect, h, c):
+            probe_doc.close()
+            return h_rect, h, c
+        best_html, best_css = h, c
+        current_size -= step_size
+
+    # Step 3: expand downward — but only into obstacle-free, sibling-free space
+    free_y1 = _max_free_y1(h_rect, page_height if page_height > 0 else h_rect.y1 + _MAX_RECT_EXPANSION,
+                           _obstacles, _siblings)
+    max_expand = min(_MAX_RECT_EXPANSION, free_y1 - h_rect.y1)
+
+    expand_step = max(fontsize * 0.6, 4.0)
+    v_rect = fitz.Rect(h_rect)
+    total_expanded = 0.0
+
+    while total_expanded < max_expand - 0.5:
+        new_y1 = min(v_rect.y1 + expand_step, h_rect.y1 + max_expand)
+        if new_y1 <= v_rect.y1 + 0.5:
+            break
+        v_rect = fitz.Rect(v_rect.x0, v_rect.y0, v_rect.x1, new_y1)
+        total_expanded = v_rect.y1 - h_rect.y1
+
+        if _probe_fits(probe_doc, v_rect, best_html, best_css):
+            probe_doc.close()
+            return v_rect, best_html, best_css
+
+    probe_doc.close()
+    return v_rect, best_html, best_css
 
 
 # Main entry point
@@ -464,11 +751,13 @@ def translate_pdf(
         pdi = len(page_line_data)
         page_line_data.append((page_num, visible_infos, para_groups))
 
+        # FIX: was referencing `line_infos` (full list) instead of `visible_infos`
+        # (filtered list). This caused index mismatches when lines were skipped.
         for gi, group in enumerate(para_groups):
             if len(group) == 1:
-                all_units.append(line_infos[group[0]]["text"])
+                all_units.append(visible_infos[group[0]]["text"])
             else:
-                all_units.append("\n".join(line_infos[idx]["text"] for idx in group))
+                all_units.append("\n".join(visible_infos[idx]["text"] for idx in group))
             unit_map.append((pdi, gi))
 
     # --- Phase 2: single batch translation for all paragraph groups ---
@@ -500,14 +789,14 @@ def translate_pdf(
     # Build a flat per-line translated text list per page
     page_translated: dict[int, dict[int, str]] = {}  # pdi -> {line_idx: translated}
     for unit_idx, (pdi, gi) in enumerate(unit_map):
-        page_num, line_infos, para_groups = page_line_data[pdi]
+        page_num, visible_infos, para_groups = page_line_data[pdi]
         group = para_groups[gi]
         tr_text = all_translated[unit_idx] if unit_idx < len(all_translated) else None
 
         line_map = page_translated.setdefault(pdi, {})
         if tr_text is None:
             for lidx in group:
-                line_map[lidx] = line_infos[lidx]["text"]
+                line_map[lidx] = visible_infos[lidx]["text"]
             errors += 1
         elif len(group) == 1:
             line_map[group[0]] = tr_text
@@ -536,14 +825,25 @@ def translate_pdf(
             raise CancelledError("Translation cancelled")
 
         page = src[page_num]
+        page_height = page.rect.height
         line_map = page_translated.get(pdi, {})
+
+        # Collect all image/drawing obstacles BEFORE redaction so we have an
+        # accurate picture of what content is on the page.
+        obstacles = _collect_obstacle_rects(page)
 
         # Redact original text per-line
         for info in line_infos:
             page.add_redact_annot(info["rect"], fill=None)  # type: ignore[arg-type]
         page.apply_redactions(images=0)  # type: ignore[arg-type]
 
-        # Insert translated text using insert_htmlbox
+        # Build the full list of original text rects for sibling-collision
+        # detection.  We track placed rects so that as we insert lines we
+        # also avoid colliding with already-inserted siblings.
+        all_line_rects: list[fitz.Rect] = [info["rect"] for info in line_infos]
+        placed_rects: list[fitz.Rect] = []
+
+        # Insert translated text using insert_htmlbox with smart fitting
         for li_idx, info in enumerate(line_infos):
             tr_text = line_map.get(li_idx, info["text"])
 
@@ -552,6 +852,14 @@ def translate_pdf(
             underline: bool = info.get("underline", False)
             page_width: float = info.get("page_width", 0.0)
             text_align: str = _infer_text_align(orig_rect, page_width)
+
+            # Sibling rects = all other original line rects + already-placed
+            # translated rects.  This prevents vertical expansion from
+            # stomping on adjacent lines.
+            sibling_rects = (
+                [r for i, r in enumerate(all_line_rects) if i != li_idx]
+                + placed_rects
+            )
 
             if info.get("is_tagged") and info.get("span_formats"):
                 html, css = _build_multi_span_html(
@@ -571,12 +879,31 @@ def translate_pdf(
                 )
 
             try:
-                result = page.insert_htmlbox(orig_rect, html, css=css)
+                # Determine best rect/html/css via non-destructive probing,
+                # then do exactly ONE insert_htmlbox call on the real page.
+                fit_rect, fit_html, fit_css = _try_fit_text(
+                    orig_rect,
+                    html,
+                    css,
+                    fontsize,
+                    info["color"],
+                    info["flags"],
+                    tr_text,
+                    underline=underline,
+                    text_align=text_align,
+                    page_width=page_width,
+                    page_height=page_height,
+                    obstacles=obstacles,
+                    sibling_rects=sibling_rects,
+                )
+                result = page.insert_htmlbox(fit_rect, fit_html, css=fit_css)
+                placed_rects.append(fit_rect)
                 if result[0] < 0:
                     logger.debug(
-                        "insert_htmlbox could not fit text on page %d at rect %s",
+                        "insert_htmlbox could not fit text on page %d at rect %s "
+                        "(after fitting attempts)",
                         page_num + 1,
-                        orig_rect,
+                        fit_rect,
                     )
             except Exception:
                 logger.exception(

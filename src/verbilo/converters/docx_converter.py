@@ -207,6 +207,26 @@ def _is_inside_del(elem: etree._Element) -> bool:
     return False
 
 
+def _is_inside_drawing_run(elem: etree._Element) -> bool:
+    """Return True if *elem* is a ``<w:t>`` inside a ``<w:r>`` that also contains
+    a ``<w:drawing>``.
+
+    Word allows only one type of content per run — a run that holds a drawing
+    element must not also carry translatable text.  When a source document has
+    such a structure the text node is an artefact (e.g. leftover Chinese label
+    that survived the drawing-group wrapper); translating it causes the result
+    string to be rendered *on top of* the floating image instead of beside it.
+    """
+    _W_R       = qn('w:r')
+    _W_DRAWING = qn('w:drawing')
+    node = elem.getparent()
+    while node is not None:
+        if node.tag == _W_R:
+            return node.find(_W_DRAWING) is not None
+        node = node.getparent()
+    return False
+
+
 import re as _re
 
 _RE_PURE_NUMBER = _re.compile(
@@ -584,10 +604,30 @@ def _fix_anchor_wrapping(root: etree._Element) -> None:
 
 
 def _is_spacer_paragraph(para: etree._Element) -> bool:
-    """Return True if *para* is a layout-spacer paragraph with no visible text."""
+    """Return True if *para* is a layout-spacer paragraph with no visible text.
+
+    Paragraphs that host ``<wp:anchor>`` elements with
+    ``positionV relativeFrom="paragraph"`` (or "line" / "character") are
+    explicitly excluded even when they carry no visible ``<w:t>`` text.
+    Their line-height / before / after spacing is the vertical reference point
+    for the anchored drawing group; compressing it shifts the floating diagram
+    away from its surrounding labels and arrows.
+    """
     for wt in para.iter(_WT_TAG):
         if wt.text and wt.text.strip():
             return False
+
+    # Protect paragraphs that anchor floating drawings to the text flow.
+    # These look like spacers (no visible text) but their spacing determines
+    # where the anchored image is rendered on the page.
+    _WP_ANCHOR = f'{{{_WP_NS}}}anchor'
+    _WP_POS_V  = f'{{{_WP_NS}}}positionV'
+    _TEXT_RELATIVE = {'paragraph', 'line', 'character'}
+    for anchor in para.iter(_WP_ANCHOR):
+        pos_v = anchor.find(_WP_POS_V)
+        if pos_v is not None and pos_v.get('relativeFrom', '') in _TEXT_RELATIVE:
+            return False
+
     return True
 
 
@@ -775,6 +815,13 @@ def _collect_wt_units(root: etree._Element) -> list[_TranslationUnit]:
 
         # Skip deleted text — translating it would corrupt tracked changes.
         if _is_inside_del(wt):
+            continue
+
+        # Skip <w:t> nodes that live inside a run which also contains a
+        # <w:drawing>.  Such runs hold a floating image; the <w:t> is an
+        # artefact that Word ignores visually but which we must not overwrite
+        # with translated text (doing so renders text on top of the image).
+        if _is_inside_drawing_run(wt):
             continue
 
         # Skip pure numbers — translators convert "42" → "forty-two", etc.
