@@ -41,6 +41,7 @@
 - Z-order guard is conservative: it avoids translating text entirely covered by opaque graphics rather than rewriting PDF content streams to change stacking order.
 - Very-short CJK tokens (1–2 characters) can behave inconsistently across translation APIs—prefer explicit source_lang to ensure correct source language.
 - Extremely complex layouts (heavy overlays, rotated text, or nonstandard encodings) can still produce visual artifacts - manual verification recommended for critical documents.
+- Chinese→English can be challenging for complex documents because Chinese often uses topic-prominent constructions while English is subject-prominent.
 
 ## Quick Start — For Developers
 

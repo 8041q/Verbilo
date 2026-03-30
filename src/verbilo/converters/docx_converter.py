@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 _NS_W   = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _NS_A   = "http://schemas.openxmlformats.org/drawingml/2006/main"
 _NS_VML = "urn:schemas-microsoft-com:vml"
+_NS_WPG = "http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"
 _DIAGRAM_DATA_CT = (
     "application/vnd.openxmlformats-officedocument.drawingml.diagramData+xml"
 )
@@ -194,11 +195,7 @@ def _is_in_heading(elem: etree._Element) -> bool:
 
 
 def _is_inside_del(elem: etree._Element) -> bool:
-    """Return True if *elem* is nested inside a ``<w:del>`` tracked-change block.
-
-    Text inside ``<w:del>`` represents deleted content and must NOT be
-    translated — it would corrupt the tracked-changes record.
-    """
+    # Return True if *elem* is nested inside a ``<w:del>`` tracked-change block.
     node = elem.getparent()
     while node is not None:
         if node.tag == _WDEL_TAG:
@@ -208,21 +205,23 @@ def _is_inside_del(elem: etree._Element) -> bool:
 
 
 def _is_inside_drawing_run(elem: etree._Element) -> bool:
-    """Return True if *elem* is a ``<w:t>`` inside a ``<w:r>`` that also contains
-    a ``<w:drawing>``.
-
-    Word allows only one type of content per run — a run that holds a drawing
-    element must not also carry translatable text.  When a source document has
-    such a structure the text node is an artefact (e.g. leftover Chinese label
-    that survived the drawing-group wrapper); translating it causes the result
-    string to be rendered *on top of* the floating image instead of beside it.
-    """
+    # Return True if *elem* is a ``<w:t>`` inside a ``<w:r>`` that also contains a ``<w:drawing>``.
     _W_R       = qn('w:r')
     _W_DRAWING = qn('w:drawing')
     node = elem.getparent()
     while node is not None:
         if node.tag == _W_R:
             return node.find(_W_DRAWING) is not None
+        node = node.getparent()
+    return False
+
+
+def _is_inside_wgp(elem: etree._Element) -> bool:
+    # Return True if *elem* is nested inside a ``<wpg:wgp>`` Word Processing Group.
+    node = elem.getparent()
+    while node is not None:
+        if node.tag == _WPG_WGP:
+            return True
         node = node.getparent()
     return False
 
@@ -252,26 +251,85 @@ _RE_HAS_DIGIT = _re.compile(r'\d')
 
 
 def _is_numeric_only(text: str) -> bool:
-    """Return True if *text* is a standalone number (possibly with units).
-
-    These are never sent to the translator to prevent silent conversion of
-    "42" → "forty-two" or decimal-separator reformatting.
-    """
+    # Return True if *text* is a standalone number (possibly with units).
     return bool(_RE_PURE_NUMBER.match(text))
 
 
-def _strip_protected_tokens(text: str) -> tuple[str, dict[str, str]]:
-    """Replace numeric tokens in *text* with placeholders before translation.
+# Matches strings that are entirely punctuation/symbols with no translatable
+# lexical content.  Sending these to OPUS-MT produces hallucinations because
+# the model has nothing real to work with.
+_RE_NO_TRANS = _re.compile(
+    r'^[\s'
+    r'\u0021-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u007E'  # ASCII punct
+    r'\u00A0-\u00BF'          # Latin-1 supplement (°, ±, ×, ÷ …)
+    r'\u2000-\u206F'          # General punctuation (—, …, •, etc.)
+    r'\u2190-\u21FF'          # Arrows
+    r'\u2300-\u23FF'          # Misc technical
+    r'\u2460-\u24FF'          # Enclosed alphanumerics (①②③)
+    r'\u2500-\u257F'          # Box drawing
+    r'\u2580-\u259F'          # Block elements
+    r'\u25A0-\u25FF'          # Geometric shapes (●○■□)
+    r'\u2600-\u26FF'          # Misc symbols (★☆)
+    r'\u2700-\u27BF'          # Dingbats
+    r'\u3000-\u303F'          # CJK punctuation (。，、；：？！…—～·【】《》)
+    r'\uFE50-\uFE6F'          # Small Form Variants (\uff62﹢﹣﹤﹥ etc.)
+    r'\uFF00-\uFF0F\uFF1A-\uFF20\uFF3B-\uFF40\uFF5B-\uFF65'  # Fullwidth punct
+    r'\uFF66-\uFFEF'          # Halfwidth/fullwidth
+    r']+$'
+)
 
-    Returns (masked_text, placeholder_map).  The caller should substitute
-    placeholders back after translation.
 
-    We protect:
-      - standalone integers and decimals (possibly thousands-grouped)
-      - years expressed as 4-digit sequences
-      - version strings like "3.14", "v2.0"
-      - sequences that are >= 50% digits by character count
+def _is_symbol_only(text: str) -> bool:
+    # Return True if *text* contains no translatable lexical content —
+    # only punctuation, symbols, whitespace, or enclosed numbers (①②③).
+    # Such segments cause hallucinations in OPUS-MT and should be skipped.
+    return bool(_RE_NO_TRANS.match(text))
+
+
+def _is_symbol_char(c: str) -> bool:
+    # Return True if the single character *c* is a non-translatable symbol.
+    # Used by strip_symbol_frame to identify leading/trailing decoration chars.
+    cp = ord(c)
+    return (
+        0x0021 <= cp <= 0x002F or 0x003A <= cp <= 0x0040 or
+        0x005B <= cp <= 0x0060 or 0x007B <= cp <= 0x007E or
+        0x00A0 <= cp <= 0x00BF or
+        0x2000 <= cp <= 0x206F or 0x2190 <= cp <= 0x21FF or
+        0x2300 <= cp <= 0x23FF or 0x2460 <= cp <= 0x24FF or
+        0x2500 <= cp <= 0x257F or 0x2580 <= cp <= 0x259F or
+        0x25A0 <= cp <= 0x25FF or 0x2600 <= cp <= 0x26FF or
+        0x2700 <= cp <= 0x27BF or
+        0x3000 <= cp <= 0x303F or
+        0xFE50 <= cp <= 0xFE6F or
+        0xFF00 <= cp <= 0xFF0F or 0xFF1A <= cp <= 0xFF20 or
+        0xFF3B <= cp <= 0xFF40 or 0xFF5B <= cp <= 0xFF65 or
+        0xFF66 <= cp <= 0xFFEF or
+        c in ' \t\n\r'
+    )
+
+
+def _strip_symbol_frame(text: str) -> tuple[str, str, str]:
+    """Split *text* into (prefix, core, suffix).
+
+    prefix and suffix are leading/trailing symbol/punctuation characters that
+    carry no lexical meaning (e.g. '●', '【', '】').  core is the translatable
+    content between them.
+
+    This handles segments like '●拔出电源描头' which should be translated as
+    '拔出电源描头' and then have the '●' reattached, rather than being sent
+    to the model with the symbol prefix that confuses it into dot-repetition.
     """
+    i = 0
+    while i < len(text) and _is_symbol_char(text[i]):
+        i += 1
+    j = len(text)
+    while j > i and _is_symbol_char(text[j - 1]):
+        j -= 1
+    return text[:i], text[i:j], text[j:]
+
+
+def _strip_protected_tokens(text: str) -> tuple[str, dict[str, str]]:
+    # Replace numeric tokens in *text* with placeholders before translation.
     placeholders: dict[str, str] = {}
     counter = [0]
 
@@ -292,11 +350,117 @@ def _strip_protected_tokens(text: str) -> tuple[str, dict[str, str]]:
     return masked, placeholders
 
 
+def _is_placeholder_only(text: str) -> bool:
+    """Return True if *text* is nothing but placeholder tokens and whitespace.
+
+    OPUS-MT and similar local NMT models hallucinate (repetition loops, garbage
+    output) when the entire input consists of placeholder tokens like [[N0]]
+    with no actual words to translate.  Segments that reduce to this after
+    masking should be passed through untranslated.
+    """
+    stripped = _re.sub(r'\[\[N\d+\]\]', '', text).strip()
+    return stripped == ''
+
+
 def _restore_protected_tokens(text: str, placeholders: dict[str, str]) -> str:
-    """Substitute placeholders back into *text* after translation."""
+    """Substitute placeholders back into *text* after translation.
+
+    Two-pass strategy:
+    1. Exact replacement — fast path for well-behaved translators.
+    2. Fuzzy replacement — catches common OPUS-MT bracket corruptions such as
+       [[N0)], [ [N0]], [[N 0]], (N0).
+    """
+    # Pass 1: exact
     for key, original in placeholders.items():
         text = text.replace(key, original)
+
+    # Pass 2: fuzzy — only needed when exact pass left tokens behind
+    for key, original in placeholders.items():
+        m = _re.match(r'\[\[N(\d+)\]\]', key)
+        if m is None:
+            continue
+        idx = _re.escape(m.group(1))
+        pattern = _re.compile(
+            r'[\[\(]\s*[\[\(]?\s*[Nn]\s*' + idx + r'\s*[\]\)][\]\)]?'
+        )
+        text = pattern.sub(original, text)
+
     return text
+
+
+# Compiled patterns used by the hallucination guard
+_RE_REPETITION  = _re.compile(r'(.{4,}?)\1{3,}')         # same chunk repeated 3+ times (adjacent)
+_RE_SENT_REPEAT = _re.compile(r'(\b.{6,}?)(\s+\1){2,}') # phrase repeated 3+ times with whitespace gap
+_RE_STUTTER     = _re.compile(r'(\b\S+\b)(\s+\1){4,}') # same word 5+ times in a row
+_RE_GARBAGE     = _re.compile(                              # mangled placeholder debris
+    r'U\s*[T]\s*\d'                                      # "UT95"-style artefacts
+    r'|,\s*,\s*,\s*,',                                   # run of empty commas
+)
+# Matches CJK unified ideographs and common CJK punctuation/symbols
+_RE_CJK = _re.compile(
+    r'[\u2E80-\u2EFF\u2F00-\u2FDF\u3000-\u303F\u3040-\u309F\u30A0-\u30FF'
+    r'\u3100-\u312F\u3200-\u32FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF'
+    r'\uFE30-\uFE4F]'
+)
+
+
+def _max_translated_len(source: str) -> int:
+    """Return the maximum plausible byte-length for a translation of *source*.
+
+    CJK characters routinely expand 8-15x into Latin script, so a flat 5x
+    multiplier on the raw source length causes massive false-positive rates
+    when translating Chinese/Japanese/Korean documents.  We count CJK chars
+    separately and give them a generous 15x budget; non-CJK chars keep 5x.
+    """
+    cjk_chars = len(_RE_CJK.findall(source))
+    other_chars = len(source) - cjk_chars
+    return cjk_chars * 15 + other_chars * 5
+
+
+def _is_hallucinated(translated: str, source: str) -> bool:
+    """Return True if *translated* looks like an NMT hallucination.
+
+    Heuristics (conservative — we would rather pass bad output than discard good):
+    - Output exceeds the CJK-aware length budget (repetition loop / verbosity).
+    - Output contains a chunk repeated 3+ times in a row.
+    - Output contains a phrase repeated 3+ times with whitespace gaps.
+    - Output contains 5+ consecutive repetitions of the same word.
+    - Output contains characteristic garbage patterns (e.g. "UT95", comma runs).
+    - Source has word characters but output has none (e.g. "* * * * * *").
+    """
+    if not translated.strip():
+        return False  # empty is handled elsewhere
+
+    if len(translated) > _max_translated_len(source):
+        logger.debug(
+            "Hallucination guard: output too long (%d vs budget %d, src=%r)",
+            len(translated), _max_translated_len(source), source[:30],
+        )
+        return True
+
+    if _RE_REPETITION.search(translated):
+        logger.debug("Hallucination guard: chunk repetition detected")
+        return True
+
+    if _RE_SENT_REPEAT.search(translated):
+        logger.debug("Hallucination guard: sentence repetition detected")
+        return True
+
+    if _RE_STUTTER.search(translated):
+        logger.debug("Hallucination guard: word stutter detected")
+        return True
+
+    if _RE_GARBAGE.search(translated):
+        logger.debug("Hallucination guard: garbage pattern detected in: %r", translated)
+        return True
+
+    # Flag output with no word characters only when the SOURCE had word characters.
+    # Pure-punctuation sources (●, /, °, ：) legitimately pass through as punctuation.
+    if _re.search(r'\w', source) and not _re.search(r'\w', translated):
+        logger.debug("Hallucination guard: no word characters in output")
+        return True
+
+    return False
 
 
 # ── Layout-protection passes ─────────────────────────────────────────────────
@@ -305,16 +469,23 @@ def _restore_protected_tokens(text: str, placeholders: dict[str, str]) -> str:
 
 _WP_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
 
+# wpg:wgp — Word Processing Group container (one anchor, many member shapes)
+_WPG_WGP     = f'{{{_NS_WPG}}}wgp'
+
+# wp: positional tags used for implicit-group anchor normalization
+_WP_ANCHOR_TAG  = f'{{{_WP_NS}}}anchor'
+_WP_POS_H_TAG   = f'{{{_WP_NS}}}positionH'
+_WP_POS_V_TAG2  = f'{{{_WP_NS}}}positionV'
+_WP_POS_OFFSET  = f'{{{_WP_NS}}}posOffset'
+_WP_EXTENT_TAG  = f'{{{_WP_NS}}}extent'
+
+# Bounding-box proximity threshold for implicit diagram group detection (EMU)
+# 914 400 EMU = 1 inch.  Shapes further apart than this are NOT the same group.
+_MAX_GROUP_GAP_EMU = 914_400
+
 
 def _fix_table_row_heights(root: etree._Element) -> None:
-    """Convert ``exact`` row-height constraints to ``atLeast``.
-
-    When a table row uses ``w:trHeight w:hRule="exact"``, Word will clip any
-    text that overflows the fixed height rather than expanding the row.  After
-    translation the text is usually longer, so clipping becomes visible.
-    Changing the rule to ``atLeast`` lets the row grow to fit its content while
-    still respecting the designer's minimum-height intent.
-    """
+    # Convert ``exact`` row-height constraints to ``atLeast``.
     TR_HEIGHT = qn('w:trHeight')
     H_RULE    = qn('w:hRule')
     for trh in root.iter(TR_HEIGHT):
@@ -324,22 +495,7 @@ def _fix_table_row_heights(root: etree._Element) -> None:
 
 
 def _fix_textbox_autofit(root: etree._Element) -> None:
-    """Enable shape auto-fit (``spAutoFit``) on text-box body properties where
-    the translated text might overflow the original fixed size.
-
-    Handles both ``<a:bodyPr>`` (DrawingML shapes / SmartArt) and
-    ``<wps:bodyPr>`` (modern Word text boxes via the wordprocessingShape
-    namespace).  Each can carry one of three resize-mode children:
-
-    * ``<a:noAutofit/>``  — clip text to the fixed box size  ← fixed ✗
-    * ``<a:normAutofit/>`` — shrink font to fit the box        ← shrinks text ✗
-    * ``<a:spAutoFit/>``  — grow the shape to fit the text    ← correct ✓
-    * (no child)           — Word defaults to clip behaviour  ← also fixed ✗
-
-    We replace ``noAutofit`` / ``normAutofit`` with ``spAutoFit`` and inject
-    ``spAutoFit`` where no child exists, so the text box always expands to
-    accommodate the (usually longer) translated text.
-    """
+    # Enable shape auto-fit (``spAutoFit``) on text-box body properties where the translated text might overflow the original fixed size.
     _NS_WPS      = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
     A_BODY_PR    = f'{{{_NS_A}}}bodyPr'
     WPS_BODY_PR  = f'{{{_NS_WPS}}}bodyPr'
@@ -349,6 +505,10 @@ def _fix_textbox_autofit(root: etree._Element) -> None:
     _AUTOFIT_TAGS = {A_NO_AUTOFIT, A_NORM_AUTO, A_SP_AUTO}
 
     for body_pr in [*root.iter(A_BODY_PR), *root.iter(WPS_BODY_PR)]:
+        # Skip shapes that are members of a wpg:wgp group — resizing them
+        # independently would break the group's internal layout.
+        if _is_inside_wgp(body_pr):
+            continue
         # Find any existing autofit child
         existing = next(
             (child for child in body_pr if child.tag in _AUTOFIT_TAGS), None
@@ -367,11 +527,7 @@ def _fix_textbox_autofit(root: etree._Element) -> None:
 
 
 def _fix_frame_autosize(root: etree._Element) -> None:
-    """Ensure legacy word-processing frames (``<w:framePr>``) can grow.
-
-    Frames created with ``<w:framePr w:h="..." w:hRule="exact">`` clip content
-    exactly like table rows.  We relax them to ``atLeast`` for the same reason.
-    """
+    # Ensure legacy word-processing frames (``<w:framePr>``) can grow.
     FRAME_PR = qn('w:framePr')
     H_RULE   = qn('w:hRule')
     for fp in root.iter(FRAME_PR):
@@ -381,16 +537,7 @@ def _fix_frame_autosize(root: etree._Element) -> None:
 
 
 def _fix_vml_textbox_autosize(root: etree._Element) -> None:
-    """Allow legacy VML text boxes to grow to fit translated (longer) text.
-
-    VML shapes use a ``style`` attribute on ``<v:shape>`` that carries
-    CSS-like ``key:value`` pairs separated by semicolons.  The property
-    ``mso-fit-shape-to-text:t`` tells Word to expand the shape height to fit
-    its content.  If it is absent or set to ``f`` (false) the shape clips.
-
-    We walk up from every ``<v:textbox>`` to its parent ``<v:shape>`` and
-    set / insert ``mso-fit-shape-to-text:t``.
-    """
+    # Allow legacy VML text boxes to grow to fit translated (longer) text.
     V_TEXTBOX = f'{{{_NS_VML}}}textbox'
     V_SHAPE   = f'{{{_NS_VML}}}shape'
 
@@ -430,26 +577,7 @@ def _fix_vml_textbox_autosize(root: etree._Element) -> None:
 
 
 def _expand_textbox_widths(root: etree._Element, expansion_ratio: float = 1.0) -> None:
-    """Widen label-sized DrawingML/WPS text boxes to reduce unwanted line-wrapping.
-
-    For CJK→Latin translation a phrase like "使用说明书" (5 chars) becomes
-    "User instructions" (17 chars).  Because CJK characters render at ~1 em
-    width and Latin characters at ~0.55 em on average, the translated text
-    needs roughly ``expansion_ratio × 0.45`` times the original box width.
-    ``spAutoFit`` handles vertical overflow when text wraps, but widening the
-    box first lets short labels stay on a single line.
-
-    Only narrow boxes (≤ ~2.2 in / 2 000 000 EMU) are widened — these are
-    labels and callouts.  Wide content boxes already have room and rely on
-    ``spAutoFit`` for vertical growth.
-
-    Shapes covered:
-    * ``<wps:wsp>`` containing ``<wps:txbx>`` — modern Word text boxes
-    * ``<a:sp>`` containing ``<a:txBody>``    — DrawingML shapes with text
-
-    Both the shape extents and the enclosing ``<wp:anchor>``/``<wp:inline>``
-    ``<wp:extent cx>`` are updated so Word does not clip at the container boundary.
-    """
+    # Widen label-sized DrawingML/WPS text boxes to reduce unwanted line-wrapping.
     _NS_WPS    = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
     WPS_WSP    = f'{{{_NS_WPS}}}wsp'
     WPS_SPR    = f'{{{_NS_WPS}}}spPr'
@@ -487,7 +615,7 @@ def _expand_textbox_widths(root: etree._Element, expansion_ratio: float = 1.0) -
             elem.set('cx', str(cx + increase))
 
     def _container_extent(shape_elem: etree._Element) -> etree._Element | None:
-        """Walk up to the enclosing wp:anchor / wp:inline and return its extent."""
+        # Walk up to the enclosing wp:anchor / wp:inline and return its extent
         node = shape_elem.getparent()
         while node is not None:
             if node.tag in (WP_ANCHOR, WP_INLINE):
@@ -497,6 +625,9 @@ def _expand_textbox_widths(root: etree._Element, expansion_ratio: float = 1.0) -
 
     # WPS text boxes: <wps:wsp> with <wps:txbx>
     for wsp in root.iter(WPS_WSP):
+        # Skip group members — their extents are in group-local coordinates.
+        if _is_inside_wgp(wsp):
+            continue
         if wsp.find(WPS_TXB) is None:
             continue
         spr = wsp.find(WPS_SPR)
@@ -511,6 +642,9 @@ def _expand_textbox_widths(root: etree._Element, expansion_ratio: float = 1.0) -
 
     # DrawingML shapes with a text body: <a:sp> containing <a:txBody>
     for sp in root.iter(A_SP):
+        # Skip group members — their extents are in group-local coordinates.
+        if _is_inside_wgp(sp):
+            continue
         if sp.find(A_TXBOD) is None:
             continue
         spr = sp.find(A_SP_PR)
@@ -525,30 +659,6 @@ def _expand_textbox_widths(root: etree._Element, expansion_ratio: float = 1.0) -
 
 
 def _fix_anchor_wrapping(root: etree._Element) -> None:
-    """Convert explicit ``wrapNone`` on standalone floating images to
-    ``wrapTopAndBottom`` so that expanded translated text does not overlap them.
-
-    An anchor image with ``wrapNone`` stays at its absolute page position even
-    as translated text expands below it, causing visible overlap.  Changing the
-    wrap mode to ``wrapTopAndBottom`` keeps the image exactly where it is but
-    tells Word to push text above and below the image instead of behind it.
-
-    The following anchors are **left untouched** to avoid breaking diagram
-    layouts (labels, arrows, callout groups):
-
-    * ``behindDoc="1"`` — background / watermark / diagram-underlay images
-      whose overlap with text is intentional.
-    * ``<wp:positionV relativeFrom>`` is ``paragraph``, ``line``, or
-      ``character`` — the image is vertically anchored to the text flow, not
-      the page.  Changing the wrap mode for these elements disrupts the visual
-      grouping of diagram components (images + labels + arrows that all anchor
-      to the same paragraph).
-    * Anchors inside a ``<w:tc>`` table cell — cell-positioned images use
-      cell-relative coordinates.
-    * Anchors with no explicit ``<wp:wrapNone/>`` child — absence of a wrap
-      element is another indicator of a deliberately-composed diagram group.
-    * Anchors that already carry any non-None wrap mode.
-    """
     W_TC         = qn('w:tc')
     WP_ANCHOR    = f'{{{_WP_NS}}}anchor'
     WP_POS_V     = f'{{{_WP_NS}}}positionV'
@@ -601,15 +711,7 @@ def _fix_anchor_wrapping(root: etree._Element) -> None:
 
 
 def _is_spacer_paragraph(para: etree._Element) -> bool:
-    """Return True if *para* is a layout-spacer paragraph with no visible text.
-
-    Paragraphs that host ``<wp:anchor>`` elements with
-    ``positionV relativeFrom="paragraph"`` (or "line" / "character") are
-    explicitly excluded even when they carry no visible ``<w:t>`` text.
-    Their line-height / before / after spacing is the vertical reference point
-    for the anchored drawing group; compressing it shifts the floating diagram
-    away from its surrounding labels and arrows.
-    """
+    # Return True if *para* is a layout-spacer paragraph with no visible text.
     for wt in para.iter(_WT_TAG):
         if wt.text and wt.text.strip():
             return False
@@ -629,7 +731,7 @@ def _is_spacer_paragraph(para: etree._Element) -> bool:
 
 
 def _para_has_page_break(para: etree._Element) -> bool:
-    """Return True if *para* starts a new page via pageBreakBefore or a w:br page break."""
+    # Return True if *para* starts a new page via pageBreakBefore or a w:br page break.
     W_P     = qn('w:p')
     W_PPR   = qn('w:pPr')
     W_PBB   = qn('w:pageBreakBefore')
@@ -654,12 +756,7 @@ def _para_has_page_break(para: etree._Element) -> bool:
 
 
 def _collect_page_sections(root: etree._Element) -> list[list[etree._Element]]:
-    """Split all body paragraphs into page sections divided by hard page breaks.
-
-    Returns a list of sections, each section being a list of ``<w:p>`` elements
-    that belong to the same logical page.  The paragraph that carries the page
-    break starts the new section.
-    """
+    # Split all body paragraphs into page sections divided by hard page breaks.
     W_BODY = qn('w:body')
     W_P    = qn('w:p')
     W_TBL  = qn('w:tbl')
@@ -682,21 +779,7 @@ def _compress_section_spacing(
     section: list[etree._Element],
     expansion_ratio: float,
 ) -> None:
-    """Compress spacing within one page section proportionally to expansion_ratio.
-
-    Strategy
-    --------
-    1. Spacer paragraphs (no text): compress ``w:before/after`` by
-       ``1/expansion_ratio``, clamped to [0.25, 1.0].  This reclaims the
-       vertical space that would otherwise push content onto the next page.
-    2. Content paragraphs: tiered compression based on expansion ratio:
-       - ratio ≤ 1.3  →  no compression
-       - 1.3 < ratio ≤ 2.0  →  ``max(0.50, 1/ratio)``
-       - ratio > 2.0  →  ``max(0.38, 1/ratio)`` (aggressive: typical CJK→Latin)
-    3. ``w:lineRule="exact"`` is always relaxed to ``atLeast`` regardless of
-       ratio, because Latin descenders clip under exact CJK-sized line heights.
-    4. Never reduce a spacing value below 0.
-    """
+    # Compress spacing within one page section proportionally to expansion_ratio.
     if expansion_ratio <= 1.0:
         # Relax exact line spacing even when text didn't expand
         for para in section:
@@ -741,7 +824,7 @@ def _compress_section_spacing(
 
 
 def _relax_exact_line_spacing(para: etree._Element) -> None:
-    """Change ``w:lineRule="exact"`` to ``atLeast`` on a single paragraph."""
+    # Change ``w:lineRule="exact"`` to ``atLeast`` on a single paragraph.
     W_PPR      = qn('w:pPr')
     W_SPACING  = qn('w:spacing')
     W_LINERULE = qn('w:lineRule')
@@ -757,7 +840,7 @@ def _relax_exact_line_spacing(para: etree._Element) -> None:
 
 
 def _compress_spacer_spacing(root: etree._Element, expansion_ratio: float) -> None:
-    """Compress spacing section-by-section, respecting hard page boundaries."""
+    # Compress spacing section-by-section, respecting hard page boundaries.
     if expansion_ratio <= 1.0:
         return
     for section in _collect_page_sections(root):
@@ -765,22 +848,14 @@ def _compress_spacer_spacing(root: etree._Element, expansion_ratio: float) -> No
 
 
 def _compress_paragraph_spacing(root: etree._Element, expansion_ratio: float) -> None:
-    """Relax exact line spacing on all paragraphs (handled inside section pass)."""
+    # Relax exact line spacing on all paragraphs (handled inside section pass).
     # This is now a no-op — the section-aware pass in _compress_spacer_spacing
     # handles both spacer and content paragraphs together so we don't double-apply.
     pass
 
 
 def _ensure_list_indentation(root: etree._Element) -> None:
-    """Add standard Western indentation to list paragraphs that have none.
-
-    CJK source documents often format bullet/numbered lists without explicit
-    ``w:ind`` because CJK characters have fixed-width cells.  After translation
-    to Latin script the list items appear flush-left.  We apply standard Office
-    indentation (720 twips per indent level, 360-twip hanging) to any paragraph
-    that carries ``w:numPr`` but lacks a meaningful ``w:left`` indent
-    (< 360 twips / 0.25 inch).
-    """
+    # Add standard Western indentation to list paragraphs that have none.
     W_P       = qn('w:p')
     W_PPR     = qn('w:pPr')
     W_NUMPR   = qn('w:numPr')
@@ -836,17 +911,150 @@ def _ensure_list_indentation(root: etree._Element) -> None:
         )
 
 
-def _apply_layout_fixes(root: etree._Element, expansion_ratio: float = 1.0) -> None:
-    """Run all layout-protection passes on *root* in one call.
+def _normalize_anchor_reference_frames(root: etree._Element) -> None:
+    # Unify ``positionV`` reference frames for implicitly grouped floating anchors.
+    W_P         = qn('w:p')
+    _PARA_REL   = {'paragraph', 'line', 'character'}
 
-    Parameters
-    ----------
-    expansion_ratio:
-        Ratio of total translated characters to total source characters for
-        this XML part.  Values > 1 mean the translation is longer (common for
-        CJK→Latin).  Used to scale down spacing on spacer and content
-        paragraphs so page layout is preserved.
-    """
+    def _read_anchor_bbox(
+        anchor: etree._Element,
+    ) -> tuple[int, int, int, int] | None:
+        """Return (x0, y0, x1, y1) bounding box in EMU, or None if unreadable."""
+        try:
+            pos_h = anchor.find(_WP_POS_H_TAG)
+            pos_v = anchor.find(_WP_POS_V_TAG2)
+            ext   = anchor.find(_WP_EXTENT_TAG)
+            if pos_h is None or pos_v is None or ext is None:
+                return None
+            off_h_elem = pos_h.find(_WP_POS_OFFSET)
+            off_v_elem = pos_v.find(_WP_POS_OFFSET)
+            if off_h_elem is None or off_v_elem is None:
+                return None
+            x0 = int(off_h_elem.text or '0')
+            y0 = int(off_v_elem.text or '0')
+            cx = int(ext.get('cx', '0'))
+            cy = int(ext.get('cy', '0'))
+            return x0, y0, x0 + cx, y0 + cy
+        except (ValueError, TypeError):
+            return None
+
+    def _bbox_gap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> int:
+        """Chebyshev gap between two bounding boxes (0 if they overlap)."""
+        x_gap = max(0, max(a[0], b[0]) - min(a[2], b[2]))
+        y_gap = max(0, max(a[1], b[1]) - min(a[3], b[3]))
+        return max(x_gap, y_gap)
+
+    for para in root.iter(W_P):
+        # Collect all wp:anchor elements nested anywhere inside this paragraph.
+        anchors = list(para.iter(_WP_ANCHOR_TAG))
+        if len(anchors) < 2:
+            continue
+
+        # Read bounding boxes and relativeFrom values.
+        bboxes: list[tuple[int, int, int, int] | None] = []
+        rel_v:  list[str] = []
+        for anchor in anchors:
+            bboxes.append(_read_anchor_bbox(anchor))
+            pv = anchor.find(_WP_POS_V_TAG2)
+            rel_v.append(pv.get('relativeFrom', '') if pv is not None else '')
+
+        # Only act if the paragraph has mixed relativeFrom values.
+        has_page = any(r == 'page' for r in rel_v)
+        has_para = any(r in _PARA_REL for r in rel_v)
+        if not (has_page and has_para):
+            continue
+
+        # Build proximity clusters (single-linkage connected-components).
+        n = len(anchors)
+        cluster_id = list(range(n))          # each anchor starts in its own cluster
+
+        def _find(i: int) -> int:
+            while cluster_id[i] != i:
+                cluster_id[i] = cluster_id[cluster_id[i]]
+                i = cluster_id[i]
+            return i
+
+        def _union(i: int, j: int) -> None:
+            ri, rj = _find(i), _find(j)
+            if ri != rj:
+                cluster_id[ri] = rj
+
+        for i in range(n):
+            if bboxes[i] is None:
+                continue
+            for j in range(i + 1, n):
+                if bboxes[j] is None:
+                    continue
+                if _bbox_gap(bboxes[i], bboxes[j]) <= _MAX_GROUP_GAP_EMU:
+                    _union(i, j)
+
+        # Group indices by cluster root.
+        from collections import defaultdict
+        clusters: dict[int, list[int]] = defaultdict(list)
+        for i in range(n):
+            clusters[_find(i)].append(i)
+
+        # For each cluster: if it mixes page-absolute + paragraph-relative
+        # anchors, convert the page-absolute ones.
+        for members in clusters.values():
+            page_idxs = [i for i in members if rel_v[i] == 'page']
+            para_idxs = [i for i in members if rel_v[i] in _PARA_REL]
+            if not page_idxs or not para_idxs:
+                continue  # Homogeneous cluster — nothing to do
+
+            # Estimate the paragraph's page-Y by pairing the para-relative
+            # anchor with the smallest absolute posV with the page-absolute
+            # anchor that is closest to it vertically.
+            # Both anchors are assumed to be at their correct visual positions
+            # right now (i.e. this is the SOURCE document's state).
+            # para_page_Y ≈ page_posV − para_posV
+            best_para_y0: int | None = None
+            best_page_y0: int | None = None
+
+            for i in para_idxs:
+                if bboxes[i] is not None:
+                    y0 = bboxes[i][1]
+                    if best_para_y0 is None or y0 < best_para_y0:
+                        best_para_y0 = y0
+
+            for i in page_idxs:
+                if bboxes[i] is not None:
+                    y0 = bboxes[i][1]
+                    if best_page_y0 is None or y0 < best_page_y0:
+                        best_page_y0 = y0
+
+            if best_para_y0 is None or best_page_y0 is None:
+                continue  # Can't estimate — skip cluster
+
+            para_page_Y = best_page_y0 - best_para_y0
+
+            # Convert each page-absolute anchor.
+            for i in page_idxs:
+                anchor = anchors[i]
+                pv = anchor.find(_WP_POS_V_TAG2)
+                if pv is None:
+                    continue
+                off_elem = pv.find(_WP_POS_OFFSET)
+                if off_elem is None:
+                    continue
+                try:
+                    current_y = int(off_elem.text or '0')
+                except ValueError:
+                    continue
+
+                new_y = current_y - para_page_Y
+                pv.set('relativeFrom', 'paragraph')
+                off_elem.text = str(new_y)
+                logger.debug(
+                    "Converted anchor positionV: page@%d → paragraph@%d "
+                    "(para_page_Y=%d)",
+                    current_y, new_y, para_page_Y,
+                )
+
+
+def _apply_layout_fixes(root: etree._Element, expansion_ratio: float = 1.0) -> None:
+    # Run all layout-protection passes on *root* in one call.
+    _normalize_anchor_reference_frames(root)
     _fix_table_row_heights(root)
     _fix_textbox_autofit(root)
     _fix_frame_autosize(root)
@@ -890,20 +1098,45 @@ def _collect_wt_units(root: etree._Element) -> list[_TranslationUnit]:
         if _is_numeric_only(text):
             continue
 
+        # Skip symbol/punctuation-only segments — no lexical content to translate,
+        # and sending them to OPUS-MT causes hallucinations.
+        if _is_symbol_only(text):
+            continue
+
+        # Strip leading/trailing symbol chars (e.g. '●' in '●拔出电源描头') so
+        # the model only sees the translatable core.  The symbols are reattached
+        # verbatim in write_back.  If nothing translatable remains, skip.
+        sym_prefix, core_text, sym_suffix = _strip_symbol_frame(text.strip())
+        if not core_text:
+            continue
+
         # For mixed text (e.g. "2023年"), mask numeric tokens so they survive
         # translation unchanged, then restore them in write_back.
-        masked_text, placeholders = _strip_protected_tokens(text.strip())
+        masked_text, placeholders = _strip_protected_tokens(core_text)
         is_heading = _is_in_heading(wt)
 
-        def _make_wb(elem: etree._Element, orig_text: str, ph: dict[str, str]):
+        # If masking consumed everything, sending placeholder-only text to
+        # OPUS-MT causes hallucinations — skip the segment entirely.
+        if _is_placeholder_only(masked_text):
+            continue
+
+        def _make_wb(elem: etree._Element, orig_text: str, ph: dict[str, str],
+                     src: str, s_pre: str, s_suf: str):
             def wb(translated: str) -> None:
                 # Restore any numeric placeholders the translator may have mangled
                 result = _restore_protected_tokens(translated, ph)
-                # Preserve leading/trailing whitespace from the original
+                # Reject hallucinated output — fall back to the original core
+                if _is_hallucinated(result, src):
+                    logger.warning(
+                        "Hallucination detected; keeping original: %r -> %r",
+                        orig_text, result,
+                    )
+                    result = _restore_protected_tokens(src, ph)
+                # Reattach symbol frame and preserve original whitespace
                 leading  = orig_text[: len(orig_text) - len(orig_text.lstrip())]
                 trailing = orig_text[len(orig_text.rstrip()):]
-                elem.text = leading + result.strip() + trailing
-                if leading or trailing:
+                elem.text = leading + s_pre + result.strip() + s_suf + trailing
+                if leading or trailing or s_pre or s_suf:
                     elem.set(
                         '{http://www.w3.org/XML/1998/namespace}space', 'preserve'
                     )
@@ -912,7 +1145,8 @@ def _collect_wt_units(root: etree._Element) -> list[_TranslationUnit]:
         units.append(_TranslationUnit(
             source_text=masked_text,
             is_heading=is_heading,
-            write_back=_make_wb(wt, text, placeholders),
+            write_back=_make_wb(wt, text, placeholders, masked_text,
+                                sym_prefix, sym_suffix),
         ))
 
     return units
@@ -931,21 +1165,40 @@ def _collect_drawingml_units(root: etree._Element) -> list[_TranslationUnit]:
         if _is_numeric_only(text):
             continue
 
-        masked_text, placeholders = _strip_protected_tokens(text.strip())
+        if _is_symbol_only(text):
+            continue
 
-        def _make_wb(e: etree._Element, orig_text: str, ph: dict[str, str]):
+        sym_prefix, core_text, sym_suffix = _strip_symbol_frame(text.strip())
+        if not core_text:
+            continue
+
+        masked_text, placeholders = _strip_protected_tokens(core_text)
+
+        # If masking consumed everything, skip to avoid OPUS-MT hallucinations.
+        if _is_placeholder_only(masked_text):
+            continue
+
+        def _make_wb(e: etree._Element, orig_text: str, ph: dict[str, str],
+                     src: str, s_pre: str, s_suf: str):
             def wb(translated: str) -> None:
                 result = _restore_protected_tokens(translated, ph)
+                if _is_hallucinated(result, src):
+                    logger.warning(
+                        "Hallucination detected; keeping original: %r -> %r",
+                        orig_text, result,
+                    )
+                    result = _restore_protected_tokens(src, ph)
                 leading  = orig_text[: len(orig_text) - len(orig_text.lstrip())]
                 trailing = orig_text[len(orig_text.rstrip()):]
-                e.text = leading + result.strip() + trailing
-                if leading or trailing:
+                e.text = leading + s_pre + result.strip() + s_suf + trailing
+                if leading or trailing or s_pre or s_suf:
                     e.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
             return wb
 
         units.append(_TranslationUnit(
             source_text=masked_text,
-            write_back=_make_wb(at_elem, text, placeholders),
+            write_back=_make_wb(at_elem, text, placeholders, masked_text,
+                                sym_prefix, sym_suffix),
         ))
 
     return units
