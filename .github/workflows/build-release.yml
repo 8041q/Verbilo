@@ -44,7 +44,7 @@ jobs:
             ${{ runner.os }}-nuitka-
 
       - name: Download models
-        run: python scripts/download_models.py --dest models/lid.176.bin
+        run: python scripts/download_models.py fasttext --dest models/lid.176.bin
 
       - name: Build with Nuitka
         env:
