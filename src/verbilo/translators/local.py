@@ -159,21 +159,52 @@ class OpusMTTranslator:
     # Low-level translation helpers
     # ------------------------------------------------------------------
 
+    # Per-language-pair generation parameters for CTranslate2.  The zh-en pair
+    # gets a shorter-favoring length_penalty because Chinese topic-prominent
+    # constructions expand significantly into English subject-prominent prose.
+    _PAIR_PARAMS: dict[str, dict] = {
+        "zh-en": {
+            "beam_size": 2,
+            "max_decoding_length": 256,
+            "length_penalty": 0.8,
+            "repetition_penalty": 1.2,
+            "no_repeat_ngram_size": 3,
+        },
+    }
+    _DEFAULT_PARAMS: dict = {
+        "beam_size": 2,
+        "max_decoding_length": 512,
+        "length_penalty": 1.0,
+        "repetition_penalty": 1.0,
+        "no_repeat_ngram_size": 0,
+    }
+
     def _tokenize(self, sp, text: str) -> list[str]:
         return sp.Encode(text, out_type=str) + ["</s>"]
 
     def _detokenize(self, sp, tokens: list[str]) -> str:
         return sp.Decode(tokens)
 
-    def _translate_tokens(self, model, tokens_batch: list[list[str]]) -> list[list[str]]:
-        results = model.translate_batch(tokens_batch, beam_size=2, max_decoding_length=512)
+    def _translate_tokens(
+        self, model, tokens_batch: list[list[str]], src: str = "", tgt: str = "",
+    ) -> list[list[str]]:
+        pair_key = f"{src}-{tgt}" if src and tgt else ""
+        params = self._PAIR_PARAMS.get(pair_key, self._DEFAULT_PARAMS)
+        results = model.translate_batch(
+            tokens_batch,
+            beam_size=params["beam_size"],
+            max_decoding_length=params["max_decoding_length"],
+            length_penalty=params["length_penalty"],
+            repetition_penalty=params["repetition_penalty"],
+            no_repeat_ngram_size=params["no_repeat_ngram_size"],
+        )
         return [r.hypotheses[0] for r in results]
 
     def _translate_single_raw(self, text: str, src: str, tgt: str) -> str:
         """Translate a single string through the CTranslate2 model."""
         translator, sp_source, sp_target = self._load_model(src, tgt)
         tokens = self._tokenize(sp_source, text)
-        translated = self._translate_tokens(translator, [tokens])
+        translated = self._translate_tokens(translator, [tokens], src=src, tgt=tgt)
         return self._detokenize(sp_target, translated[0])
 
     # ------------------------------------------------------------------
@@ -337,7 +368,9 @@ class OpusMTTranslator:
             chunk_texts = [t for t, _ in chunk]
 
             tokens_batch = [self._tokenize(sp_source, t) for t in chunk_texts]
-            translated_tokens = self._translate_tokens(translator, tokens_batch)
+            translated_tokens = self._translate_tokens(
+                translator, tokens_batch, src=src, tgt=target_lang,
+            )
 
             for (orig_text, indices), out_tokens in zip(chunk, translated_tokens):
                 tr_text = self._detokenize(sp_target, out_tokens)

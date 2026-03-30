@@ -231,17 +231,37 @@ import re as _re
 _RE_PURE_NUMBER = _re.compile(
     r"""
     ^[\s\u00a0]*           # optional leading whitespace / NBSP
-    [+-]?                  # optional sign
+    [+-﹢﹣]?              # optional sign (incl. fullwidth small-form ﹢﹣)
     (?:
         \d{1,3}(?:[.,\s]\d{3})*  # thousands-grouped integer e.g. 1,234
         |\d+                      # plain integer
     )
     (?:[.,]\d+)?           # optional decimal part
     [\s\u00a0]*            # optional trailing whitespace
-    (?:%|°|㎡|㎞|km|cm|mm|m²|m³|€|\$|£|¥|₹|元|円|₩)?  # optional unit
+    (?:%|°|℃|℉|㎡|㎞|km|cm|mm|m²|m³|€|\$|£|¥|₹|元|円|₩|V|A|W|Hz|kV|mA|kW|Ω|dB|MPa|kPa)?  # optional unit
     [\s\u00a0]*$
     """,
     _re.VERBOSE,
+)
+
+# Matches compound numeric/technical expressions that are language-independent
+# and should be passed through untranslated.  Examples:
+#   ﹢5℃～﹢40℃   0~75°   Φ20mm   DC24V   ≥75%RH   -20℃~+60℃
+_RE_TECHNICAL_EXPR = _re.compile(
+    r'^[\s\u00a0]*'
+    r'[+-﹢﹣]?'
+    r'[\d.,]+'
+    r'[\s\u00a0~～\-–—/×x*Φφ°℃℉%㎡㎞VAwWΩ㏀㏁HzdBMPakK㎝㎜㎝㎞℃℉]*'
+    r'(?:[+-﹢﹣]?[\d.,]+[\s\u00a0~～\-–—/×x*Φφ°℃℉%㎡㎞VAwWΩ㏀㏁HzdBMPakK㎝㎜]*)*'
+    r'(?:mm|cm|km|kV|mA|kW|Hz|dB|MPa|kPa|RH|VA|pF|nF|μF|mH|pH|Nm)?'
+    r'[\s\u00a0]*$'
+)
+
+# Matches standalone technical symbols with a number: Φ20, ≥75, ≤100
+_RE_SYMBOL_NUMBER = _re.compile(
+    r'^[\s\u00a0]*[Φφ≥≤><≧≦±∅][\s\u00a0]*\d[\d.,]*'
+    r'(?:mm|cm|km|kV|mA|kW|Hz|dB|MPa|kPa|RH|VA|pF|nF|μF|%|°|℃|℉)?'
+    r'[\s\u00a0]*$'
 )
 
 # Matches strings that are MOSTLY digits — the text contains digits but also
@@ -251,8 +271,13 @@ _RE_HAS_DIGIT = _re.compile(r'\d')
 
 
 def _is_numeric_only(text: str) -> bool:
-    # Return True if *text* is a standalone number (possibly with units).
-    return bool(_RE_PURE_NUMBER.match(text))
+    # Return True if *text* is a standalone number (possibly with units)
+    # or a compound technical expression (e.g. temperature ranges, dimensions).
+    return bool(
+        _RE_PURE_NUMBER.match(text)
+        or _RE_TECHNICAL_EXPR.match(text)
+        or _RE_SYMBOL_NUMBER.match(text)
+    )
 
 
 # Matches strings that are entirely punctuation/symbols with no translatable
@@ -299,91 +324,166 @@ def _is_symbol_char(c: str) -> bool:
         0x2500 <= cp <= 0x257F or 0x2580 <= cp <= 0x259F or
         0x25A0 <= cp <= 0x25FF or 0x2600 <= cp <= 0x26FF or
         0x2700 <= cp <= 0x27BF or
-        0x3000 <= cp <= 0x303F or
+        # CJK Symbols and Punctuation — exclude sentence-level punctuation
+        # 、(U+3001) and 。(U+3002) so the zh→en model handles them and they
+        # are not blindly reattached after translation, bypassing protection.
+        (0x3000 <= cp <= 0x303F and cp not in (0x3001, 0x3002)) or
         0xFE50 <= cp <= 0xFE6F or
-        0xFF00 <= cp <= 0xFF0F or 0xFF1A <= cp <= 0xFF20 or
+        # Fullwidth forms — exclude ％ (U+FF05) and ‰-adjacent chars that are
+        # covered by _PROTECTED_UNITS; stripping them as suffix would bypass
+        # placeholder protection and leave unrestored [[N…]] tokens in output.
+        (0xFF00 <= cp <= 0xFF0F and cp != 0xFF05) or
+        0xFF1A <= cp <= 0xFF20 or
         0xFF3B <= cp <= 0xFF40 or 0xFF5B <= cp <= 0xFF65 or
         0xFF66 <= cp <= 0xFFEF or
         c in ' \t\n\r'
     )
 
 
+# Matches an enumeration index at the current position, e.g. "1)", "12.", "a)"
+_RE_ENUM_INDEX = _re.compile(r'\d+[)\]>.] *|[a-zA-Z][)\]>.] *')
+
+
 def _strip_symbol_frame(text: str) -> tuple[str, str, str]:
-    """Split *text* into (prefix, core, suffix).
-
-    prefix and suffix are leading/trailing symbol/punctuation characters that
-    carry no lexical meaning (e.g. '●', '【', '】').  core is the translatable
-    content between them.
-
-    This handles segments like '●拔出电源描头' which should be translated as
-    '拔出电源描头' and then have the '●' reattached, rather than being sent
-    to the model with the symbol prefix that confuses it into dot-repetition.
-    """
+    # Split *text* into (prefix, core, suffix)
     i = 0
     while i < len(text) and _is_symbol_char(text[i]):
         i += 1
+    # Include an enumeration index that may follow the symbol prefix,
+    # e.g. "(1)" → prefix="(1)", not prefix="(" with core="1)…"
+    m = _RE_ENUM_INDEX.match(text, i)
+    if m:
+        i = m.end()
+        # After the enum index there may be more symbols (e.g. a space)
+        while i < len(text) and _is_symbol_char(text[i]):
+            i += 1
     j = len(text)
     while j > i and _is_symbol_char(text[j - 1]):
         j -= 1
     return text[:i], text[i:j], text[j:]
 
 
+# Special symbols / units that OPUS-MT's SentencePiece vocabulary cannot
+# represent.  These are protected as [[U0]], [[U1]], … placeholders before
+# translation and restored verbatim afterwards.
+_PROTECTED_UNITS = _re.compile(
+    r'℃|℉'                            # temperature symbols
+    r'|[﹢﹣]'                          # small-form plus/minus
+    r'|[～]'                            # fullwidth tilde
+    r'|[Φφ∅]'                          # diameter symbols
+    r'|[≥≤≧≦]'                         # comparison operators
+    r'|[±]'                            # plus-minus
+    r'|[×÷]'                           # multiplication/division
+    r'|[°](?!C|F)'                     # degree (not followed by C/F — those are ℃/℉)
+    r'|㎡|㎞|㎝|㎜'                     # squared/cubed CJK units
+    r'|㏀|㏁'                           # kilo-ohm / mega-ohm
+    r'|[Ωμ]'                           # ohm, micro
+    r'|％'                              # fullwidth percent
+    r'|‰'                              # per mille
+)
+
+
+# Fullwidth structural punctuation mapped to ASCII equivalents.
+# These tokenize poorly in SentencePiece; replacing them with ASCII gives the
+# model cleaner context.  Sentence-level CJK punctuation (，。) is intentionally
+# excluded — the zh-en model expects them.
+_FULLWIDTH_STRUCT: dict[str, str] = {
+    '\uff1a': ':',   # ：
+    '\uff1b': ';',   # ；
+    '\uff08': '(',   # （
+    '\uff09': ')',   # ）
+    '\uff01': '!',   # ！
+    '\uff1f': '?',   # ？
+}
+_FULLWIDTH_STRUCT_RE = _re.compile(
+    '[' + ''.join(_FULLWIDTH_STRUCT.keys()) + ']'
+)
+
+
 def _strip_protected_tokens(text: str) -> tuple[str, dict[str, str]]:
-    # Replace numeric tokens in *text* with placeholders before translation.
+    # Replace numeric tokens and special symbols in *text* with placeholders
+    # before translation so they survive the round-trip through OPUS-MT unchanged.
+    
     placeholders: dict[str, str] = {}
     counter = [0]
 
-    def _replace(m: _re.Match) -> str:
-        # Use a bracket format that is XML-safe, unlikely to appear in real text,
-        # and opaque enough that translators treat it as a token to preserve.
+    def _replace_num(m: _re.Match) -> str:
         key = f'[[N{counter[0]}]]'
         placeholders[key] = m.group(0)
         counter[0] += 1
         return key
 
-    # Protect numeric tokens: integers, decimals, version numbers, years
+    # Pass 0: normalise fullwidth structural punctuation to ASCII (one-way).
+    # We do NOT restore these in _restore_protected_tokens — the translated
+    # English output should use ASCII punctuation.
+    normalized = _FULLWIDTH_STRUCT_RE.sub(
+        lambda m: _FULLWIDTH_STRUCT[m.group(0)], text
+    )
+
+    # Pass 1: protect special symbols / units
+    ucounter = [0]
+
+    def _replace_unit(m: _re.Match) -> str:
+        key = f'[[U{ucounter[0]}]]'
+        placeholders[key] = m.group(0)
+        ucounter[0] += 1
+        return key
+
+    masked = _PROTECTED_UNITS.sub(_replace_unit, normalized)
+
+    # Pass 2: protect numeric tokens: integers, decimals, version numbers, years
     masked = _re.sub(
         r'(?<!\w)(\d[\d,.\s]*\d|\d)(?!\w)',
-        _replace,
-        text,
+        _replace_num,
+        masked,
     )
+
+    # Guard: if masking left fewer than 2 CJK characters of real content,
+    # the translator has too little context — undo ALL masking and return
+    # the normalised original so the model sees actual text.
+    stripped_for_check = _re.sub(r'\[\[[NU]\d+\]\]', '', masked)
+    cjk_left = len(_RE_CJK.findall(stripped_for_check))
+    if cjk_left < 2 and cjk_left > 0 and placeholders:
+        return normalized, {}
+
     return masked, placeholders
 
 
 def _is_placeholder_only(text: str) -> bool:
-    """Return True if *text* is nothing but placeholder tokens and whitespace.
-
-    OPUS-MT and similar local NMT models hallucinate (repetition loops, garbage
-    output) when the entire input consists of placeholder tokens like [[N0]]
-    with no actual words to translate.  Segments that reduce to this after
-    masking should be passed through untranslated.
-    """
-    stripped = _re.sub(r'\[\[N\d+\]\]', '', text).strip()
+    # Return True if *text* is nothing but placeholder tokens and whitespace
+    stripped = _re.sub(r'\[\[[NU]\d+\]\]', '', text).strip()
     return stripped == ''
 
 
 def _restore_protected_tokens(text: str, placeholders: dict[str, str]) -> str:
-    """Substitute placeholders back into *text* after translation.
-
-    Two-pass strategy:
-    1. Exact replacement — fast path for well-behaved translators.
-    2. Fuzzy replacement — catches common OPUS-MT bracket corruptions such as
-       [[N0)], [ [N0]], [[N 0]], (N0).
-    """
+    # Substitute placeholders back into *text* after translation
     # Pass 1: exact
     for key, original in placeholders.items():
         text = text.replace(key, original)
 
     # Pass 2: fuzzy — only needed when exact pass left tokens behind
     for key, original in placeholders.items():
-        m = _re.match(r'\[\[N(\d+)\]\]', key)
+        m = _re.match(r'\[\[([NU])(\d+)\]\]', key)
         if m is None:
             continue
-        idx = _re.escape(m.group(1))
+        tag = m.group(1)  # 'N' or 'U'
+        idx = _re.escape(m.group(2))
+        # Pattern set 1: various bracket corruptions
         pattern = _re.compile(
-            r'[\[\(]\s*[\[\(]?\s*[Nn]\s*' + idx + r'\s*[\]\)][\]\)]?'
+            r'[\[\(]\s*[\[\(]?\s*[' + tag + tag.lower() + r']\s*' + idx + r'\s*[\]\)][\]\)]?'
         )
         text = pattern.sub(original, text)
+        # Pattern set 2: single-bracket form like [N0] or (U1)
+        pattern2 = _re.compile(
+            r'\[\s*[' + tag + tag.lower() + r']\s*' + idx + r'\s*\]'
+        )
+        text = pattern2.sub(original, text)
+        # Pattern set 3: completely bracketless form like N0 or U1
+        # Only match when surrounded by non-alphanumeric chars
+        pattern3 = _re.compile(
+            r'(?<![a-zA-Z0-9])' + '[' + tag + tag.lower() + ']' + idx + r'(?![a-zA-Z0-9])'
+        )
+        text = pattern3.sub(original, text)
 
     return text
 
@@ -405,13 +505,8 @@ _RE_CJK = _re.compile(
 
 
 def _max_translated_len(source: str) -> int:
-    """Return the maximum plausible byte-length for a translation of *source*.
-
-    CJK characters routinely expand 8-15x into Latin script, so a flat 5x
-    multiplier on the raw source length causes massive false-positive rates
-    when translating Chinese/Japanese/Korean documents.  We count CJK chars
-    separately and give them a generous 15x budget; non-CJK chars keep 5x.
-    """
+    # Return the maximum plausible byte-length for a translation of *source*.
+    # CJK characters expand 8-15x into Latin script
     cjk_chars = len(_RE_CJK.findall(source))
     other_chars = len(source) - cjk_chars
     return cjk_chars * 15 + other_chars * 5
@@ -919,7 +1014,7 @@ def _normalize_anchor_reference_frames(root: etree._Element) -> None:
     def _read_anchor_bbox(
         anchor: etree._Element,
     ) -> tuple[int, int, int, int] | None:
-        """Return (x0, y0, x1, y1) bounding box in EMU, or None if unreadable."""
+        # Return (x0, y0, x1, y1) bounding box in EMU, or None if unreadable
         try:
             pos_h = anchor.find(_WP_POS_H_TAG)
             pos_v = anchor.find(_WP_POS_V_TAG2)
@@ -939,7 +1034,7 @@ def _normalize_anchor_reference_frames(root: etree._Element) -> None:
             return None
 
     def _bbox_gap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> int:
-        """Chebyshev gap between two bounding boxes (0 if they overlap)."""
+        # Chebyshev gap between two bounding boxes (0 if they overlap)
         x_gap = max(0, max(a[0], b[0]) - min(a[2], b[2]))
         y_gap = max(0, max(a[1], b[1]) - min(a[3], b[3]))
         return max(x_gap, y_gap)
@@ -1264,7 +1359,7 @@ def _parse_xml_part(data: bytes) -> etree._Element:
 
 
 def _serialise_xml_part(root: etree._Element, original_data: bytes) -> bytes:
-    """Serialise *root* back to bytes, preserving the original XML declaration."""
+    # Serialise *root* back to bytes, preserving the original XML declaration
     # Detect encoding from original declaration (default UTF-8)
     encoding = 'UTF-8'
     if original_data.startswith(b'<?xml'):

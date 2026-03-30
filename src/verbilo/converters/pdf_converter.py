@@ -53,18 +53,43 @@ def _is_ocr_required(doc: fitz.Document) -> bool:
 
 # ── font / style helpers ─────────────────────────────────────────────────────
 
+# CJK font families whose "-Medium" variant is visually regular weight
+_CJK_REGULAR_MEDIUM = {
+    "notosanscjk", "notoserifcjk", "sourcehansans", "sourcehanserif",
+    "stsong", "stkaiti", "stheiti", "stfangsong", "stzhongsong",
+    "microsoftyahei", "microsoftjhenghei", "simsun", "simhei",
+    "fangsonggb", "fangsong", "kaiti", "mingliu", "pmingliu",
+    "mssong", "msyahei", "nsimsun", "dengxian", "华文",
+}
+
+
 def _css_weight(font_name: str, flags: int) -> int:
     """Map a PDF span font name + flags to a CSS font-weight integer.
 
-    PyMuPDF flags bit 16 = bold.  Font name suffixes are also checked because
-    some fonts (e.g. NotoSansCJKsc-Medium) encode weight only in the name.
+    The PDF bold flag (bit 16) is the most reliable indicator.  Font-name
+    heuristics are used only as a secondary signal, with extra care for CJK
+    fonts where "-Medium" is the normal/regular weight.
     """
-    name_lc = font_name.lower()
-    if flags & 16 or "bold" in name_lc or "black" in name_lc or "heavy" in name_lc:
+    # Primary: trust the PDF bold flag
+    if flags & 16:
         return 700
-    if "semibold" in name_lc or "demibold" in name_lc or "medium" in name_lc:
-        return 500
-    if "light" in name_lc or "thin" in name_lc:
+
+    name_lc = font_name.lower()
+    # Strip common prefixes that confuse substring matching
+    base = name_lc.replace("-", "").replace("_", "").replace(" ", "")
+
+    # Exact suffix matching only — avoid false positives from substrings
+    if base.endswith("bold") or base.endswith("black") or base.endswith("heavy"):
+        return 700
+    if base.endswith("semibold") or base.endswith("demibold"):
+        return 600
+
+    # "Medium" in CJK fonts means regular weight (400), not CSS 500
+    if "medium" in name_lc:
+        is_cjk = any(fam in base for fam in _CJK_REGULAR_MEDIUM)
+        return 400 if is_cjk else 500
+
+    if base.endswith("light") or base.endswith("thin"):
         return 300
     return 400
 
@@ -97,7 +122,8 @@ def _extract_blocks(page: fitz.Page) -> list[dict]:
         rect        – fitz.Rect of the original block bounding box
         text        – full plain text (lines joined by \\n) for translation
         line_styles – list of style-dicts, one per original line, in order
-        page_width  – page width (for alignment inference)
+        line_rects  – list of fitz.Rect, one per original line (for per-line redaction)
+        page_width  – page width
         page_height – page height
     """
     page_w = page.rect.width
@@ -109,7 +135,7 @@ def _extract_blocks(page: fitz.Page) -> list[dict]:
         if block.get("type") != 0:
             continue
 
-        lines_data: list[tuple[str, dict]] = []
+        lines_data: list[tuple[str, dict, fitz.Rect]] = []
 
         for line in block.get("lines", []):
             spans = line.get("spans", [])
@@ -117,38 +143,86 @@ def _extract_blocks(page: fitz.Page) -> list[dict]:
             if not valid:
                 continue
 
-            line_text = "".join(s["text"] for s in valid).strip()
+            # Join spans preserving inter-span spacing.  When the horizontal
+            # gap between consecutive spans exceeds half the average character
+            # width we insert a space so "100  50" does not become "10050".
+            parts: list[str] = [valid[0]["text"]]
+            for k in range(1, len(valid)):
+                prev_bbox = fitz.Rect(valid[k - 1]["bbox"])
+                cur_bbox  = fitz.Rect(valid[k]["bbox"])
+                gap = cur_bbox.x0 - prev_bbox.x1
+                avg_cw = prev_bbox.width / max(len(valid[k - 1]["text"]), 1)
+                if gap > avg_cw * 0.5:
+                    parts.append(" ")
+                parts.append(valid[k]["text"])
+            line_text = "".join(parts).strip()
             if not line_text:
                 continue
 
-            # Dominant style = span with the most characters
-            dominant = max(valid, key=lambda s: len(s["text"]))
+            # Majority-vote font weight: use the weight that covers the most
+            # characters.  Ties go to the lighter weight.
+            weight_chars: dict[int, int] = {}
+            for s in valid:
+                w = _css_weight(s["font"], s["flags"])
+                weight_chars[w] = weight_chars.get(w, 0) + len(s["text"])
+            final_weight = min(
+                weight_chars,
+                key=lambda w: (-weight_chars[w], w),  # most chars wins; lighter on tie
+            )
 
-            # Infer alignment from line bbox vs page width
+            dominant = max(valid, key=lambda s: len(s["text"]))
             lb = fitz.Rect(line["bbox"])
-            cx = lb.x0 + lb.width / 2
-            if abs(cx - page_w / 2) < page_w * 0.08:
-                align = "center"
-            elif lb.x0 > page_w * 0.60:
-                align = "right"
-            else:
-                align = "left"
 
             lines_data.append((line_text, {
                 "size":   dominant["size"],
-                "weight": _css_weight(dominant["font"], dominant["flags"]),
+                "weight": final_weight,
                 "style":  _css_style(dominant["flags"]),
                 "color":  _css_color(dominant["color"]),
-                "align":  align,
-            }))
+                "align":  "left",  # placeholder — computed at block level below
+            }, lb))
 
         if not lines_data:
             continue
 
+        # ── Block-relative alignment inference ──
+        # For multi-line blocks (≥3 lines): check variance of x0 and line
+        # centres within the block.  For 1-2 line blocks: default to "left"
+        # unless the block is clearly centred on the page.
+        block_rect = fitz.Rect(block["bbox"])
+        n_lines = len(lines_data)
+
+        if n_lines >= 3:
+            x0s = [lr.x0 for _, _, lr in lines_data]
+            x1s = [lr.x1 for _, _, lr in lines_data]
+            cxs = [(lr.x0 + lr.x1) / 2 for _, _, lr in lines_data]
+            x0_range = max(x0s) - min(x0s)
+            x1_range = max(x1s) - min(x1s)
+            cx_range = max(cxs) - min(cxs)
+            avg_w = sum(lr.width for _, _, lr in lines_data) / n_lines
+            tolerance = max(avg_w * 0.12, 4.0)
+
+            if cx_range < tolerance and x0_range > tolerance:
+                block_align = "center"
+            elif x1_range < tolerance and x0_range > tolerance:
+                block_align = "right"
+            else:
+                block_align = "left"
+        else:
+            # 1-2 lines: default left, tight centering check
+            bcx = (block_rect.x0 + block_rect.x1) / 2
+            block_align = "left"
+            if (block_rect.width < page_w * 0.50
+                    and abs(bcx - page_w / 2) < page_w * 0.03):
+                block_align = "center"
+
+        for _, style, _ in lines_data:
+            style["align"] = block_align
+
         out.append({
-            "rect":        fitz.Rect(block["bbox"]),
-            "text":        "\n".join(t for t, _ in lines_data),
-            "line_styles": [s for _, s in lines_data],
+            "rect":        block_rect,
+            "text":        "\n".join(t for t, _, _ in lines_data),
+            "line_styles": [s for _, s, _ in lines_data],
+            "line_rects":  [lr for _, _, lr in lines_data],
             "page_width":  page_w,
             "page_height": page_h,
         })
@@ -159,18 +233,16 @@ def _extract_blocks(page: fitz.Page) -> list[dict]:
 # ── HTML builder ─────────────────────────────────────────────────────────────
 
 def _build_block_html(translated: str, line_styles: list[dict]) -> tuple[str, str]:
-    """Build HTML + CSS for *translated* text using the original per-line styles.
-
-    Splits *translated* on \\n and applies the i-th original style to the i-th
-    translated line (last style reused for any extra lines).
-
-    The CSS global rule hard-resets all inheritable properties so that only our
-    inline span styles take effect — critical for correct bold/italic rendering
-    inside insert_htmlbox.
-    """
+    # Build HTML + CSS for *translated* text using the original per-line styles.
     orig_lines = translated.split("\n")
     n = len(line_styles)
     max_size = max((s["size"] for s in line_styles), default=11.0)
+
+    # Use the dominant alignment (most common across lines)
+    align_counts: dict[str, int] = {}
+    for s in line_styles:
+        align_counts[s["align"]] = align_counts.get(s["align"], 0) + 1
+    dominant_align = max(align_counts, key=align_counts.get)  # type: ignore[arg-type]
 
     parts: list[str] = []
     for i, line_text in enumerate(orig_lines):
@@ -183,24 +255,23 @@ def _build_block_html(translated: str, line_styles: list[dict]) -> tuple[str, st
             f"text-decoration:none;"
         )
         safe = _html_escape(line_text)
-        parts.append(
-            f'<div style="text-align:{s["align"]};">'
-            f'<span style="{inline}">{safe}</span>'
-            f"</div>"
-        )
+        parts.append(f'<span style="{inline}">{safe}</span>')
 
-    html = "\n".join(parts)
+    html = (
+        f'<div style="text-align:{dominant_align}; margin:0; padding:0;">'
+        + "<br/>".join(parts)
+        + "</div>"
+    )
     css = (
         f"* {{font-family:sans-serif; font-size:{max_size:.1f}px;"
-        f" font-weight:normal; font-style:normal; text-decoration:none;}}"
+        f" font-weight:normal; font-style:normal; text-decoration:none;"
+        f" margin:0; padding:0; line-height:1.15;}}"
     )
     return html, css
 
 
-# ── obstacle / free-space helpers ────────────────────────────────────────────
-
 def _collect_obstacles(page: fitz.Page) -> list[fitz.Rect]:
-    """Return rects of all image blocks and significant filled drawings on *page*."""
+    # Return rects of all image blocks and significant filled drawings
     obs: list[fitz.Rect] = []
 
     for block in page.get_text("dict")["blocks"]:
@@ -242,6 +313,27 @@ def _free_y1(
     return max(limit, rect.y1)
 
 
+def _free_x1(
+    rect: fitz.Rect,
+    page_width: float,
+    obstacles: list[fitz.Rect],
+    siblings: list[fitz.Rect],
+) -> float:
+    # Return the rightmost x1 reachable from *rect* without colliding
+    limit = page_width - 2.0  # minimum right margin
+    for other in obstacles + siblings:
+        # Only elements that vertically overlap with our rect matter
+        if other.y0 >= rect.y1 - 1 or other.y1 <= rect.y0 + 1:
+            continue
+        if other.x0 > rect.x1 and other.x0 < limit:
+            limit = other.x0 - 2.0
+    return max(limit, rect.x1)
+
+
+_MAX_EXPAND_H = 120.0  # max points a block rect may grow rightward
+_EXPAND_H_STEP = 8.0   # horizontal expansion increment (points)
+
+
 # ── fitting logic ─────────────────────────────────────────────────────────────
 
 def _fit_block(
@@ -251,21 +343,16 @@ def _fit_block(
     obstacles: list[fitz.Rect],
     siblings: list[fitz.Rect],
     page_height: float,
+    page_width: float = 0.0,
 ) -> fitz.Rect:
-    """Return the best rect for this block's insert_htmlbox call.
+    # Return the best rect for this block's insert_htmlbox call
+    if page_width <= 0:
+        page_width = rect.x1 + 100
 
-    1. Probe the original rect with scale_low=0.
-       If scale >= SCALE_THRESHOLD — text fits well, return original rect unchanged.
-    2. Otherwise expand downward in small steps into obstacle/sibling-free space,
-       up to _MAX_EXPAND_DOWN points, until scale becomes acceptable.
-    3. If still not good enough, return the largest allowed rect anyway;
-       scale_low=0 will handle the remainder.
-
-    All probes use a throw-away document (no writes to the real PDF).
-    """
+    probe_w = max(rect.width + _MAX_EXPAND_H + 20, 1)
+    probe_h = max(rect.height + _MAX_EXPAND_DOWN + 20, 1)
     probe = fitz.open()
-    # Probe page height just needs to be tall enough for the expanded case
-    probe.new_page(width=max(rect.width, 1), height=max(rect.height + _MAX_EXPAND_DOWN + 20, 1))
+    probe.new_page(width=probe_w, height=probe_h)
 
     def _probe(r: fitz.Rect) -> tuple[float, float]:
         try:
@@ -283,16 +370,33 @@ def _fit_block(
         probe.close()
         return rect
 
-    # Step 2 — expand downward into free space
-    max_y1   = _free_y1(rect, page_height, obstacles, siblings)
-    max_exp  = min(_MAX_EXPAND_DOWN, max_y1 - rect.y1)
-    expanded = fitz.Rect(rect)
-    grown    = 0.0
+    # Step 2 — expand rightward only (x0 stays fixed)
+    max_x1 = _free_x1(rect, page_width, obstacles, siblings)
+    max_h_exp = min(_MAX_EXPAND_H, max_x1 - rect.x1)
 
-    while grown < max_exp - 0.5:
-        step     = min(_EXPAND_STEP, max_exp - grown)
-        expanded = fitz.Rect(expanded.x0, expanded.y0, expanded.x1, expanded.y1 + step)
-        grown   += step
+    expanded = fitz.Rect(rect)
+    h_grown = 0.0
+
+    while h_grown < max_h_exp - 0.5:
+        step = min(_EXPAND_H_STEP, max_h_exp - h_grown)
+        expanded = fitz.Rect(expanded.x0, expanded.y0,
+                             expanded.x1 + step, expanded.y1)
+        h_grown += step
+        spare, scale = _probe(expanded)
+        if spare >= 0 and scale >= _SCALE_THRESHOLD:
+            probe.close()
+            return expanded
+
+    # Step 3 — expand downward (y0 stays fixed)
+    max_y1  = _free_y1(expanded, page_height, obstacles, siblings)
+    max_exp = min(_MAX_EXPAND_DOWN, max_y1 - expanded.y1)
+    v_grown = 0.0
+
+    while v_grown < max_exp - 0.5:
+        step = min(_EXPAND_STEP, max_exp - v_grown)
+        expanded = fitz.Rect(expanded.x0, expanded.y0,
+                             expanded.x1, expanded.y1 + step)
+        v_grown += step
         spare, scale = _probe(expanded)
         if spare >= 0 and scale >= _SCALE_THRESHOLD:
             probe.close()
@@ -313,13 +417,7 @@ def translate_pdf(
     cancel_event: threading.Event | None = None,
     source_lang: str = "auto",
 ) -> str | None:
-    """Translate a PDF in-place while preserving the original layout.
-
-    Phase 1 — Extract one translation unit per text block (all pages).
-    Phase 2 — Batch-translate everything in a single API call.
-    Phase 3 — Per page: redact originals, insert translations via insert_htmlbox
-               with scale_low=0; expand block rect only when auto-scale is too aggressive.
-    """
+    # Translate a PDF in-place while preserving the original layout
     src = fitz.open(input_path)
 
     if _is_ocr_required(src):
@@ -394,22 +492,32 @@ def translate_pdf(
 
         page        = src[page_num]
         page_height = page.rect.height
+        page_width  = page.rect.width
 
         # Collect obstacles before redaction (image/drawing positions are stable)
         obstacles = _collect_obstacles(page)
 
-        # Redact all original block rects in a single pass first
-        for block in blocks:
-            page.add_redact_annot(block["rect"], fill=None)  # type: ignore[arg-type]
-        page.apply_redactions(images=0)  # type: ignore[arg-type]
-
         all_rects = [b["rect"] for b in blocks]
 
+        # Process each block individually: redact then insert.  If insertion
+        # fails the original text is already gone so we attempt to re-insert
+        # the untranslated text as a fallback.
         for bi, block in enumerate(blocks):
             tr_text     = block.get("translated", block["text"])
             orig_rect   = block["rect"]
             line_styles = block["line_styles"]
+            line_rects  = block.get("line_rects", [])
             siblings    = [r for i, r in enumerate(all_rects) if i != bi]
+
+            # Redact per-line rects instead of the whole block rect so that
+            # vector drawings (table lines, shapes) within the block area
+            # but outside the actual text lines are preserved.
+            if line_rects:
+                for lr in line_rects:
+                    page.add_redact_annot(lr, fill=None)  # type: ignore[arg-type]
+            else:
+                page.add_redact_annot(orig_rect, fill=None)  # type: ignore[arg-type]
+            page.apply_redactions(images=0)  # type: ignore[arg-type]
 
             html, css = _build_block_html(tr_text, line_styles)
 
@@ -417,6 +525,7 @@ def translate_pdf(
                 fit_rect = _fit_block(
                     html, css, orig_rect,
                     obstacles, siblings, page_height,
+                    page_width=page_width,
                 )
                 result = page.insert_htmlbox(fit_rect, html, css=css, scale_low=0)
                 if result[0] < 0:
@@ -426,8 +535,22 @@ def translate_pdf(
                     )
             except Exception:
                 logger.exception(
-                    "Failed inserting block page %d block %d", page_num + 1, bi
+                    "Failed inserting translated block page %d block %d",
+                    page_num + 1, bi,
                 )
+                # Fallback: re-insert original text so the area isn't blank
+                try:
+                    fb_html, fb_css = _build_block_html(
+                        block["text"], line_styles
+                    )
+                    page.insert_htmlbox(
+                        orig_rect, fb_html, css=fb_css, scale_low=0
+                    )
+                except Exception:
+                    logger.debug(
+                        "Fallback insertion also failed page %d block %d",
+                        page_num + 1, bi,
+                    )
                 errors += 1
 
     # ── Save ──────────────────────────────────────────────────────────────────
