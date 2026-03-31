@@ -2491,6 +2491,40 @@ class App:
             _update_row_status(cname)
 
             slug = _find_slug(cname)
+
+            is_frozen = getattr(sys, "frozen", False) or "__compiled__" in globals()
+            if is_frozen:
+                import queue as _queue
+                q: queue.Queue = queue.Queue()
+                dl_queues[cname] = q
+                dl_procs[cname] = None  # no subprocess
+
+                def _frozen_download():
+                    import io, contextlib
+                    from scripts.download_models import download_opus_mt  # adjust import path
+                    # Redirect stdout so PROGRESS lines go into the queue
+                    old_stdout = sys.stdout
+                    class _QueueWriter(io.TextIOBase):
+                        def write(self, s):
+                            if s.strip():
+                                q.put(s.rstrip())
+                            return len(s)
+                    sys.stdout = _QueueWriter()
+                    try:
+                        download_opus_mt(slug, model_dir)
+                    except SystemExit:
+                        pass
+                    except Exception as exc:
+                        q.put(f"ERROR: {exc}")
+                    finally:
+                        sys.stdout = old_stdout
+                        q.put(None)  # sentinel
+
+                threading.Thread(target=_frozen_download, daemon=True).start()
+                return
+
+            scripts_dir = str(Path(__file__).resolve().parents[3] / "scripts")
+
             cmd = [
                 sys.executable,
                 os.path.join(scripts_dir, "download_models.py"),

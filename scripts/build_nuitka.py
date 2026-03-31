@@ -62,7 +62,7 @@ def main():
     os.makedirs(opus_mt_path, exist_ok=True)
     favicon_ico = os.path.join(assets_abs_path, "favicon.ico")
     version_abs_path = os.path.join(repo_root, "src", "verbilo",)
-    os.environ["PYTHONPATH"] = src_dir + os.pathsep + os.environ.get("PYTHONPATH", "")
+    os.environ["PYTHONPATH"] = repo_root + os.pathsep + src_dir + os.pathsep + os.environ.get("PYTHONPATH", "")
 
     flags = [
         "--mode=standalone",
@@ -129,7 +129,11 @@ def main():
 
         # ── App Version Control ──────────────────────────────────────────
         "--include-module=verbilo._version",
-        
+
+        # ── Scripts ──────────────────────────────────────────────────────
+        "--include-module=scripts.download_models",
+        "--nofollow-import-to=scripts.build_nuitka",
+
         # ── Optimization ─────────────────────────────────────────────────
         "--python-flag=no_site",
         "--nofollow-import-to=81d243bd2c585b0f4821__mypyc",
