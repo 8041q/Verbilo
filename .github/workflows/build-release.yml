@@ -11,6 +11,7 @@ jobs:
     runs-on: windows-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      NUITKA_CACHE_DIR: ${{ github.workspace }}\.nuitka-cache
     permissions:
       contents: write
     steps:
@@ -51,8 +52,6 @@ jobs:
         shell: pwsh
 
       - name: Build with Nuitka
-        env:
-          NUITKA_CACHE_DIR: ${{ github.workspace }}\.nuitka-cache
         run: python scripts/build_nuitka.py --entry gui --output dist/nuitka
 
       - name: Prepare Release Package
