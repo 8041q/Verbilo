@@ -58,6 +58,8 @@ def main():
 
     assets_abs_path = os.path.join(repo_root, "src", "verbilo", "assets")
     models_abs_path = os.path.join(repo_root, "models")
+    opus_mt_path = os.path.join(models_abs_path, "opus-mt")
+    os.makedirs(opus_mt_path, exist_ok=True)
     favicon_ico = os.path.join(assets_abs_path, "favicon.ico")
     version_abs_path = os.path.join(repo_root, "src", "verbilo",)
     os.environ["PYTHONPATH"] = src_dir + os.pathsep + os.environ.get("PYTHONPATH", "")

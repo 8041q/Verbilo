@@ -45,6 +45,10 @@ jobs:
 
       - name: Download models
         run: python scripts/download_models.py fasttext --dest models/lid.176.bin
+      
+      - name: Create opus-mt placeholder directory
+        run: New-Item -ItemType Directory -Force -Path "models\opus-mt"
+        shell: pwsh
 
       - name: Build with Nuitka
         env:
