@@ -133,6 +133,7 @@ def main():
         # ── Scripts ──────────────────────────────────────────────────────
         "--include-module=scripts.download_models",
         "--nofollow-import-to=scripts.build_nuitka",
+        "--nofollow-import-to=scripts.preconvert_ct2.py",
 
         # ── Optimization ─────────────────────────────────────────────────
         "--python-flag=no_site",
@@ -144,6 +145,8 @@ def main():
         "--include-package=fitz",
         "--include-package-data=fitz",
         "--include-package=charset_normalizer",
+        "--module-parameter=torch-disable-jit=no",
+        "--nofollow-import-to=transformers",
 
         f"--output-filename=verbilo",
     ]

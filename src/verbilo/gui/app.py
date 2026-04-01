@@ -39,8 +39,22 @@ DEFAULT_OUTPUT_FOLDER = "Output"
 DEFAULT_INPUT_FOLDER = "Input"
 
 
+def _get_app_root() -> Path:
+    """Return the application root directory, aware of Nuitka frozen builds.
+
+    In dev mode ``__file__`` lives at ``src/verbilo/gui/app.py`` so
+    ``parents[3]`` reaches the repo root.  In a Nuitka standalone build the
+    directory structure is flatter (``launch.dist/verbilo/gui/…``) so the same
+    traversal overshoots.  For frozen builds we anchor on the executable's
+    directory which is always the dist root.
+    """
+    if getattr(sys, "frozen", False) or "__compiled__" in globals():
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[3]
+
+
 def _try_make_relative(absolute_path: str) -> str:
-    repo_root = Path(__file__).resolve().parents[3]
+    repo_root = _get_app_root()
     try:
         return str(Path(absolute_path).resolve().relative_to(repo_root))
     except Exception:
@@ -281,7 +295,7 @@ def _opus_code_to_iso(code: str) -> str:
 
 def _get_default_model_dir() -> str:
     # Return the default OPUS-MT models directory (same logic as factory.py)
-    return str(Path(__file__).resolve().parents[3] / "models" / "opus-mt")
+    return str(_get_app_root() / "models" / "opus-mt")
 
 
 def _load_models_catalogue() -> list[dict]:
@@ -960,7 +974,7 @@ class App:
             pass
 
     def _initialdir_for_input(self) -> str:
-        repo_root = Path(__file__).resolve().parents[3]
+        repo_root = _get_app_root()
         candidate = None
         try:
             if hasattr(self, "output_entry"):
@@ -2284,7 +2298,7 @@ class App:
 
         model_dir = _get_local_model_dir_from_cfg(self.cfg)
         catalogue = _load_models_catalogue()
-        scripts_dir = str(Path(__file__).resolve().parents[3] / "scripts")
+        scripts_dir = str(_get_app_root() / "scripts")
 
         # --- state ---
         # dl_procs: canonical_name -> subprocess.Popen
@@ -2483,53 +2497,158 @@ class App:
                     return e["slug"]
             return cname
 
+        def _find_ct2_repo(cname: str) -> str | None:
+            for e in catalogue:
+                if e["canonical_name"] == cname:
+                    return e.get("ct2_repo")
+            return None
+
+        def _find_hf_repo(cname: str) -> str | None:
+            """Extract HuggingFace repo name from catalogue download_url."""
+            for e in catalogue:
+                if e["canonical_name"] == cname:
+                    url = e.get("download_url", "")
+                    if "huggingface.co/" in url:
+                        return url.rsplit("huggingface.co/", 1)[-1]
+            return None
+
         def _start_download(cname: str):
             if dl_state.get(cname) == "downloading":
                 return
             dl_state[cname] = "downloading"
-            dl_cumulative[cname] = {"last_received": 0, "offset": 0}
+            dl_cumulative[cname] = {
+                "last_received": 0, "last_total": 0, "completed_bytes": 0,
+            }
             _update_row_status(cname)
 
             slug = _find_slug(cname)
+            ct2_repo = _find_ct2_repo(cname)
+            hf_repo = _find_hf_repo(cname)
+
+            q: queue.Queue = queue.Queue()
+            dl_queues[cname] = q
+
+            total_model_bytes = _cat_size_mb.get(cname, 0) * 1024 * 1024
+
+            def _poll():
+                if cname not in dl_queues:
+                    return
+                # Drain all available lines without blocking
+                sentinel_received = False
+                error_received = False
+                while True:
+                    try:
+                        line = q.get_nowait()
+                    except queue.Empty:
+                        break
+                    if line is None:
+                        # Stream ended — process/thread finished
+                        sentinel_received = True
+                        break
+                    line = line.strip()
+                    if line.startswith("ERROR:"):
+                        error_received = True
+                    elif line.startswith("PHASE converting"):
+                        rw = row_widgets.get(cname)
+                        if rw and "progress_label" in rw:
+                            rw["progress_label"].configure(
+                                text="Converting\u2026", text_color=p.status_info)
+                    elif line.startswith("PROGRESS "):
+                        parts = line.split()
+                        if len(parts) == 3:
+                            try:
+                                received = int(parts[1])
+                                total = int(parts[2])
+                                cum = dl_cumulative.get(cname)
+                                if cum is not None:
+                                    # Detect new file: received drops
+                                    if received < cum["last_received"]:
+                                        cum["completed_bytes"] += cum["last_total"]
+                                    cum["last_received"] = received
+                                    cum["last_total"] = total
+                                    total_received = cum["completed_bytes"] + received
+                                    aggregate_total = cum["completed_bytes"] + total
+                                    # Use catalogue size as cap when available,
+                                    # otherwise use actual download totals.
+                                    denom = max(total_model_bytes, aggregate_total) if total_model_bytes > 0 else max(1, aggregate_total)
+                                    pct = min(99, int(total_received / denom * 100))
+                                    rw = row_widgets.get(cname)
+                                    if rw and "progress_label" in rw:
+                                        rw["progress_label"].configure(
+                                            text=f"{pct}%", text_color=p.status_info)
+                            except ValueError:
+                                pass
+                p_obj = dl_procs.get(cname)
+                if p_obj is None:
+                    # Frozen/in-process path: wait for the sentinel from the download thread
+                    if sentinel_received:
+                        dl_procs.pop(cname, None)
+                        dl_queues.pop(cname, None)
+                        dl_cumulative.pop(cname, None)
+                        dl_state[cname] = "error" if error_received else "done"
+                        _update_row_status(cname)
+                        if not error_received:
+                            self._refresh_language_dropdowns()
+                    else:
+                        win.after(100, _poll)  # keep polling until the thread finishes
+                    return
+                rc = p_obj.poll()
+                if rc is None:
+                    win.after(100, _poll)
+                else:
+                    dl_procs.pop(cname, None)
+                    dl_queues.pop(cname, None)
+                    dl_cumulative.pop(cname, None)
+                    dl_state[cname] = "done" if rc == 0 else "error"
+                    _update_row_status(cname)
+                    if rc == 0:
+                        self._refresh_language_dropdowns()
 
             is_frozen = getattr(sys, "frozen", False) or "__compiled__" in globals()
             if is_frozen:
-                import queue as _queue
-                q: queue.Queue = queue.Queue()
-                dl_queues[cname] = q
                 dl_procs[cname] = None  # no subprocess
 
                 def _frozen_download():
-                    import io, contextlib
-                    from scripts.download_models import download_opus_mt  # adjust import path
-                    # Redirect stdout so PROGRESS lines go into the queue
+                    import io
+                    from scripts.download_models import download_opus_mt
                     old_stdout = sys.stdout
+                    old_stderr = sys.stderr
                     class _QueueWriter(io.TextIOBase):
                         def write(self, s):
                             if s.strip():
                                 q.put(s.rstrip())
                             return len(s)
-                    sys.stdout = _QueueWriter()
+                    writer = _QueueWriter()
+                    sys.stdout = writer
+                    sys.stderr = writer
                     try:
-                        download_opus_mt(slug, model_dir)
-                    except SystemExit:
-                        pass
+                        download_opus_mt(slug, model_dir, ct2_repo=ct2_repo,
+                                         hf_repo=hf_repo)
+                    except SystemExit as e:
+                        if e.code != 0:
+                            q.put(f"ERROR: download failed (exit code {e.code})")
                     except Exception as exc:
                         q.put(f"ERROR: {exc}")
                     finally:
                         sys.stdout = old_stdout
+                        sys.stderr = old_stderr
                         q.put(None)  # sentinel
 
                 threading.Thread(target=_frozen_download, daemon=True).start()
+                win.after(100, _poll)
                 return
 
-            scripts_dir = str(Path(__file__).resolve().parents[3] / "scripts")
+            scripts_dir = str(_get_app_root() / "scripts")
 
             cmd = [
                 sys.executable,
                 os.path.join(scripts_dir, "download_models.py"),
                 "opus-mt", slug, "--dest-dir", model_dir,
             ]
+            if ct2_repo:
+                cmd.extend(["--ct2-repo", ct2_repo])
+            if hf_repo:
+                cmd.extend(["--hf-repo", hf_repo])
 
             try:
                 proc = subprocess.Popen(
@@ -2544,11 +2663,6 @@ class App:
 
             dl_procs[cname] = proc
 
-            # Feed stdout lines into a queue via a daemon thread
-            # so _poll never blocks the GUI thread.
-            q: queue.Queue = queue.Queue()
-            dl_queues[cname] = q
-
             def _reader():
                 try:
                     for line in proc.stdout:
@@ -2560,57 +2674,6 @@ class App:
 
             t = threading.Thread(target=_reader, daemon=True)
             t.start()
-
-            total_model_bytes = _cat_size_mb.get(cname, 0) * 1024 * 1024
-
-            def _poll():
-                if cname not in dl_procs:
-                    return
-                # Drain all available lines without blocking
-                while True:
-                    try:
-                        line = q.get_nowait()
-                    except queue.Empty:
-                        break
-                    if line is None:
-                        # Stream ended — process finishing
-                        break
-                    line = line.strip()
-                    if line.startswith("PROGRESS "):
-                        parts = line.split()
-                        if len(parts) == 3:
-                            try:
-                                received = int(parts[1])
-                                total = int(parts[2])
-                                cum = dl_cumulative.get(cname)
-                                if cum is not None:
-                                    # Detect new file: received drops
-                                    if received < cum["last_received"]:
-                                        cum["offset"] += cum["last_received"]
-                                    cum["last_received"] = received
-                                    total_received = cum["offset"] + received
-                                    denom = total_model_bytes if total_model_bytes > 0 else (total if total > 0 else 1)
-                                    pct = min(99, int(total_received / denom * 100))
-                                    rw = row_widgets.get(cname)
-                                    if rw and "progress_label" in rw:
-                                        rw["progress_label"].configure(
-                                            text=f"{pct}%", text_color=p.status_info)
-                            except ValueError:
-                                pass
-                p_obj = dl_procs.get(cname)
-                if p_obj is None:
-                    return
-                rc = p_obj.poll()
-                if rc is None:
-                    win.after(100, _poll)
-                else:
-                    dl_procs.pop(cname, None)
-                    dl_queues.pop(cname, None)
-                    dl_cumulative.pop(cname, None)
-                    dl_state[cname] = "done" if rc == 0 else "error"
-                    _update_row_status(cname)
-                    if rc == 0:
-                        self._refresh_language_dropdowns()
 
             win.after(100, _poll)
 
@@ -3123,7 +3186,7 @@ class App:
             source_lang = self._source_lang_map.get(typed, "auto")
 
         # Resolve output path; relative paths are resolved against cwd and auto-created
-        repo_root = Path(__file__).resolve().parents[3]
+        repo_root = _get_app_root()
         output = self.output_entry.get().strip() or DEFAULT_OUTPUT_FOLDER
         out_path = Path(output)
         is_relative = not out_path.is_absolute()

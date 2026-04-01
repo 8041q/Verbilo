@@ -36,8 +36,13 @@ class TranslatorFactory:
         if engine == "local":
             from .local import OpusMTTranslator
             from pathlib import Path
+            import sys as _sys
+            if getattr(_sys, "frozen", False) or "__compiled__" in globals():
+                _app_root = Path(_sys.executable).resolve().parent
+            else:
+                _app_root = Path(__file__).resolve().parents[3]
             model_dir = local_model_dir or str(
-                Path(__file__).resolve().parents[3] / "models" / "opus-mt"
+                _app_root / "models" / "opus-mt"
             )
             return OpusMTTranslator(
                 model_dir=model_dir, source_lang=source_lang, detector=detector,

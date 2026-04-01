@@ -5,6 +5,7 @@
 #   ctranslate2, transformers, huggingface_hub, pyyaml
 
 import argparse
+import json
 import os
 import shutil
 import ssl
@@ -125,7 +126,6 @@ def _resolve_hf_repo(slug: str) -> str:
 
 def _list_hf_repo_files(model_name: str) -> list:
     """Return list of filenames in a HuggingFace repo via the JSON API."""
-    import json
     url = f"https://huggingface.co/api/models/{model_name}"
     try:
         with _open_url(url) as r:
@@ -244,6 +244,12 @@ def _convert_bergamot(local_dir: str, out_path: Path) -> bool:
 
 def _convert_standard_marian(local_dir: str, out_path: Path) -> bool:
     """Convert a standard MarianMT model using ct2-transformers-converter."""
+    # In a frozen/Nuitka build the converter CLI is not available (it requires
+    # a full Python + transformers runtime), so skip the attempt entirely.
+    if getattr(sys, "frozen", False) or globals().get("__compiled__"):
+        print("  Skipping ct2-transformers-converter (frozen build).", file=sys.stderr)
+        return False
+
     scripts_dir = Path(sys.executable).parent
     converter_bin = scripts_dir / "ct2-transformers-converter"
     if not converter_bin.exists():
@@ -262,6 +268,52 @@ def _convert_standard_marian(local_dir: str, out_path: Path) -> bool:
         return True
     print("ct2-transformers-converter failed.", file=sys.stderr)
     return False
+
+
+# ---------------------------------------------------------------------------
+# Direct download of pre-converted CTranslate2 model from HuggingFace
+# ---------------------------------------------------------------------------
+
+_CT2_REQUIRED_FILES = ["model.bin", "source.spm", "target.spm"]
+_CT2_OPTIONAL_FILES = [
+    "shared_vocabulary.json", "config.json", "vocab.json",
+    "tokenizer_config.json",
+]
+
+
+def _download_ct2_direct(ct2_repo: str, out_path: Path) -> bool:
+    """Download a pre-converted CTranslate2 model directly from HuggingFace.
+
+    These repos (e.g. gaudi/opus-mt-en-fr-ctranslate2) already contain the
+    final model.bin + SentencePiece files — no conversion step needed.
+    """
+    files = _list_hf_repo_files(ct2_repo)
+    if not files:
+        print(f"  Could not list files for CT2 repo: {ct2_repo}", file=sys.stderr)
+        return False
+
+    # Verify required files exist in the repo
+    for req in _CT2_REQUIRED_FILES:
+        if req not in files:
+            print(f"  CT2 repo {ct2_repo} missing required file: {req}", file=sys.stderr)
+            return False
+
+    out_path.mkdir(parents=True, exist_ok=True)
+    base_url = _HF_BASE.format(repo=ct2_repo)
+    wanted = [f for f in files if f in _CT2_REQUIRED_FILES or f in _CT2_OPTIONAL_FILES]
+
+    print(f"Downloading pre-converted CT2 model from {ct2_repo} -> {out_path}")
+    for filename in wanted:
+        dest = out_path / filename
+        if dest.exists():
+            print(f"  [skip] {filename}")
+            continue
+        if not _try_download(f"{base_url}/{filename}", str(dest)):
+            print(f"  Failed to download {filename} from {ct2_repo}", file=sys.stderr)
+            return False
+
+    print("CT2 direct download succeeded.")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +359,29 @@ def _convert_raw_zip(slug: str, out_path: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Catalogue look-up for CT2 repo
+# ---------------------------------------------------------------------------
+
+def _lookup_ct2_repo(slug: str) -> Optional[str]:
+    """Return the ct2_repo value from models_catalogue.json for this slug."""
+    cat_paths = [
+        Path(__file__).resolve().parent.parent / "src" / "verbilo" / "assets" / "models_catalogue.json",
+        # Frozen build: catalogue is next to the exe
+        Path(sys.executable).resolve().parent / "verbilo" / "assets" / "models_catalogue.json",
+    ]
+    for cat_path in cat_paths:
+        if cat_path.is_file():
+            try:
+                catalogue = json.loads(cat_path.read_text(encoding="utf-8"))
+                for entry in catalogue:
+                    if entry.get("slug") == slug:
+                        return entry.get("ct2_repo")
+            except Exception:
+                pass
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -335,7 +410,9 @@ def _slug_to_pair(slug: str) -> str:
     return slug                          # "en-fr" → "en-fr"
 
 
-def download_opus_mt(slug: str, dest_dir: Optional[str] = None) -> Path:
+def download_opus_mt(slug: str, dest_dir: Optional[str] = None,
+                     ct2_repo: Optional[str] = None,
+                     hf_repo: Optional[str] = None) -> Path:
     dest_dir = dest_dir or _DEFAULT_OPUS_DIR
     # Output folder must be named "{src}-{tgt}" so local.py can find it.
     pair = _slug_to_pair(slug)
@@ -345,19 +422,42 @@ def download_opus_mt(slug: str, dest_dir: Optional[str] = None) -> Path:
         print(f"Model '{slug}' (folder: {pair}) already converted at {out_path}")
         return out_path
 
-    for pkg in ["ctranslate2", "huggingface_hub"]:
+    # If no ct2_repo was explicitly passed, look it up from the catalogue.
+    if ct2_repo is None:
+        ct2_repo = _lookup_ct2_repo(slug)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # ── Strategy 1: pre-converted CTranslate2 model (no conversion needed) ──
+    if ct2_repo:
+        print(f"PHASE download", flush=True)
+        print(f"Strategy: CT2 direct download from {ct2_repo}")
+        if _download_ct2_direct(ct2_repo, out_path):
+            (out_path / _SENTINEL).write_text("ok\n")
+            print(f"\nModel '{slug}' ready at {out_path} (load as pair '{pair}')")
+            return out_path
+        print("CT2 direct download failed, falling back to conversion.", file=sys.stderr)
+
+    # ── Remaining strategies require downloading the original HF repo ────────
+    for pkg in ["ctranslate2"]:
         try:
             __import__(pkg)
         except ImportError:
             print(f"{pkg} is not installed. Run: pip install {pkg}", file=sys.stderr)
             sys.exit(1)
 
-    model_name = _resolve_hf_repo(slug)
+    print(f"PHASE download", flush=True)
+    # Use explicit hf_repo from catalogue download_url when available;
+    # fall back to slug-based resolution otherwise.
+    if hf_repo:
+        model_name = hf_repo
+    else:
+        model_name = _resolve_hf_repo(slug)
     print(f"Resolved HuggingFace repo: {model_name}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     safe_name = model_name.replace("/", "--")
-    local_dir = os.path.join(_DEFAULT_OPUS_DIR, ".hf-cache", safe_name)
+    local_dir = os.path.join(dest_dir, ".hf-cache", safe_name)
 
     # Download files first (always needed regardless of model type).
     if not _download_repo_files(model_name, local_dir):
@@ -377,6 +477,7 @@ def download_opus_mt(slug: str, dest_dir: Optional[str] = None) -> Path:
     print(f"    pytorch_model*.bin         : {has_pytorch_bin}")
 
     converted = False
+    print("PHASE converting", flush=True)
 
     if has_bergamot_cfg or has_decoder_yml:
         # Bergamot/raw-Marian format — use MarianConverter via yml config
@@ -387,6 +488,11 @@ def download_opus_mt(slug: str, dest_dir: Optional[str] = None) -> Path:
         # Standard HuggingFace Transformers format — use ct2-transformers-converter
         print("Strategy: ct2-transformers-converter (Transformers/safetensors)")
         converted = _convert_standard_marian(local_dir, out_path)
+        if not converted:
+            # CLI is unavailable in a frozen/standalone build (sys.executable is verbilo.exe);
+            # fall back to the raw OPUS zip which only requires ctranslate2 (compiled in).
+            print("Strategy: raw zip fallback (ct2-transformers-converter unavailable)")
+            converted = _convert_raw_zip(slug, out_path)
 
     else:
         # Nothing useful downloaded — fall back to raw zip
@@ -394,13 +500,23 @@ def download_opus_mt(slug: str, dest_dir: Optional[str] = None) -> Path:
         converted = _convert_raw_zip(slug, out_path)
 
     if not converted:
-        print(
-            f"\nConversion failed for '{slug}' (pair '{pair}').\n"
-            "Check:\n"
-            "  1. Slug at https://huggingface.co/Helsinki-NLP\n"
-            "  2. pip install -U ctranslate2 transformers huggingface_hub",
-            file=sys.stderr,
-        )
+        is_frozen = getattr(sys, "frozen", False) or globals().get("__compiled__")
+        if is_frozen:
+            print(
+                f"\nERROR: Model '{slug}' cannot be downloaded in standalone mode.\n"
+                "No pre-converted CTranslate2 version is available for this model.\n"
+                "Run the conversion in a development environment first, or add a\n"
+                "'ct2_repo' entry to models_catalogue.json pointing to a pre-converted repo.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"\nConversion failed for '{slug}' (pair '{pair}').\n"
+                "Check:\n"
+                "  1. Slug at https://huggingface.co/Helsinki-NLP\n"
+                "  2. pip install -U ctranslate2 transformers huggingface_hub",
+                file=sys.stderr,
+            )
         sys.exit(1)
 
     # Copy spm / tokenizer files if not already placed by the converter.
@@ -440,12 +556,17 @@ def main():
         "matching what local.py expects under model_dir/src-tgt/."
     ))
     opus.add_argument("--dest-dir", default=_DEFAULT_OPUS_DIR)
+    opus.add_argument("--ct2-repo", default=None,
+                      help="HuggingFace repo with pre-converted CT2 model")
+    opus.add_argument("--hf-repo", default=None,
+                      help="HuggingFace repo name for the original model")
 
     args = parser.parse_args()
 
     if args.command == "opus-mt":
         try:
-            download_opus_mt(args.slug, args.dest_dir)
+            download_opus_mt(args.slug, args.dest_dir, ct2_repo=args.ct2_repo,
+                             hf_repo=args.hf_repo)
         except Exception as e:
             print(f"OPUS-MT download failed: {e}", file=sys.stderr)
             sys.exit(1)
