@@ -133,7 +133,8 @@ def main():
         # ── Scripts ──────────────────────────────────────────────────────
         "--include-module=scripts.download_models",
         "--nofollow-import-to=scripts.build_nuitka",
-        "--nofollow-import-to=scripts.preconvert_ct2.py",
+        "--nofollow-import-to=scripts.preconvert_ct2",
+        "--nofollow-import-to=scripts.upload_models_hf",
 
         # ── Optimization ─────────────────────────────────────────────────
         "--python-flag=no_site",

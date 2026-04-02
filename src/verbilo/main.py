@@ -1,5 +1,6 @@
 from pathlib import Path
 import threading
+from typing import Callable
 from .translators.factory import TranslatorFactory
 from .converters import docx_converter, xlsx_converter, pdf_converter
 from .utils.io import resolve_output_path
@@ -27,6 +28,7 @@ def translate_file(
     google_project_id: str = "",
     google_sa_json: str = "",
     local_model_dir: str = "",
+    progress_callback: Callable[[int, int], None] | None = None,
 ):
     # source_lang="auto" translates everything; cancel_event raises CancelledError before saving
     p = Path(input_path)
@@ -61,11 +63,11 @@ def translate_file(
     output_path = resolve_output_path(p, output_path)
 
     if suffix == ".docx":
-        docx_converter.translate_docx(str(p), str(output_path), translator, target_lang, cancel_event=cancel_event, source_lang=source_lang)
+        docx_converter.translate_docx(str(p), str(output_path), translator, target_lang, cancel_event=cancel_event, source_lang=source_lang, progress_callback=progress_callback)
     elif suffix in (".xls", ".xlsx"):
-        xlsx_converter.translate_xlsx(str(p), str(output_path), translator, target_lang, cancel_event=cancel_event, source_lang=source_lang)
+        xlsx_converter.translate_xlsx(str(p), str(output_path), translator, target_lang, cancel_event=cancel_event, source_lang=source_lang, progress_callback=progress_callback)
     elif suffix == ".pdf":
-        result = pdf_converter.translate_pdf(str(p), str(output_path), translator, target_lang, cancel_event=cancel_event, source_lang=source_lang)
+        result = pdf_converter.translate_pdf(str(p), str(output_path), translator, target_lang, cancel_event=cancel_event, source_lang=source_lang, progress_callback=progress_callback)
         if result == "skipped-ocr":
             return "skipped-ocr"
     else:

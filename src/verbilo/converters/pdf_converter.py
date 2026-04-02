@@ -416,6 +416,7 @@ def translate_pdf(
     *,
     cancel_event: threading.Event | None = None,
     source_lang: str = "auto",
+    progress_callback: 'Callable[[int, int], None] | None' = None,
 ) -> str | None:
     # Translate a PDF in-place while preserving the original layout
     src = fitz.open(input_path)
@@ -429,6 +430,17 @@ def translate_pdf(
         return "skipped-ocr"
 
     errors = 0
+
+    # Progress: num_pages (extract) + 1 (translate) + num_pages (redact)
+    _n_pages = src.page_count
+    _total_steps = _n_pages + 1 + _n_pages
+    _steps_done = 0
+
+    def _report(done: int) -> None:
+        nonlocal _steps_done
+        _steps_done = done
+        if progress_callback is not None:
+            progress_callback(_steps_done, _total_steps)
 
     # ── Phase 1: extract ──────────────────────────────────────────────────────
     page_blocks: list[tuple[int, list[dict]]] = []
@@ -449,6 +461,8 @@ def translate_pdf(
         for bi, block in enumerate(blocks):
             all_units.append(block["text"])
             unit_map.append((pdi, bi))
+
+        _report(page_num + 1)
 
     # ── Phase 2: translate ────────────────────────────────────────────────────
     if all_units:
@@ -480,6 +494,8 @@ def translate_pdf(
         blocks[bi]["translated"] = tr if tr is not None else blocks[bi]["text"]
         if tr is None:
             errors += 1
+
+    _report(_n_pages + 1)  # extraction + translation done
 
     # ── Phase 3: redact + insert ──────────────────────────────────────────────
     for pdi, (page_num, blocks) in enumerate(page_blocks):
@@ -552,6 +568,8 @@ def translate_pdf(
                         page_num + 1, bi,
                     )
                 errors += 1
+
+        _report(_n_pages + 1 + pdi + 1)  # extract + translate + pages redacted so far
 
     # ── Save ──────────────────────────────────────────────────────────────────
     if cancel_event is not None and cancel_event.is_set():

@@ -1,6 +1,6 @@
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
-from typing import Any
+from typing import Any, Callable
 import logging
 import threading
 import unicodedata
@@ -29,7 +29,7 @@ def _sanitize_text(text: str) -> str:
     return text
 
 
-def translate_xlsx(input_path: str, output_path: str, translator: Any, target_lang: str, *, cancel_event: threading.Event | None = None, source_lang: str = "auto"):
+def translate_xlsx(input_path: str, output_path: str, translator: Any, target_lang: str, *, cancel_event: threading.Event | None = None, source_lang: str = "auto", progress_callback: 'Callable[[int, int], None] | None' = None):
     # batch-translate XLSX with row-level contextual grouping.
     # When source_lang=="auto" row grouping is skipped so each cell is its own translation
     # unit, letting the API auto-detect the language per cell.
@@ -89,6 +89,7 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
                 unit_cells.append([(cell, text)])
 
     # --- batch-translate ---
+    total_units = len(units)
     try:
         translated = translator.translate_batch(units, target_lang, cancel_event=cancel_event)
     except CancelledError:
@@ -103,6 +104,9 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
             except Exception:
                 logger.exception("Per-item fallback also failed")
                 translated.append(t)
+
+    if progress_callback is not None:
+        progress_callback(total_units, total_units)
 
     # --- write results back ---
     errors = 0

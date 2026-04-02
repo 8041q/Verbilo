@@ -30,12 +30,7 @@ _SENTINEL = "converted.ok"
 
 
 def list_downloaded_pairs(model_dir: str) -> list[tuple[str, str]]:
-    """Return sorted ``(src, tgt)`` tuples for every ready model on disk.
-
-    A subdirectory of *model_dir* counts as a valid pair when its name
-    contains exactly one ``-`` and a ``converted.ok`` sentinel is present.
-    No heavy imports required — pure filesystem scan.
-    """
+    # Return sorted ``(src, tgt)`` tuples for every ready model on disk.
     root = Path(model_dir)
     if not root.is_dir():
         return []
@@ -53,24 +48,7 @@ def list_downloaded_pairs(model_dir: str) -> list[tuple[str, str]]:
 
 
 class OpusMTTranslator:
-    """Offline OPUS-MT translator backed by CTranslate2 + SentencePiece.
-
-    Satisfies the ``Translator`` protocol defined in ``base.py``.
-
-    When **source_lang is "auto"**, the source language is detected **once per
-    batch** by sampling the first non-empty text segment.  This means that
-    mixed-language documents will be routed through a single model determined
-    by that sample.  This is a deliberate trade-off: OPUS-MT requires a fixed
-    source language to select the correct ``opus-mt-{src}-{tgt}`` model, and
-    per-string detection would cause constant model swapping.
-
-    Model lifecycle
-    ---------------
-    Models are loaded lazily on first use and cached in an LRU
-    ``OrderedDict`` capped at 3 entries.  When a 4th model would be loaded,
-    the least-recently-used model is unloaded (``ct2.Translator.unload_model``)
-    to free memory.
-    """
+    # Offline OPUS-MT translator backed by CTranslate2 + SentencePiece.
 
     _engine_name = "local"
     _SEGMENT_RE = re.compile(r'(\n|\r\n|\r|/)')
@@ -89,13 +67,11 @@ class OpusMTTranslator:
         # L1 in-memory translation cache: {target_lang: {source_text: translated_text}}
         self._cache: Dict[str, Dict[str, str]] = {}
 
-    # ------------------------------------------------------------------
+     
     # Model management (LRU cap = 3)
-    # ------------------------------------------------------------------
-
+     
     def _load_model(self, src: str, tgt: str):
-        """Return ``(ct2_translator, sp_source, sp_target)`` for the pair,
-        loading from disk if not already cached."""
+        # Return ``(ct2_translator, sp_source, sp_target)`` for the pair, loading from disk if not already cached
         import ctranslate2
         import sentencepiece as spm
 
@@ -136,18 +112,17 @@ class OpusMTTranslator:
         logger.info("Loaded OPUS-MT model %s from %s", key, pair_dir)
         return entry
 
-    # ------------------------------------------------------------------
+     
     # Source language resolution
-    # ------------------------------------------------------------------
-
+     
     def _resolve_src(self, text: str) -> str:
-        """Detect the source language of *text*, falling back to ``"en"``."""
+        # Detect the source language of *text*, falling back to "en"
         from .lang_detect import detect_language
         code, _conf = detect_language(text, detector=self._detector)
         return code if code != "und" else "en"
 
     def _resolve_batch_src(self, texts: list[str]) -> str:
-        """Detect source language once from the first non-empty element."""
+        # Detect source language once from the first non-empty element
         if self._source_lang != "auto":
             return self._source_lang
         for t in texts:
@@ -155,10 +130,9 @@ class OpusMTTranslator:
                 return self._resolve_src(t)
         return "en"
 
-    # ------------------------------------------------------------------
+     
     # Low-level translation helpers
-    # ------------------------------------------------------------------
-
+     
     # Per-language-pair generation parameters for CTranslate2.  The zh-en pair
     # gets a shorter-favoring length_penalty because Chinese topic-prominent
     # constructions expand significantly into English subject-prominent prose.
@@ -201,16 +175,15 @@ class OpusMTTranslator:
         return [r.hypotheses[0] for r in results]
 
     def _translate_single_raw(self, text: str, src: str, tgt: str) -> str:
-        """Translate a single string through the CTranslate2 model."""
+        # Translate a single string through the CTranslate2 model
         translator, sp_source, sp_target = self._load_model(src, tgt)
         tokens = self._tokenize(sp_source, text)
         translated = self._translate_tokens(translator, [tokens], src=src, tgt=tgt)
         return self._detokenize(sp_target, translated[0])
 
-    # ------------------------------------------------------------------
+     
     # Source-language filtering (mirrors google.py patterns)
-    # ------------------------------------------------------------------
-
+     
     def _should_translate(self, text: str) -> bool:
         if self._source_lang == "auto":
             return True
@@ -218,7 +191,7 @@ class OpusMTTranslator:
         return is_source_language(text, self._source_lang, detector=self._detector)
 
     def _translate_segments(self, text: str, target_lang: str, src: str) -> str:
-        """Split on ``/`` and newlines, translate only source-language segments."""
+        # Split on `/` and newlines, translate only source-language segments
         from .lang_detect import is_source_language
         parts = self._SEGMENT_RE.split(text)
         changed = False
@@ -241,10 +214,9 @@ class OpusMTTranslator:
                 result_parts.append(part)
         return "".join(result_parts) if changed else text
 
-    # ------------------------------------------------------------------
+     
     # Caching wrapper (L1 dict + L2 SQLite)
-    # ------------------------------------------------------------------
-
+     
     def _cached_translate(self, text: str, src: str, tgt: str) -> str:
         tgt_cache = self._cache.setdefault(tgt, {})
         if text in tgt_cache:
@@ -268,10 +240,9 @@ class OpusMTTranslator:
             pass
         return result
 
-    # ------------------------------------------------------------------
+     
     # Public interface — Translator protocol
-    # ------------------------------------------------------------------
-
+     
     def translate_text(self, text: str, target_lang: str) -> str:
         if not text or not text.strip():
             return text

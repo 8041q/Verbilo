@@ -125,12 +125,43 @@ class Worker:
              azure_key="", azure_region="", deepl_api_key="",
              baidu_tier="standard", google_project_id="", google_sa_json="",
              local_model_dir=""):
+        import os
+
+        # Compute file-size weights for smooth global progress
+        file_sizes = []
         for f in files:
+            try:
+                file_sizes.append(os.path.getsize(f))
+            except OSError:
+                file_sizes.append(1)
+        total_size = sum(file_sizes) or 1
+        # cumulative_weight[i] = fraction of total work completed by files before i
+        cumulative_weight = []
+        cumsum = 0.0
+        for sz in file_sizes:
+            cumulative_weight.append(cumsum / total_size)
+            cumsum += sz
+        file_weight = [sz / total_size for sz in file_sizes]
+
+        for fi, f in enumerate(files):
             if self._stop.is_set():
                 log_cb("Cancelled by user")
                 break
             name = Path(f).name
             t0 = time.perf_counter()
+
+            # Build a per-file progress callback that maps (done, total)
+            # within this file to a global fraction and forwards it
+            base = cumulative_weight[fi]
+            weight = file_weight[fi]
+
+            def _file_progress(done: int, total: int, _base=base, _weight=weight) -> None:
+                if total > 0:
+                    frac = _base + _weight * (done / total)
+                else:
+                    frac = _base
+                progress_cb(f, "progress", frac)
+
             try:
                 progress_cb(f, "started", None)
                 log_cb(f"Translating {name} ...")
@@ -151,6 +182,7 @@ class Worker:
                     google_project_id=google_project_id,
                     google_sa_json=google_sa_json,
                     local_model_dir=local_model_dir,
+                    progress_callback=_file_progress,
                 )
                 elapsed = time.perf_counter() - t0
 

@@ -3327,7 +3327,8 @@ class App:
         self.completed_files = 0
         self._file_start_times.clear()
         self._set_progress(0.0)
-        self._update_progress_label(f"0 / {self.total_files} files (0%)")
+        self._update_progress_label("Starting\u2026")
+        self._current_file_name = ""
 
         self.worker.start(
             self.files, lang, output, None,
@@ -3363,14 +3364,33 @@ class App:
             if status == "started":
                 self._file_start_times[filepath] = _time.perf_counter()
                 self._update_file_status(filepath, "translating\u2026")
+                self._current_file_name = Path(filepath).name
+                self._update_progress_label(
+                    f"Translating {self._current_file_name}\u2026 0%"
+                )
+            elif status == "progress":
+                # elapsed carries the global fraction (0.0–1.0) for intra-file progress
+                frac = elapsed if elapsed is not None else 0.0
+                frac = max(0.0, min(1.0, frac))
+                self._set_progress(frac)
+                name = getattr(self, "_current_file_name", "")
+                self._update_progress_label(
+                    f"Translating {name}\u2026 {int(frac * 100)}%"
+                )
             elif status in ("finished", "error"):
                 self.completed_files += 1
                 self._update_file_status(filepath, status, elapsed)
                 pct = self.completed_files / max(1, self.total_files)
                 self._set_progress(pct)
-                self._update_progress_label(
-                    f"{self.completed_files} / {self.total_files} files ({int(pct * 100)}%)",
-                )
+                remaining = self.total_files - self.completed_files
+                if remaining > 0:
+                    self._update_progress_label(
+                        f"{self.completed_files} / {self.total_files} files ({int(pct * 100)}%)"
+                    )
+                else:
+                    self._update_progress_label(
+                        f"{self.completed_files} / {self.total_files} files (100%)"
+                    )
                 if self.completed_files >= self.total_files:
                     self._finish_run()
             elif status == "cancelled":
@@ -3413,7 +3433,7 @@ class App:
         if cancelled:
             pct = self.completed_files / max(1, self.total_files)
             self._update_progress_label(
-                f"Cancelled \u2014 {self.completed_files} / {self.total_files} files ({int(pct * 100)}%)",
+                f"Cancelled \u2014 {int(pct * 100)}%",
             )
 
     def _apply_debug_mode(self):

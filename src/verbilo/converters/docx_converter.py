@@ -117,6 +117,7 @@ def _translate_and_writeback(
     translator: Any,
     target_lang: str,
     cancel_event: threading.Event | None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> int:
     #  Translate each group and call write_back on each unit. Returns error count. Uses ``translate_batch`` when available, falling back to ``translate_text`` for single-item groups
     
@@ -129,8 +130,9 @@ def _translate_and_writeback(
             "translate_text — cannot translate."
         )
 
+    total_groups = len(groups)
     errors = 0
-    for group in groups:
+    for gi, group in enumerate(groups):
         if cancel_event is not None and cancel_event.is_set():
             raise CancelledError("Translation cancelled")
 
@@ -146,6 +148,8 @@ def _translate_and_writeback(
                     raise ValueError("translate_batch returned wrong number of results")
                 for idx, i in enumerate(group):
                     units[i].write_back(translated_parts[idx])
+                if progress_callback is not None:
+                    progress_callback(gi + 1, total_groups)
                 continue
             except CancelledError:
                 raise
@@ -170,6 +174,9 @@ def _translate_and_writeback(
             except Exception:
                 logger.warning("Failed to translate unit %d", i, exc_info=True)
                 errors += 1
+
+        if progress_callback is not None:
+            progress_callback(gi + 1, total_groups)
 
     return errors
 
@@ -1418,6 +1425,7 @@ def translate_docx(
     *,
     cancel_event: threading.Event | None = None,
     source_lang: str = "auto",
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> None:
     auto_detect = source_lang == "auto"
     errors = 0
@@ -1468,35 +1476,66 @@ def translate_docx(
         _extra = [settings_part] if settings_part else []
         raw_parts = {name: zf.read(name) for name in text_parts + smartart_parts + _extra}
 
-    # --- text parts (w:t, a:t, VML) ---
-    for part_name in text_parts:
-        if cancel_event is not None and cancel_event.is_set():
-            raise CancelledError("Translation cancelled during XML collection")
+    # Pre-parse all parts to count total translation groups for progress
+    _parsed_text_parts: list[tuple[str, Any, list[_TranslationUnit], list[list[int]]]] = []
+    _parsed_smartart_parts: list[tuple[str, Any, list[_TranslationUnit], list[list[int]]]] = []
+    _total_groups = 0
 
+    for part_name in text_parts:
         raw = raw_parts[part_name]
         try:
             root = _parse_xml_part(raw)
         except etree.XMLSyntaxError:
             logger.warning("Skipping malformed XML part: %s", part_name)
             continue
-
         pool: list[_TranslationUnit] = []
         pool.extend(_collect_wt_units(root))
         pool.extend(_collect_drawingml_units(root))
         pool.extend(_collect_vml_units(root))
-
         if not pool:
             continue
+        groups = _group_units(pool, auto_detect=auto_detect)
+        _total_groups += len(groups)
+        _parsed_text_parts.append((part_name, root, pool, groups))
+
+    for part_name in smartart_parts:
+        raw = raw_parts[part_name]
+        try:
+            pool_sa, root_sa = _collect_smartart_units_from_blob(raw)
+        except Exception:
+            logger.warning("Failed to parse SmartArt part %s", part_name, exc_info=True)
+            continue
+        if not pool_sa:
+            continue
+        groups_sa = _group_units(pool_sa, auto_detect=auto_detect)
+        _total_groups += len(groups_sa)
+        _parsed_smartart_parts.append((part_name, root_sa, pool_sa, groups_sa))
+
+    _groups_done = 0
+
+    def _offset_progress(done: int, total: int) -> None:
+        nonlocal _groups_done
+        _groups_done = _groups_base + done
+        if progress_callback is not None:
+            progress_callback(_groups_done, _total_groups)
+
+    # --- text parts (w:t, a:t, VML) ---
+    for part_name, root, pool, groups in _parsed_text_parts:
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError("Translation cancelled during XML collection")
+
+        raw = raw_parts[part_name]
 
         logger.debug("%s: %d units collected", part_name, len(pool))
-        groups = _group_units(pool, auto_detect=auto_detect)
 
         # Snapshot source lengths before translation so we can compute the
         # expansion ratio used by the layout-fix passes below.
         source_chars = sum(len(u.source_text) for u in pool)
 
+        _groups_base = _groups_done
         part_errors = _translate_and_writeback(
             pool, groups, translator, target_lang, cancel_event,
+            progress_callback=_offset_progress if progress_callback else None,
         )
         errors += part_errors
 
@@ -1527,26 +1566,19 @@ def translate_docx(
         patches[part_name] = _serialise_xml_part(root, raw)
 
     # --- SmartArt parts ---
-    for part_name in smartart_parts:
+    for part_name, root_sa, pool_sa, groups_sa in _parsed_smartart_parts:
         if cancel_event is not None and cancel_event.is_set():
             raise CancelledError("Translation cancelled during SmartArt collection")
 
         raw = raw_parts[part_name]
-        try:
-            pool, root = _collect_smartart_units_from_blob(raw)
-        except Exception:
-            logger.warning("Failed to parse SmartArt part %s", part_name, exc_info=True)
-            continue
 
-        if not pool:
-            continue
-
-        logger.debug("%s: %d SmartArt units", part_name, len(pool))
-        groups = _group_units(pool, auto_detect=auto_detect)
+        logger.debug("%s: %d SmartArt units", part_name, len(pool_sa))
+        _groups_base = _groups_done
         errors += _translate_and_writeback(
-            pool, groups, translator, target_lang, cancel_event,
+            pool_sa, groups_sa, translator, target_lang, cancel_event,
+            progress_callback=_offset_progress if progress_callback else None,
         )
-        patches[part_name] = _serialise_xml_part(root, raw)
+        patches[part_name] = _serialise_xml_part(root_sa, raw)
 
     # --- settings.xml: suppress first-paragraph spacing at page tops ---
     if settings_part:

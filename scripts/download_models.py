@@ -38,10 +38,9 @@ _SSL_UNVERIFIED.check_hostname = False
 _SSL_UNVERIFIED.verify_mode = ssl.CERT_NONE
 
 
-# ---------------------------------------------------------------------------
+  
 # HTTP helpers
-# ---------------------------------------------------------------------------
-
+  
 def _open_url(url: str, method: str = "GET"):
     req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
     req.method = method
@@ -103,10 +102,9 @@ def _try_download(url: str, dest_path: str) -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
+  
 # Repo resolution
-# ---------------------------------------------------------------------------
-
+  
 def _resolve_hf_repo(slug: str) -> str:
     org = "Helsinki-NLP"
     if any(slug.startswith(p) for p in _UNDERSCORE_PREFIXES):
@@ -120,12 +118,11 @@ def _resolve_hf_repo(slug: str) -> str:
     return repo
 
 
-# ---------------------------------------------------------------------------
+  
 # Download all files from HF repo using hf_hub_download (no snapshot_download)
-# ---------------------------------------------------------------------------
-
+  
 def _list_hf_repo_files(model_name: str) -> list:
-    """Return list of filenames in a HuggingFace repo via the JSON API."""
+    # Return list of filenames in a HuggingFace repo via the JSON API
     url = f"https://huggingface.co/api/models/{model_name}"
     try:
         with _open_url(url) as r:
@@ -137,13 +134,7 @@ def _list_hf_repo_files(model_name: str) -> list:
 
 
 def _download_repo_files(model_name: str, local_dir: str) -> bool:
-    """Download every file in a HuggingFace repo via plain HTTP.
-
-    huggingface_hub (snapshot_download AND hf_hub_download) both have a
-    WindowsPath .touch() bug that leaves all files as .incomplete.
-    We bypass the library entirely: list files via the HF JSON API, then
-    download each one with our own urllib-based download() function.
-    """
+    # Download every file in a HuggingFace repo via plain HTTP.
     os.makedirs(local_dir, exist_ok=True)
     files = _list_hf_repo_files(model_name)
     if not files:
@@ -163,21 +154,11 @@ def _download_repo_files(model_name: str, local_dir: str) -> bool:
     return True
 
 
-# ---------------------------------------------------------------------------
+  
 # Conversion: Bergamot/tiny models (config.intgemm8bitalpha.yml)
-# ---------------------------------------------------------------------------
-
+  
 def _convert_bergamot(local_dir: str, out_path: Path) -> bool:
-    """Convert a Bergamot/tiny OPUS-MT model using MarianConverter.
-
-    Tiny models ship:
-      - config.intgemm8bitalpha.yml  lists model (.npz) and vocab (.spm) paths
-      - model.npz                    Marian weights
-      - *.spm                        SentencePiece vocab
-
-    We read the yml to find the exact model_path and vocab_paths, then call
-    ctranslate2.converters.MarianConverter directly.
-    """
+    # Convert a Bergamot/tiny OPUS-MT model using MarianConverter.
     try:
         import ctranslate2
         import yaml
@@ -238,12 +219,11 @@ def _convert_bergamot(local_dir: str, out_path: Path) -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
+  
 # Conversion: standard MarianMT (model_type=marian in config.json)
-# ---------------------------------------------------------------------------
-
+  
 def _convert_standard_marian(local_dir: str, out_path: Path) -> bool:
-    """Convert a standard MarianMT model using ct2-transformers-converter."""
+    # Convert a standard MarianMT model using ct2-transformers-converter
     # In a frozen/Nuitka build the converter CLI is not available (it requires
     # a full Python + transformers runtime), so skip the attempt entirely.
     if getattr(sys, "frozen", False) or globals().get("__compiled__"):
@@ -270,10 +250,9 @@ def _convert_standard_marian(local_dir: str, out_path: Path) -> bool:
     return False
 
 
-# ---------------------------------------------------------------------------
+  
 # Direct download of pre-converted CTranslate2 model from HuggingFace
-# ---------------------------------------------------------------------------
-
+  
 _CT2_REQUIRED_FILES = ["model.bin", "source.spm", "target.spm"]
 _CT2_OPTIONAL_FILES = [
     "shared_vocabulary.json", "config.json", "vocab.json",
@@ -282,11 +261,7 @@ _CT2_OPTIONAL_FILES = [
 
 
 def _download_ct2_direct(ct2_repo: str, out_path: Path) -> bool:
-    """Download a pre-converted CTranslate2 model directly from HuggingFace.
-
-    These repos (e.g. gaudi/opus-mt-en-fr-ctranslate2) already contain the
-    final model.bin + SentencePiece files — no conversion step needed.
-    """
+    # Download a pre-converted CTranslate2 model directly from HuggingFace.
     files = _list_hf_repo_files(ct2_repo)
     if not files:
         print(f"  Could not list files for CT2 repo: {ct2_repo}", file=sys.stderr)
@@ -316,12 +291,11 @@ def _download_ct2_direct(ct2_repo: str, out_path: Path) -> bool:
     return True
 
 
-# ---------------------------------------------------------------------------
+  
 # Conversion: raw zip from object.pouta.csc.fi (decoder.yml format)
-# ---------------------------------------------------------------------------
-
+  
 def _convert_raw_zip(slug: str, out_path: Path) -> bool:
-    """Download the raw Marian zip and convert with OpusMTConverter."""
+    # Download the raw Marian zip and convert with OpusMTConverter
     try:
         import ctranslate2
     except ImportError:
@@ -358,12 +332,11 @@ def _convert_raw_zip(slug: str, out_path: Path) -> bool:
             return False
 
 
-# ---------------------------------------------------------------------------
+  
 # Catalogue look-up for CT2 repo
-# ---------------------------------------------------------------------------
-
+  
 def _lookup_ct2_repo(slug: str) -> Optional[str]:
-    """Return the ct2_repo value from models_catalogue.json for this slug."""
+    # Return the ct2_repo value from models_catalogue.json for this slug
     cat_paths = [
         Path(__file__).resolve().parent.parent / "src" / "verbilo" / "assets" / "models_catalogue.json",
         # Frozen build: catalogue is next to the exe
@@ -381,27 +354,18 @@ def _lookup_ct2_repo(slug: str) -> Optional[str]:
     return None
 
 
-# ---------------------------------------------------------------------------
+  
 # Main entry point
-# ---------------------------------------------------------------------------
 
 def _slug_to_pair(slug: str) -> str:
     """Derive the canonical src-tgt folder name from a slug.
 
-    local.py expects the model directory to be named exactly "{src}-{tgt}",
-    e.g. "en-fr", so it can build the path as model_dir / f"{src}-{tgt}".
-
-    The slug may be longer (e.g. "tiny_eng-fra", "tc-big-en-fr") — we extract
-    the last two dash-separated tokens that look like language codes, but the
-    simplest and most reliable approach is to derive it from the HF repo
-    language codes embedded in the slug:
+    local.py expects the model directory to be named exactly "{src}-{tgt}" so we extract
+    the last two dash-separated tokens that look like language codes
 
       tiny_eng-fra  → eng-fra
       tc-big-en-fr  → en-fr
       en-fr         → en-fr  (already correct)
-
-    We take everything after the last underscore (or the whole slug if no
-    underscore), which gives us the "src-tgt" portion.
     """
     # Strip any leading variant prefix (tiny_, tc-big-, etc.) — keep only
     # the part after the final underscore.
@@ -537,10 +501,9 @@ def download_opus_mt(slug: str, dest_dir: Optional[str] = None,
     return out_path
 
 
-# ---------------------------------------------------------------------------
+  
 # CLI
-# ---------------------------------------------------------------------------
-
+  
 def main():
     parser = argparse.ArgumentParser(description="Download FastText and/or OPUS-MT models.")
     sub = parser.add_subparsers(dest="command")
