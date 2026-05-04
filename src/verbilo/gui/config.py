@@ -17,6 +17,11 @@ except ImportError:
 
 CONFIG_FILENAME = ".verbilo_gui.json"
 
+_DEFAULT_CONFIG: Dict[str, Any] = {
+    "debug_mode": False,
+    "ui_locale": "en",
+}
+
 
 def _config_path() -> Path:
     return Path(_user_config_dir("verbilo", appauthor=False)) / CONFIG_FILENAME
@@ -25,12 +30,16 @@ def _config_path() -> Path:
 def load_config() -> Dict[str, Any]:
     p = _config_path()
     if not p.exists():
-        # first-run defaults
-        return {"debug_mode": False}
+        return dict(_DEFAULT_CONFIG)
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
-        return {}
+        return dict(_DEFAULT_CONFIG)
+    if not isinstance(data, dict):
+        return dict(_DEFAULT_CONFIG)
+    cfg = dict(_DEFAULT_CONFIG)
+    cfg.update(data)
+    return cfg
 
 
 def save_config(cfg: Dict[str, Any]) -> None:

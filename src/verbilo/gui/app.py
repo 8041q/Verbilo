@@ -22,6 +22,7 @@ from . import theme
 from .helpers import Worker, list_supported_files, center_window, GuiLoggingHandler, SUPPORTED_EXTS
 from .config import load_config, save_config
 from .icons import get_icon, get_photo_image, get_app_icon, apply_window_icon
+from .i18n import DEFAULT_UI_LOCALE, get_supported_ui_locales, load_ui_localizer, resolve_ui_locale
 
 logger = logging.getLogger(__name__)
 
@@ -131,19 +132,26 @@ _DEEPL_LANG_CODES: frozenset[str] = frozenset({
     "zh", "zh-CN", "zh-TW",
 })
 
-# Translation engine choices (display name → internal key).
-_ENGINE_OPTIONS: list[tuple[str, str]] = [
-    ("Google Translate (free)",  "google"),
-    ("Google Cloud API (v2)",    "google-cloud"),
-    ("Google Cloud API (v3)",    "google-cloud-v3"),
-    ("Baidu Translate",          "baidu"),
-    ("Microsoft Azure",          "azure"),
-    ("DeepL",               "deepl"),
-    ("Local (Offline)",          "local"),
+_ENGINE_LABEL_KEYS: list[tuple[str, str]] = [
+    ("google", "engine.google"),
+    ("google-cloud", "engine.google_cloud"),
+    ("google-cloud-v3", "engine.google_cloud_v3"),
+    ("baidu", "engine.baidu"),
+    ("azure", "engine.azure"),
+    ("deepl", "engine.deepl"),
+    ("local", "engine.local"),
 ]
-_ENGINE_DISPLAY = [name for name, _ in _ENGINE_OPTIONS]
-_ENGINE_MAP = {name: key for name, key in _ENGINE_OPTIONS}
-_ENGINE_REVERSE = {key: name for name, key in _ENGINE_OPTIONS}
+
+
+def _get_engine_options(localizer) -> list[tuple[str, str]]:
+    return [(localizer.t(label_key), engine_key) for engine_key, label_key in _ENGINE_LABEL_KEYS]
+
+
+def _get_engine_display_name(localizer, engine_key: str) -> str:
+    for key, label_key in _ENGINE_LABEL_KEYS:
+        if key == engine_key:
+            return localizer.t(label_key)
+    return engine_key
 
 
 def _filter_by_detector(
@@ -181,45 +189,23 @@ def _filter_by_engine(
     return result
 
 
-_cached_language_options: list[tuple[str, str]] | None = None
+_cached_language_options: dict[str, list[tuple[str, str]]] = {}
 
 
-def _get_language_options() -> list[tuple[str, str]]:
+def _get_language_options(locale: str | None = None) -> list[tuple[str, str]]:
     # returns (code, name) pairs for all supported languages
-    global _cached_language_options
-    if _cached_language_options is not None:
-        return _cached_language_options
+    resolved_locale = resolve_ui_locale(locale)
+    cached = _cached_language_options.get(resolved_locale)
+    if cached is not None:
+        return cached
 
-    fallback: dict[str, str] = {
-        "af": "Afrikaans", "sq": "Albanian", "am": "Amharic", "ar": "Arabic",
-        "hy": "Armenian", "az": "Azerbaijani", "eu": "Basque", "be": "Belarusian",
-        "bn": "Bengali", "bs": "Bosnian", "bg": "Bulgarian", "ca": "Catalan",
-        "ceb": "Cebuano", "zh": "Chinese (Simplified)",
-        "co": "Corsican", "hr": "Croatian", "cs": "Czech", "da": "Danish",
-        "nl": "Dutch", "en": "English", "eo": "Esperanto", "et": "Estonian",
-        "fi": "Finnish", "fr": "French", "fy": "Frisian", "gl": "Galician",
-        "ka": "Georgian", "de": "German", "el": "Greek", "gu": "Gujarati",
-        "ht": "Haitian Creole", "ha": "Hausa", "haw": "Hawaiian", "he": "Hebrew",
-        "hi": "Hindi", "hmn": "Hmong", "hu": "Hungarian", "is": "Icelandic",
-        "ig": "Igbo", "id": "Indonesian", "ga": "Irish", "it": "Italian",
-        "ja": "Japanese", "jw": "Javanese", "kn": "Kannada", "kk": "Kazakh",
-        "km": "Khmer", "rw": "Kinyarwanda", "ko": "Korean", "ku": "Kurdish",
-        "ky": "Kyrgyz", "lo": "Lao", "la": "Latin", "lv": "Latvian",
-        "lt": "Lithuanian", "lb": "Luxembourgish", "mk": "Macedonian",
-        "mg": "Malagasy", "ms": "Malay", "ml": "Malayalam", "mt": "Maltese",
-        "mi": "Maori", "mr": "Marathi", "mn": "Mongolian", "my": "Myanmar (Burmese)",
-        "ne": "Nepali", "no": "Norwegian", "ny": "Nyanja (Chichewa)",
-        "or": "Odia (Oriya)", "ps": "Pashto", "fa": "Persian", "pl": "Polish",
-        "pt": "Portuguese", "pa": "Punjabi", "ro": "Romanian", "ru": "Russian",
-        "sm": "Samoan", "gd": "Scots Gaelic", "sr": "Serbian", "st": "Sesotho",
-        "sn": "Shona", "sd": "Sindhi", "si": "Sinhala (Sinhalese)", "sk": "Slovak",
-        "sl": "Slovenian", "so": "Somali", "es": "Spanish", "su": "Sundanese",
-        "sw": "Swahili", "sv": "Swedish", "tl": "Tagalog (Filipino)", "tg": "Tajik",
-        "ta": "Tamil", "tt": "Tatar", "te": "Telugu", "th": "Thai", "tr": "Turkish",
-        "tk": "Turkmen", "uk": "Ukrainian", "ur": "Urdu", "ug": "Uyghur",
-        "uz": "Uzbek", "vi": "Vietnamese", "cy": "Welsh", "xh": "Xhosa",
-        "yi": "Yiddish", "yo": "Yoruba", "zu": "Zulu",
-    }
+    base_localizer = load_ui_localizer(DEFAULT_UI_LOCALE)
+    localizer = load_ui_localizer(resolved_locale)
+    fallback = dict(base_localizer.language_names)
+    canonical_codes = {code.lower(): code for code in fallback}
+
+    def _canon(code: str) -> str:
+        return canonical_codes.get(code.strip().lower(), code.strip())
 
     try:
         from deep_translator import GoogleTranslator
@@ -238,13 +224,21 @@ def _get_language_options() -> list[tuple[str, str]]:
             langs = getattr(GoogleTranslator, "SUPPORTED_LANGUAGES")
 
         if isinstance(langs, dict):
+            result = []
+            seen_codes: set[str] = set()
             first_key = next(iter(langs), "")
             if len(first_key) <= 5 and first_key.isascii() and first_key.islower():
-                result = [(str(k), str(v).title()) for k, v in langs.items()]
+                codes = [str(k) for k in langs]
             else:
-                result = [(str(v), str(k).title()) for k, v in langs.items()]
+                codes = [str(v) for v in langs.values()]
+            for code in codes:
+                canonical = _canon(code)
+                if not canonical or canonical in seen_codes:
+                    continue
+                seen_codes.add(canonical)
+                result.append((canonical, localizer.language_name(canonical)))
             result.sort(key=lambda x: x[1].lower())
-            _cached_language_options = result
+            _cached_language_options[resolved_locale] = result
             return result
 
         if isinstance(langs, (list, tuple)) and langs:
@@ -256,20 +250,24 @@ def _get_language_options() -> list[tuple[str, str]]:
                     continue
                 low = entry.lower()
                 if low in name_to_code:
-                    result.append((name_to_code[low], entry.title()))
+                    code = name_to_code[low]
                 elif entry in fallback:
-                    result.append((entry, fallback[entry]))
+                    code = entry
                 else:
-                    result.append((low, entry.title()))
+                    code = _canon(low)
+                result.append((code, localizer.language_name(code)))
             result.sort(key=lambda x: x[1].lower())
-            _cached_language_options = result
+            _cached_language_options[resolved_locale] = result
             return result
 
     except Exception:
         logger.exception("Failed to probe deep_translator for supported languages")
 
-    result = sorted(fallback.items(), key=lambda x: x[1].lower())
-    _cached_language_options = result
+    result = sorted(
+        ((code, localizer.language_name(code)) for code in fallback),
+        key=lambda x: x[1].lower(),
+    )
+    _cached_language_options[resolved_locale] = result
     return result
 
 
@@ -907,12 +905,15 @@ class SearchableComboBox:
 
 # --- main app ---
 
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.worker = Worker()
         self.files: list[str] = []
         self.cfg = load_config() or {}
+        self.ui = load_ui_localizer(self.cfg.get("ui_locale"))
+        self.t = self.ui.t
         self.total_files = 0
         self.completed_files = 0
         self._running = False
@@ -961,6 +962,29 @@ class App:
             self._on_engine_changed()
         except Exception:
             logger.exception("Failed to apply saved translation engine on startup")
+
+    def _format_language_option(self, code: str, name: str | None = None) -> str:
+        display_name = name if name is not None else self.ui.language_name(code)
+        return f"{display_name} ({code})"
+
+    def _engine_key_for_display(self, display_name: str) -> str:
+        return self._engine_map.get(display_name, "google")
+
+    def _engine_display_name(self, engine_key: str) -> str:
+        return _get_engine_display_name(self.ui, engine_key)
+
+    def _status_text(self, status: str) -> str:
+        status_key = {
+            "pending": "table.status.pending",
+            "started": "table.status.translating",
+            "finished": "table.status.finished",
+            "error": "table.status.error",
+            "cancelled": "table.status.cancelled",
+            "translating": "table.status.translating",
+        }.get(status)
+        if status_key is None:
+            return status
+        return self.t(status_key)
 
     # --- directory helpers ---
 
@@ -1066,7 +1090,9 @@ class App:
         ).pack(side=tk.LEFT)
         # Overlay badge for visual testing (non-clickable)
         try:
-            title_badge = theme.make_label(title_frame, "(beta)", level="tiny", text_color=p.text_muted)
+            title_badge = theme.make_label(
+                title_frame, self.t("sidebar.beta"), level="tiny", text_color=p.text_muted,
+            )
             # Place at the far right of the title row without affecting layout
             title_badge.place(relx=1.0, x=-8, rely=0.5, anchor="e")
             try:
@@ -1079,24 +1105,32 @@ class App:
 
         # Source language
         self._source_lang_label = theme.make_label(
-            self.sidebar, "Source language", level="small",
+            self.sidebar, self.t("sidebar.source_language"), level="small",
         )
         self._source_lang_label.grid(row=row, column=0, sticky="w", padx=PAD, pady=(4, 2))
         row += 1
 
-        lang_opts = _get_language_options()
-        self._lang_map = {f"{name} ({code})": code for code, name in lang_opts}
+        self._engine_options = _get_engine_options(self.ui)
+        self._engine_display = [name for name, _ in self._engine_options]
+        self._engine_map = {name: key for name, key in self._engine_options}
+        self._engine_reverse = {key: name for name, key in self._engine_options}
+
+        lang_opts = _get_language_options(self.ui.locale)
+        self._lang_map = {self._format_language_option(code, name): code for code, name in lang_opts}
         display_values = list(self._lang_map.keys())
         if not display_values:
-            display_values = ["English (en)"]
+            display_values = [self._format_language_option("en")]
 
         # Source language: filtered to languages the initial detector (fasttext) can identify.
         _src_filtered = _filter_by_detector(lang_opts, "fasttext")
-        _src_display = [f"{name} ({code})" for code, name in _src_filtered]
-        self._source_lang_label.configure(text=f"Source language ({len(_src_display)})")
-        self.source_lang_var = tk.StringVar(value="Auto-detect (translate all)")
-        source_values = ["Auto-detect (translate all)"] + _src_display
-        self._source_lang_map = {"Auto-detect (translate all)": "auto"}
+        _src_display = [self._format_language_option(code, name) for code, name in _src_filtered]
+        self._source_lang_label.configure(
+            text=self.t("sidebar.source_language_count", count=len(_src_display)),
+        )
+        auto_detect_label = self.t("sidebar.auto_detect")
+        self.source_lang_var = tk.StringVar(value=auto_detect_label)
+        source_values = [auto_detect_label] + _src_display
+        self._source_lang_map = {auto_detect_label: "auto"}
         self._source_lang_map.update({k: v for k, v in self._lang_map.items() if k in set(_src_display)})
 
         self.source_lang_box = SearchableComboBox(
@@ -1110,11 +1144,11 @@ class App:
 
         # Target language
         theme.make_label(
-            self.sidebar, "Target language", level="small",
+            self.sidebar, self.t("sidebar.target_language"), level="small",
         ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(6, 2))
         row += 1
 
-        default_target = "English (en)"
+        default_target = self._format_language_option("en")
         if default_target not in display_values and display_values:
             default_target = display_values[0]
         self.lang_var = tk.StringVar(value=default_target)
@@ -1126,7 +1160,7 @@ class App:
 
         # Language detector
         theme.make_label(
-            self.sidebar, "Language detector", level="small",
+            self.sidebar, self.t("sidebar.language_detector"), level="small",
         ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(6, 2))
         row += 1
 
@@ -1142,16 +1176,16 @@ class App:
 
         # Translation engine
         theme.make_label(
-            self.sidebar, "Translation engine", level="small",
+            self.sidebar, self.t("sidebar.translation_engine"), level="small",
         ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(6, 2))
         row += 1
 
         saved_engine = self.cfg.get("translation_engine", "google")
-        default_engine_display = _ENGINE_REVERSE.get(saved_engine, _ENGINE_DISPLAY[0])
+        default_engine_display = self._engine_reverse.get(saved_engine, self._engine_display[0])
         self.engine_var = tk.StringVar(value=default_engine_display)
         self.engine_menu = SimpleComboBox(
             self.sidebar,
-            values=_ENGINE_DISPLAY,
+            values=self._engine_display,
             variable=self.engine_var,
             command=self._on_engine_changed,
         )
@@ -1163,7 +1197,7 @@ class App:
         self._engine_usage_label_grid_kw = dict(row=row, column=0, sticky="w", padx=PAD, pady=(0, 6))
         self._engine_usage_label.grid(**self._engine_usage_label_grid_kw)
         row += 1
-        self._update_usage_label(_ENGINE_MAP.get(default_engine_display, "google"))
+        self._update_usage_label(self._engine_key_for_display(default_engine_display))
       
         # Spacer row (pushes everything to bottom)
         self.sidebar.grid_rowconfigure(row, weight=1)
@@ -1171,7 +1205,7 @@ class App:
 
         # OUTPUT section
         theme.make_label(
-            self.sidebar, "Output folder", level="small",
+            self.sidebar, self.t("sidebar.output_folder"), level="small",
         ).grid(row=row, column=0, sticky="w", padx=PAD, pady=(2, 2))
         row += 1
 
@@ -1199,7 +1233,7 @@ class App:
         # Action buttons
         play_icon = get_icon("play", size=16, on_accent=True)
         self.start_btn = theme.make_button(
-            self.sidebar, "Start Translation", command=self._start, style="primary",
+            self.sidebar, self.t("sidebar.start_translation"), command=self._start, style="primary",
             height=38, image=play_icon,
         )
         self.start_btn.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(8, 4))
@@ -1207,7 +1241,7 @@ class App:
 
         stop_icon = get_icon("stop", size=16)
         self.cancel_btn = theme.make_button(
-            self.sidebar, "Cancel", command=self._cancel, style="secondary",
+            self.sidebar, self.t("sidebar.cancel"), command=self._cancel, style="secondary",
             height=32, state="disabled", image=stop_icon,
         )
         self.cancel_btn.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 4))
@@ -1221,7 +1255,7 @@ class App:
 
         settings_icon = get_icon("settings", size=16)
         theme.make_button(
-            self.sidebar, "Settings", command=self._open_settings, style="ghost",
+            self.sidebar, self.t("sidebar.settings"), command=self._open_settings, style="ghost",
             anchor="w", image=settings_icon,
         ).grid(row=row, column=0, sticky="ew", padx=PAD, pady=(4, 4))
         row += 1
@@ -1231,7 +1265,7 @@ class App:
         about_frame.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, PAD))
         about_frame.grid_columnconfigure(0, weight=1)
         about_btn = theme.make_button(
-            about_frame, "About", command=self._open_about, style="ghost",
+            about_frame, self.t("sidebar.about"), command=self._open_about, style="ghost",
             anchor="w", image=info_icon,
         )
         about_btn.grid(row=0, column=0, sticky="ew")
@@ -1257,7 +1291,7 @@ class App:
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, PAD))
         toolbar.grid_columnconfigure(0, weight=1)
 
-        theme.make_label(toolbar, "Files", level="subheading").grid(
+        theme.make_label(toolbar, self.t("content.files"), level="subheading").grid(
             row=0, column=0, sticky="w", padx=PAD, pady=8,
         )
         btn_frame = ctk.CTkFrame(toolbar, fg_color="transparent")
@@ -1268,15 +1302,15 @@ class App:
         trash_icon = get_icon("trash", size=16)
 
         theme.make_button(
-            btn_frame, "Add Files", command=self._add_files, style="primary",
+            btn_frame, self.t("content.add_files"), command=self._add_files, style="primary",
             image=add_icon, height=30,
         ).pack(side=tk.LEFT, padx=(0, 6))
         theme.make_button(
-            btn_frame, "Select Folder", command=self._select_folder, style="primary",
+            btn_frame, self.t("content.select_folder"), command=self._select_folder, style="primary",
             image=folder_icon, height=30,
         ).pack(side=tk.LEFT, padx=(0, 6))
         theme.make_button(
-            btn_frame, "Clear", command=self._clear_files, style="secondary",
+            btn_frame, self.t("content.clear"), command=self._clear_files, style="secondary",
             image=trash_icon, height=30,
         ).pack(side=tk.LEFT)
 
@@ -1291,7 +1325,7 @@ class App:
         progress_card.grid_columnconfigure(0, weight=1)
 
         self.progress_label = theme.make_label(
-            progress_card, "Ready", level="small",
+            progress_card, self.t("content.ready"), level="small",
         )
         self.progress_label.grid(
             row=0, column=0, sticky="w", padx=PAD, pady=(10, 4),
@@ -1313,7 +1347,7 @@ class App:
         log_card.grid_columnconfigure(0, weight=1)
         log_card.grid_rowconfigure(1, weight=1)
 
-        theme.make_label(log_card, "Log", level="subheading").grid(
+        theme.make_label(log_card, self.t("content.log"), level="subheading").grid(
             row=0, column=0, sticky="w", padx=PAD, pady=(10, 4),
         )
 
@@ -1458,11 +1492,11 @@ class App:
             self.file_table.tk.call(str(self.file_table), "configure", "-highlightthickness", 0)
         except Exception:
             pass
-        self.file_table.heading("status", text="Status", anchor="center")
-        self.file_table.heading("time", text="Time", anchor="center")
+        self.file_table.heading("status", text=self.t("table.status"), anchor="center")
+        self.file_table.heading("time", text=self.t("table.time"), anchor="center")
 
         self.file_table["show"] = ("tree", "headings")
-        self.file_table.heading("#0", text="File", anchor="w")
+        self.file_table.heading("#0", text=self.t("table.file"), anchor="w")
         self.file_table.column("#0", width=300, minwidth=150, stretch=True)
         self.file_table.column("status", width=100, minwidth=80, stretch=False, anchor="center")
         self.file_table.column("time", width=80, minwidth=60, stretch=False, anchor="center")
@@ -1522,7 +1556,7 @@ class App:
         if icon:
             kw["image"] = icon
         iid = self.file_table.insert(
-            "", tk.END, text=f"  {name}", values=(status, ""), tags=(status, row_tag), **kw,
+            "", tk.END, text=f"  {name}", values=(self._status_text(status), ""), tags=(status, row_tag), **kw,
         )
         self._tree_ids[iid] = filepath
         self._file_to_iid[filepath] = iid
@@ -1535,14 +1569,14 @@ class App:
         time_str = self._format_elapsed_time(elapsed)
         idx = list(self._file_to_iid.keys()).index(filepath)
         row_tag = "even" if idx % 2 == 0 else "odd"
-        self.file_table.item(iid, text=name, values=(status, time_str), tags=(status, row_tag))
+        self.file_table.item(iid, text=name, values=(self._status_text(status), time_str), tags=(status, row_tag))
 
     def _update_all_statuses(self, status: str):
         for filepath, iid in self._file_to_iid.items():
             name = os.path.basename(filepath)
             idx = list(self._file_to_iid.keys()).index(filepath)
             row_tag = "even" if idx % 2 == 0 else "odd"
-            self.file_table.item(iid, text=name, values=(status, ""), tags=(status, row_tag))
+            self.file_table.item(iid, text=name, values=(self._status_text(status), ""), tags=(status, row_tag))
 
     def _retag_rows(self):
         for idx, iid in enumerate(self.file_table.get_children()):
@@ -2043,16 +2077,17 @@ class App:
                 from ..translators.usage import get_tracker
                 t = get_tracker()
                 lines: list[str] = []
-                for display_name, eng_key in _ENGINE_OPTIONS:
+                for eng_key, _label_key in _ENGINE_LABEL_KEYS:
                     usage_str = t.format_usage(eng_key)
                     if usage_str:
+                        display_name = self._engine_display_name(eng_key)
                         lines.append(f"{display_name}: {usage_str}")
-                return "\n".join(lines) if lines else "No usage data yet."
+                return "\n".join(lines) if lines else self.t("settings.no_usage_data")
             except Exception:
                 return ""
 
         usage_text = _get_usage_text()
-        usage_lbl = theme.make_label(right, usage_text or "No usage data yet.", level="tiny")
+        usage_lbl = theme.make_label(right, usage_text or self.t("settings.no_usage_data"), level="tiny")
         usage_lbl.configure(anchor="w", justify="left")
         usage_lbl.grid(row=_rrow, column=0, sticky="w", pady=(0, 6))
         _rrow += 1
@@ -2064,9 +2099,9 @@ class App:
             from ..utils.io import format_bytes
             n = get_cache().size()
             b = get_cache().disk_usage_bytes()
-            initial_lbl = f"({n:,} entries, {format_bytes(b)})"
+            initial_lbl = self.t("settings.cache.entries", entries=f"{n:,}", size=format_bytes(b))
         except Exception:
-            initial_lbl = "(0 entries, 0 B)"
+            initial_lbl = self.t("settings.cache.entries", entries="0", size="0 B")
 
         _cache_row = ctk.CTkFrame(right, fg_color="transparent")
         _cache_row.grid(row=_rrow, column=0, sticky="w", pady=(0, 4))
@@ -2081,9 +2116,9 @@ class App:
                 from ..utils.io import format_bytes
                 n = get_cache().size()
                 b = get_cache().disk_usage_bytes()
-                txt = f"({n:,} entries, {format_bytes(b)})"
+                txt = self.t("settings.cache.entries", entries=f"{n:,}", size=format_bytes(b))
             except Exception:
-                txt = "(0 entries, 0 B)"
+                txt = self.t("settings.cache.entries", entries="0", size="0 B")
             try:
                 cache_lbl.configure(text=txt)
                 cache_lbl.update_idletasks()
@@ -2094,16 +2129,16 @@ class App:
             try:
                 from ..translators.cache import get_cache
                 get_cache().clear()
-                self._log("Translation cache cleared.")
+                self._log(self.t("log.cache_cleared"))
             except Exception as e:
-                self._log(f"Error clearing cache: {e}")
+                self._log(self.t("log.cache_clear_error", error=e))
             try:
                 _update_cache_label()
             except Exception:
                 pass
 
         clear_btn = theme.make_button(
-            _cache_row, "Clear translation cache",
+            _cache_row, self.t("settings.clear_translation_cache"),
             command=_clear_cache, style="secondary", height=26,
         )
         clear_btn.pack(side=tk.LEFT)
@@ -2129,7 +2164,7 @@ class App:
             inp = in_entry.get().strip()
             out = out_entry.get().strip()
             if not out:
-                self._settings_error.configure(text="Input or Output path cannot be empty")
+                self._settings_error.configure(text=self.t("settings.error.input_or_output_empty"))
                 return
             self._settings_error.configure(text="")
             self.cfg["default_input"] = inp
@@ -2154,7 +2189,7 @@ class App:
             # Refresh engine-dependent UI after config changes
             try:
                 self._refresh_language_dropdowns()
-                self._update_usage_label(_ENGINE_MAP.get(self.engine_var.get(), "google"))
+                self._update_usage_label(self._engine_key_for_display(self.engine_var.get()))
             except Exception:
                 logger.exception("Failed to refresh language dropdowns after saving settings")
 
@@ -2164,11 +2199,11 @@ class App:
                 pass
             win.destroy()
 
-        theme.make_button(btn_frame, "Save", command=_save_and_close, style="primary",
+        theme.make_button(btn_frame, self.t("settings.save"), command=_save_and_close, style="primary",
                           height=28).pack(
             side=tk.LEFT, padx=(0, 6),
         )
-        theme.make_button(btn_frame, "Cancel", command=win.destroy, style="secondary",
+        theme.make_button(btn_frame, self.t("sidebar.cancel"), command=win.destroy, style="secondary",
                           height=28).pack(
             side=tk.LEFT,
         )
@@ -2917,13 +2952,15 @@ class App:
     def _add_files(self):
         init = self._initialdir_for_input()
         filetypes = [
-            ("All supported", ("*.docx", "*.pdf", "*.xlsx", "*.xls")),
-            ("Excel spreadsheets", ("*.xlsx", "*.xls")),
-            ("Word documents", ("*.docx",)),
-            ("PDF documents", ("*.pdf",)),
-            ("All files", "*.*"),
+            (self.t("file_dialog.all_supported"), ("*.docx", "*.pdf", "*.xlsx", "*.xls")),
+            (self.t("file_dialog.excel_spreadsheets"), ("*.xlsx", "*.xls")),
+            (self.t("file_dialog.word_documents"), ("*.docx",)),
+            (self.t("file_dialog.pdf_documents"), ("*.pdf",)),
+            (self.t("file_dialog.all_files"), "*.*"),
         ]
-        paths = filedialog.askopenfilenames(title="Select files", parent=self.root, initialdir=init, filetypes=filetypes)
+        paths = filedialog.askopenfilenames(
+            title=self.t("file_dialog.select_files"), parent=self.root, initialdir=init, filetypes=filetypes,
+        )
         if not paths:
             return
 
@@ -2945,19 +2982,23 @@ class App:
 
         if invalid:
             messagebox.showwarning(
-                "Unsupported files",
-                "Some selected files were not supported and were ignored.\n\n"
-                "Supported types: .docx, .pdf, .xlsx, .xls"
+                self.t("message.unsupported_files_title"),
+                self.t("message.unsupported_files_body"),
             )
 
     def _select_folder(self):
         init = self._initialdir_for_input()
-        d = filedialog.askdirectory(title="Select folder containing files", parent=self.root, initialdir=init)
+        d = filedialog.askdirectory(
+            title=self.t("file_dialog.select_folder"), parent=self.root, initialdir=init,
+        )
         if not d:
             return
         found = list_supported_files(d)
         if not found:
-            messagebox.showinfo("No files", f"No supported files found in {d}")
+            messagebox.showinfo(
+                self.t("message.no_files_title"),
+                self.t("message.no_files_found_body", path=d),
+            )
             return
         
         from pathlib import Path as _Path
@@ -2990,7 +3031,7 @@ class App:
             self.completed_files = 0
             self.total_files = 0
             self._set_progress(0.0)
-            self._update_progress_label("Ready")
+            self._update_progress_label(self.t("content.ready"))
             try:
                 self.log.configure(state="normal")
                 self.log.delete("1.0", "end")
@@ -3000,7 +3041,9 @@ class App:
 
     def _select_output(self):
         init = self._initialdir_for_output()
-        d = filedialog.askdirectory(title="Select output folder", parent=self.root, initialdir=init)
+        d = filedialog.askdirectory(
+            title=self.t("file_dialog.select_output_folder"), parent=self.root, initialdir=init,
+        )
         if d:
             self.output_entry.delete(0, tk.END)
             self.output_entry.insert(0, _try_make_relative(d))
@@ -3014,7 +3057,7 @@ class App:
     def _on_engine_changed(self, *_) -> None:
         # Repopulate language dropdowns when the translation engine changes.
         self._refresh_language_dropdowns()
-        engine_key = _ENGINE_MAP.get(self.engine_var.get(), "google")
+        engine_key = self._engine_key_for_display(self.engine_var.get())
         self.cfg["translation_engine"] = engine_key
         save_config(self.cfg)
         self._log(f"Translation engine changed to: {engine_key!r}")
@@ -3022,14 +3065,14 @@ class App:
 
     def _on_source_lang_changed(self, *_) -> None:
         # Only local engine uses source-based target filtering.
-        engine_key = _ENGINE_MAP.get(self.engine_var.get(), "google")
+        engine_key = self._engine_key_for_display(self.engine_var.get())
         if engine_key != "local":
             return
 
         from ..translators.local import list_downloaded_pairs
         model_dir = _get_local_model_dir_from_cfg(self.cfg)
         pairs = list_downloaded_pairs(model_dir)
-        lang_opts = _get_language_options()
+        lang_opts = _get_language_options(self.ui.locale)
 
         source_code = self._source_lang_map.get(self.source_lang_var.get())
 
@@ -3042,8 +3085,8 @@ class App:
                     tgt_codes.add(_opus_code_to_iso(t))
 
         tgt_filtered = [(c, n) for c, n in lang_opts if c in tgt_codes]
-        tgt_display = [f"{name} ({code})" for code, name in tgt_filtered]
-        self._lang_map = {f"{name} ({code})": code for code, name in tgt_filtered}
+        tgt_display = [self._format_language_option(code, name) for code, name in tgt_filtered]
+        self._lang_map = {self._format_language_option(code, name): code for code, name in tgt_filtered}
         self.target_lang_box.update_values(tgt_display)
 
     def _update_usage_label(self, engine_key: str) -> None:
@@ -3080,9 +3123,8 @@ class App:
     def _refresh_language_dropdowns(self) -> None:
         # Recompute source and target language lists based on current engine + detector
         detector = (self.detector_var.get() or "fasttext").strip().lower()
-        engine_key = _ENGINE_MAP.get(self.engine_var.get(), "google")
-        lang_opts = _get_language_options()
-        lang_name_by_code = {code: name for code, name in lang_opts}
+        engine_key = self._engine_key_for_display(self.engine_var.get())
+        lang_opts = _get_language_options(self.ui.locale)
 
         if engine_key == "local":
             # Local engine: only show languages where a downloaded model exists
@@ -3101,18 +3143,20 @@ class App:
             # Source list — languages which appear as source in at least one pair
             # No Auto-detect for local engine (each pair needs an explicit model)
             src_filtered = [(c, n) for c, n in lang_opts if c in src_codes_set]
-            src_display = [f"{name} ({code})" for code, name in src_filtered]
+            src_display = [self._format_language_option(code, name) for code, name in src_filtered]
             source_values = src_display
             self._source_lang_map = {
-                f"{name} ({code})": code for code, name in src_filtered
+                self._format_language_option(code, name): code for code, name in src_filtered
             }
             self.source_lang_box.update_values(source_values)
-            self._source_lang_label.configure(text=f"Source language ({len(src_display)})")
+            self._source_lang_label.configure(
+                text=self.t("sidebar.source_language_count", count=len(src_display)),
+            )
 
             # Target list — all targets reachable from any source
             tgt_filtered = [(c, n) for c, n in lang_opts if c in tgt_codes_set]
-            tgt_display = [f"{name} ({code})" for code, name in tgt_filtered]
-            self._lang_map = {f"{name} ({code})": code for code, name in tgt_filtered}
+            tgt_display = [self._format_language_option(code, name) for code, name in tgt_filtered]
+            self._lang_map = {self._format_language_option(code, name): code for code, name in tgt_filtered}
             self.target_lang_box.update_values(tgt_display)
 
             self._log(f"Language lists updated for engine={engine_key!r} "
@@ -3123,21 +3167,23 @@ class App:
         # Non-local engines: original logic
         # Target: filter by engine only (detector doesn't restrict target)
         tgt_filtered = _filter_by_engine(lang_opts, engine_key)
-        tgt_display = [f"{name} ({code})" for code, name in tgt_filtered]
-        self._lang_map = {f"{name} ({code})": code for code, name in tgt_filtered}
+        tgt_display = [self._format_language_option(code, name) for code, name in tgt_filtered]
+        self._lang_map = {self._format_language_option(code, name): code for code, name in tgt_filtered}
         self.target_lang_box.update_values(tgt_display)
 
         # Source: intersection of engine-supported and detector-supported
         src_filtered = _filter_by_engine(_filter_by_detector(lang_opts, detector), engine_key)
-        src_display = [f"{name} ({code})" for code, name in src_filtered]
-        src_display_set = set(src_display)
-        source_values = ["Auto-detect (translate all)"] + src_display
-        self._source_lang_map = {"Auto-detect (translate all)": "auto"}
+        src_display = [self._format_language_option(code, name) for code, name in src_filtered]
+        auto_detect_label = self.t("sidebar.auto_detect")
+        source_values = [auto_detect_label] + src_display
+        self._source_lang_map = {auto_detect_label: "auto"}
         self._source_lang_map.update(
-            {f"{name} ({code})": code for code, name in src_filtered}
+            {self._format_language_option(code, name): code for code, name in src_filtered}
         )
         self.source_lang_box.update_values(source_values)
-        self._source_lang_label.configure(text=f"Source language ({len(src_display)})")
+        self._source_lang_label.configure(
+            text=self.t("sidebar.source_language_count", count=len(src_display)),
+        )
         self._log(f"Language lists updated for engine={engine_key!r}, detector={detector!r} "
                   f"(target: {len(tgt_display)}, source: {len(src_display)})")
 
@@ -3172,10 +3218,10 @@ class App:
             typed = self.target_lang_box.get()
             lang = self._lang_map.get(typed)
         if not lang:
-            messagebox.showwarning("Missing language", "Please select a target language from the dropdown.")
+            messagebox.showwarning(self.t("message.missing_language_title"), self.t("message.missing_language_body"))
             return
         if not self.files:
-            messagebox.showwarning("No files", "Please add files or select a folder first.")
+            messagebox.showwarning(self.t("message.no_files_title"), self.t("message.no_files_selected_body"))
             return
 
         # Resolve source language
@@ -3196,7 +3242,7 @@ class App:
             if is_relative:
                 out_path.mkdir(parents=True, exist_ok=True)
             else:
-                self._log(f"Error: Output path \u201c{output}\u201d does not exist \u2014 translation cancelled.")
+                self._log(self.t("log.output_path_missing", output=output))
                 return
         output = str(out_path)
 
@@ -3206,7 +3252,7 @@ class App:
             detector = "fasttext"
 
         # Resolve translation engine and credentials from config
-        engine = _ENGINE_MAP.get(self.engine_var.get(), "google")
+        engine = self._engine_key_for_display(self.engine_var.get())
         proxy_url = self.cfg.get("proxy_url", "").strip()
         proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else None
         google_api_key = self.cfg.get("google_api_key", "")
@@ -3223,38 +3269,32 @@ class App:
         # Validate credentials for engines that require them
         if engine == "baidu" and (not baidu_appid or not baidu_appkey):
             messagebox.showwarning(
-                "Missing credentials",
-                "Baidu Translate requires an App ID and App Key.\n"
-                "Please configure them in Settings → API Keys.",
+                self.t("message.missing_credentials_title"),
+                self.t("message.baidu_missing_credentials"),
             )
             return
         if engine == "google-cloud-v3" and not google_project_id:
             messagebox.showwarning(
-                "Missing credentials",
-                "Google Cloud API (v3) requires a Project ID.\n"
-                "Please configure it in Settings → API Keys.",
+                self.t("message.missing_credentials_title"),
+                self.t("message.google_cloud_v3_missing_credentials"),
             )
             return
         if engine == "google-cloud" and not google_api_key:
             messagebox.showwarning(
-                "Missing API key",
-                "Google Cloud API requires an API key.\n"
-                "Please configure it in Settings → API Keys,\n"
-                "or switch to \"Google Translate (free)\".",
+                self.t("message.missing_api_key_title"),
+                self.t("message.google_cloud_missing_api_key"),
             )
             return
         if engine == "azure" and (not azure_key or not azure_region):
             messagebox.showwarning(
-                "Missing credentials",
-                "Microsoft Azure Translator requires a Subscription Key and Region.\n"
-                "Please configure them in Settings → Azure Translator.",
+                self.t("message.missing_credentials_title"),
+                self.t("message.azure_missing_credentials"),
             )
             return
         if engine == "deepl" and not deepl_api_key:
             messagebox.showwarning(
-                "Missing API key",
-                "DeepL requires an API Key.\n"
-                "Please configure it in Settings \u2192 DeepL.",
+                self.t("message.missing_api_key_title"),
+                self.t("message.deepl_missing_api_key"),
             )
             return
 
@@ -3265,9 +3305,8 @@ class App:
             _local_pairs = list_downloaded_pairs(_lm_dir)
             if not _local_pairs:
                 if messagebox.askyesno(
-                    "No models downloaded",
-                    "No local OPUS-MT models found.\n\n"
-                    "Open Settings to download models?",
+                    self.t("message.no_models_downloaded_title"),
+                    self.t("message.no_models_downloaded_body"),
                 ):
                     self._open_settings()
                 return
@@ -3275,9 +3314,8 @@ class App:
                          for s, t in _local_pairs}
             if (source_lang, lang) not in _pair_set:
                 if messagebox.askyesno(
-                    "Missing model",
-                    f"No local model for {source_lang} \u2192 {lang}.\n\n"
-                    "Open Settings to download it?",
+                    self.t("message.missing_model_title"),
+                    self.t("message.missing_model_body", source=source_lang, target=lang),
                 ):
                     self._open_settings()
                 return
@@ -3294,19 +3332,12 @@ class App:
                 warning = tracker.check_warning(_usage_key)
                 if warning in ("warn", "limit"):
                     used_str = tracker.format_usage(_usage_key) or ""
-                    engine_display = _ENGINE_REVERSE.get(engine, engine)
+                    engine_display = self._engine_display_name(engine)
                     if warning == "limit":
-                        msg = (
-                            f"You have used {used_str} of your {engine_display} quota.\n\n"
-                            "You may have exceeded your monthly limit. "
-                            "The API will likely reject requests.\n\nContinue anyway?"
-                        )
+                        msg = self.t("message.usage_limit_body", usage=used_str, engine=engine_display)
                     else:
-                        msg = (
-                            f"You have used {used_str} of your {engine_display} quota "
-                            "for this month.\n\nYou are approaching your monthly limit. Continue?"
-                        )
-                    if not messagebox.askyesno("Usage Warning", msg):
+                        msg = self.t("message.usage_warn_body", usage=used_str, engine=engine_display)
+                    if not messagebox.askyesno(self.t("message.usage_warning_title"), msg):
                         return
                     self._update_usage_label(engine)
             except Exception:
@@ -3327,7 +3358,7 @@ class App:
         self.completed_files = 0
         self._file_start_times.clear()
         self._set_progress(0.0)
-        self._update_progress_label("Starting\u2026")
+        self._update_progress_label(self.t("progress.starting"))
         self._current_file_name = ""
 
         self.worker.start(
@@ -3363,10 +3394,10 @@ class App:
             import time as _time
             if status == "started":
                 self._file_start_times[filepath] = _time.perf_counter()
-                self._update_file_status(filepath, "translating\u2026")
+                self._update_file_status(filepath, "started")
                 self._current_file_name = Path(filepath).name
                 self._update_progress_label(
-                    f"Translating {self._current_file_name}\u2026 0%"
+                    self.t("progress.translating_file", name=self._current_file_name)
                 )
             elif status == "progress":
                 # elapsed carries the global fraction (0.0–1.0) for intra-file progress
@@ -3375,7 +3406,7 @@ class App:
                 self._set_progress(frac)
                 name = getattr(self, "_current_file_name", "")
                 self._update_progress_label(
-                    f"Translating {name}\u2026 {int(frac * 100)}%"
+                    self.t("progress.translating_percent", name=name, percent=int(frac * 100))
                 )
             elif status in ("finished", "error"):
                 self.completed_files += 1
@@ -3385,11 +3416,21 @@ class App:
                 remaining = self.total_files - self.completed_files
                 if remaining > 0:
                     self._update_progress_label(
-                        f"{self.completed_files} / {self.total_files} files ({int(pct * 100)}%)"
+                        self.t(
+                            "progress.files_complete",
+                            completed=self.completed_files,
+                            total=self.total_files,
+                            percent=int(pct * 100),
+                        )
                     )
                 else:
                     self._update_progress_label(
-                        f"{self.completed_files} / {self.total_files} files (100%)"
+                        self.t(
+                            "progress.files_complete",
+                            completed=self.completed_files,
+                            total=self.total_files,
+                            percent=100,
+                        )
                     )
                 if self.completed_files >= self.total_files:
                     self._finish_run()
@@ -3399,7 +3440,7 @@ class App:
                     iid = self._file_to_iid.get(f)
                     if iid:
                         vals = self.file_table.item(iid, "values")
-                        if vals and vals[0] == "pending":
+                        if vals and vals[0] == self._status_text("pending"):
                             self._update_file_status(f, "cancelled")
                 self._finish_run(cancelled=True)
 
@@ -3426,14 +3467,14 @@ class App:
         self._set_button_disabled(self.start_btn, False)
         self._set_button_disabled(self.cancel_btn, True)
         try:
-            engine_key = _ENGINE_MAP.get(self.engine_var.get(), "google")
+            engine_key = self._engine_key_for_display(self.engine_var.get())
             self._update_usage_label(engine_key)
         except Exception:
             pass
         if cancelled:
             pct = self.completed_files / max(1, self.total_files)
             self._update_progress_label(
-                f"Cancelled \u2014 {int(pct * 100)}%",
+                self.t("progress.cancelled", percent=int(pct * 100)),
             )
 
     def _apply_debug_mode(self):
