@@ -5,7 +5,7 @@
   },
   "ui_locale_names": {
     "en": "English",
-    "zh-Hans": "Chinese (Simplified)"
+    "zh-Hans": "Chinese (简体中文)"
   },
   "strings": {
     "engine.google": "Google Translate (free)",
@@ -51,7 +51,6 @@
     "settings.appearance.light_mode": "Light mode",
     "settings.appearance.restart_required": "Appearance changes require a restart to take effect.",
     "settings.section.language": "LANGUAGE",
-    "settings.ui_language": "User interface language",
     "settings.language.restart_required": "Language changes require a restart to take effect.",
     "settings.section.updates": "UPDATES",
     "settings.auto_check_updates": "Automatically check for updates",
@@ -122,7 +121,7 @@
     "dialog.about_copyright": "Copyright 2026 crt_ (8041q) - Released under the AGPL-3.0 License",
     "dialog.about.check_for_updates": "Check for Updates",
     "dialog.about.update.checking": "Checking...",
-    "dialog.about.update.latest": "OK  You are up to date",
+    "dialog.about.update.latest": "🗸 You are up to date",
     "dialog.about.update.error": "Could not check for updates.",
     "dialog.about.update.available": "Update available: v{version}",
     "dialog.about.github": "View on GitHub",

@@ -1594,7 +1594,7 @@ class App:
         win = ctk.CTkToplevel(self.root)
         win.wm_attributes("-alpha", 0)  # keep invisible until centered
         apply_window_icon(win)
-        win.title("Settings")
+        win.title(self.t("settings.title"))
         win.transient(self.root)
         win.grab_set()
         win.configure(fg_color=p.bg_main)
@@ -1614,7 +1614,7 @@ class App:
         title_frame.grid(row=0, column=0, sticky="w", padx=PAD, pady=(PAD, PAD))
         if settings_icon:
             ctk.CTkLabel(title_frame, text="", image=settings_icon, width=20).pack(side=tk.LEFT, padx=(0, 8))
-        theme.make_label(title_frame, "Settings", level="heading").pack(side=tk.LEFT)
+        theme.make_label(title_frame, self.t("settings.title"), level="heading").pack(side=tk.LEFT)
 
         # ── Two-column body ───────────────────────────────────────────────
         body = ctk.CTkFrame(card, fg_color="transparent")
@@ -1641,13 +1641,13 @@ class App:
         _lrow = 0
 
         # FOLDERS section
-        theme.make_label(left, "FOLDERS", level="section").grid(
+        theme.make_label(left, self.t("settings.section.folders"), level="section").grid(
             row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4),
         )
         _lrow += 1
 
         # Default input folder
-        theme.make_label(left, "Default input folder", level="small").grid(
+        theme.make_label(left, self.t("settings.default_input_folder"), level="small").grid(
             row=_lrow, column=0, sticky="w", pady=(0, 2),
         )
         _lrow += 1
@@ -1667,18 +1667,18 @@ class App:
                 candidate = Path.cwd()
             while not candidate.exists() and candidate.parent != candidate:
                 candidate = candidate.parent
-            d = filedialog.askdirectory(title="Select default input folder", parent=win, initialdir=str(candidate))
+            d = filedialog.askdirectory(title=self.t("dialog.select_default_input_folder"), parent=win, initialdir=str(candidate))
             if d:
                 in_entry.delete(0, tk.END)
                 in_entry.insert(0, str(Path(d).resolve()))
 
         browse_icon_s = get_icon("folder", size=14)
-        theme.make_button(_input_row, "Browse", command=_browse_default_input, style="secondary",
+        theme.make_button(_input_row, self.t("settings.browse"), command=_browse_default_input, style="secondary",
                           image=browse_icon_s, height=28).grid(row=0, column=1, padx=(6, 0))
         _lrow += 1
 
         # Default output folder
-        theme.make_label(left, "Default output folder", level="small").grid(
+        theme.make_label(left, self.t("settings.default_output_folder"), level="small").grid(
             row=_lrow, column=0, sticky="w", pady=(6, 4),
         )
         _lrow += 1
@@ -1698,12 +1698,12 @@ class App:
                 candidate = Path.cwd()
             while not candidate.exists() and candidate.parent != candidate:
                 candidate = candidate.parent
-            d = filedialog.askdirectory(title="Select default output folder", parent=win, initialdir=str(candidate))
+            d = filedialog.askdirectory(title=self.t("dialog.select_default_output_folder"), parent=win, initialdir=str(candidate))
             if d:
                 out_entry.delete(0, tk.END)
                 out_entry.insert(0, str(Path(d).resolve()))
 
-        theme.make_button(_output_row, "Browse", command=_browse_default_output, style="secondary",
+        theme.make_button(_output_row, self.t("settings.browse"), command=_browse_default_output, style="secondary",
                           image=browse_icon_s, height=28).grid(row=0, column=1, padx=(6, 0))
         _lrow += 1
 
@@ -1712,7 +1712,7 @@ class App:
         _lrow += 1
 
         # APPEARANCE section
-        theme.make_label(left, "APPEARANCE", level="section").grid(
+        theme.make_label(left, self.t("settings.section.appearance"), level="section").grid(
             row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4),
         )
         _lrow += 1
@@ -1720,7 +1720,7 @@ class App:
         mode_switch_var = tk.BooleanVar(value=(theme.get_mode() == "Dark"))
         mode_switch = ctk.CTkSwitch(
             left,
-            text="Dark mode" if theme.get_mode() == "Dark" else "Light mode",
+            text=self.t("settings.appearance.dark_mode") if theme.get_mode() == "Dark" else self.t("settings.appearance.light_mode"),
             variable=mode_switch_var,
             onvalue=True,
             offvalue=False,
@@ -1735,12 +1735,43 @@ class App:
         _lrow += 1
 
         def _on_mode_switch(*_):
-            mode_switch.configure(text="Dark mode" if mode_switch_var.get() else "Light mode")
+            mode_switch.configure(text=self.t("settings.appearance.dark_mode") if mode_switch_var.get() else self.t("settings.appearance.light_mode"))
 
         mode_switch_var.trace_add("write", _on_mode_switch)
 
         theme.make_label(
-            left, "Appearance changes require a restart to take effect.",
+            left, self.t("settings.appearance.restart_required"),
+            level="tiny",
+        ).grid(row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        _lrow += 1
+
+        # Divider
+        theme.make_divider(left).grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(10, 8))
+        _lrow += 1
+
+        # LANGUAGE section
+        theme.make_label(left, self.t("settings.section.language"), level="section").grid(
+            row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4),
+        )
+        _lrow += 1
+
+        _locale_options = get_supported_ui_locales(self.ui.locale)
+        _locale_display = [name for _, name in _locale_options]
+        _current_locale = resolve_ui_locale(self.cfg.get("ui_locale"))
+        _initial_locale_display = next(
+            (name for code, name in _locale_options if code == _current_locale),
+            _locale_display[0],
+        )
+        ui_lang_var = tk.StringVar(value=_initial_locale_display)
+        SimpleComboBox(
+            left,
+            values=_locale_display,
+            variable=ui_lang_var,
+        ).grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        _lrow += 1
+
+        theme.make_label(
+            left, self.t("settings.language.restart_required"),
             level="tiny",
         ).grid(row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 2))
         _lrow += 1
@@ -1750,7 +1781,7 @@ class App:
         _lrow += 1
 
         # UPDATES section
-        theme.make_label(left, "UPDATES", level="section").grid(
+        theme.make_label(left, self.t("settings.section.updates"), level="section").grid(
             row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4),
         )
         _lrow += 1
@@ -1758,7 +1789,7 @@ class App:
         auto_updates_var = tk.BooleanVar(value=self.cfg.get("auto_check_updates", True))
         auto_updates_cb = ctk.CTkCheckBox(
             left,
-            text="Automatically check for updates",
+            text=self.t("settings.auto_check_updates"),
             variable=auto_updates_var,
             onvalue=True,
             offvalue=False,
@@ -1777,7 +1808,7 @@ class App:
         _lrow += 1
 
         # DEBUG section
-        theme.make_label(left, "DEBUG", level="section").grid(
+        theme.make_label(left, self.t("settings.section.debug"), level="section").grid(
             row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4),
         )
         _lrow += 1
@@ -1785,7 +1816,7 @@ class App:
         debug_var = tk.BooleanVar(value=bool(self.cfg.get("debug_mode", False)))
         debug_cb = ctk.CTkCheckBox(
             left,
-            text="Debug mode (show debug/info messages)",
+            text=self.t("settings.debug_mode"),
             variable=debug_var,
             onvalue=True,
             offvalue=False,
@@ -1804,7 +1835,7 @@ class App:
         _lrow += 1
 
         # LOCAL MODELS section
-        theme.make_label(left, "LOCAL MODELS", level="section").grid(
+        theme.make_label(left, self.t("settings.section.local_models"), level="section").grid(
             row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4),
         )
         _lrow += 1
@@ -1814,7 +1845,7 @@ class App:
             self.root.after(50, self._open_model_manager)
 
         theme.make_button(
-            left, "Open Model Manager",
+            left, self.t("settings.open_model_manager"),
             command=_open_manager_from_settings,
             style="secondary", height=28,
         ).grid(row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4))
@@ -1836,12 +1867,12 @@ class App:
         _rrow = 0
 
         # NETWORK section
-        theme.make_label(right, "NETWORK", level="section").grid(
+        theme.make_label(right, self.t("settings.section.network"), level="section").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 6),
         )
         _rrow += 1
 
-        theme.make_label(right, "HTTPS Proxy", level="small").grid(
+        theme.make_label(right, self.t("settings.https_proxy"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 4),
         )
         _rrow += 1
@@ -1850,7 +1881,7 @@ class App:
         proxy_entry.insert(0, self.cfg.get("proxy_url", ""))
         _rrow += 1
         theme.make_label(
-            right, "e.g. http://127.0.0.1:7890  —  also reads HTTPS_PROXY env var",
+            right, self.t("settings.proxy_hint"),
             level="tiny",
         ).grid(row=_rrow, column=0, sticky="w", pady=(0, 8))
         _rrow += 1
@@ -1860,13 +1891,13 @@ class App:
         _rrow += 1
 
         # Google Cloud section
-        theme.make_label(right, "GOOGLE CLOUD", level="section").grid(
+        theme.make_label(right, self.t("settings.section.google_cloud"), level="section").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 6),
         )
         _rrow += 1
 
         # Google Cloud API key
-        theme.make_label(right, "Google Cloud API key (v2)", level="small").grid(
+        theme.make_label(right, self.t("settings.google_cloud_api_key_v2"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 4),
         )
         _rrow += 1
@@ -1877,7 +1908,7 @@ class App:
         _rrow += 1
 
         lbl1 = theme.make_label(
-            right, "For Google Cloud API (v2). Get key at cloud.google.com/translate\n500K chars/month free",
+            right, self.t("settings.google_cloud_v2_hint"),
             level="tiny",
         )
         lbl1.configure(anchor="w", justify="left")
@@ -1885,7 +1916,7 @@ class App:
         _rrow += 1
 
         # Google Cloud v3 Project ID
-        theme.make_label(right, "Google Cloud Project ID (v3)", level="small").grid(
+        theme.make_label(right, self.t("settings.google_cloud_project_id_v3"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 2),
         )
         _rrow += 1
@@ -1895,7 +1926,7 @@ class App:
         _rrow += 1
 
         # Google Cloud v3 Service Account JSON
-        theme.make_label(right, "Service Account JSON key (v3)", level="small").grid(
+        theme.make_label(right, self.t("settings.google_cloud_sa_json_v3"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 2),
         )
         _rrow += 1
@@ -1904,7 +1935,7 @@ class App:
         google_sa_entry.insert(0, self.cfg.get("google_sa_json", ""))
         _rrow += 1
         lbl_v3 = theme.make_label(
-            right, "For Google Cloud API (v3). Project ID required; SA JSON = file path or raw JSON.\nLeave SA JSON blank to use Application Default Credentials.",
+            right, self.t("settings.google_cloud_v3_hint"),
             level="tiny",
         )
         lbl_v3.configure(anchor="w", justify="left")
@@ -1916,13 +1947,13 @@ class App:
         _rrow += 1
 
         # Baidu section
-        theme.make_label(right, "BAIDU TRANSLATE", level="section").grid(
+        theme.make_label(right, self.t("settings.section.baidu"), level="section").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 6),
         )
         _rrow += 1
 
         # Baidu App ID
-        theme.make_label(right, "Baidu App ID", level="small").grid(
+        theme.make_label(right, self.t("settings.baidu_app_id"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 2),
         )
         _rrow += 1
@@ -1932,7 +1963,7 @@ class App:
         _rrow += 1
 
         # Baidu App Key
-        theme.make_label(right, "Baidu App Key", level="small").grid(
+        theme.make_label(right, self.t("settings.baidu_app_key"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 2),
         )
         _rrow += 1
@@ -1943,7 +1974,7 @@ class App:
         _rrow += 1
 
         lbl = theme.make_label(
-            right, "Get credentials at fanyi-api.baidu.com/choose -> 通用文本翻译 / 文本翻译 API\nStandard: 50K chars/month free (1 req/s QPS limit)\nPremium: no char limit, higher QPS (requires approved account)",
+            right, self.t("settings.baidu_hint"),
             level="tiny",
         )
         lbl.configure(anchor="w", justify="left")
@@ -1951,7 +1982,7 @@ class App:
         _rrow += 1
 
         # Baidu API tier selection
-        theme.make_label(right, "API Tier", level="small").grid(
+        theme.make_label(right, self.t("settings.api_tier"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 4),
         )
         _rrow += 1
@@ -1974,8 +2005,8 @@ class App:
             btn.pack(side=tk.LEFT, padx=(0, 6))
             return btn
 
-        _tier_btn_standard = _make_tier_btn(_tier_frame, "Standard", "standard")
-        _tier_btn_premium  = _make_tier_btn(_tier_frame, "Premium",  "premium")
+        _tier_btn_standard = _make_tier_btn(_tier_frame, self.t("settings.api_tier.standard"), "standard")
+        _tier_btn_premium  = _make_tier_btn(_tier_frame, self.t("settings.api_tier.premium"),  "premium")
 
         def _refresh_tier_btns():
             p_now = theme.get()
@@ -2004,12 +2035,12 @@ class App:
         _rrow += 1
 
         # Azure section
-        theme.make_label(right, "AZURE TRANSLATOR", level="section").grid(
+        theme.make_label(right, self.t("settings.section.azure"), level="section").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 6),
         )
         _rrow += 1
 
-        theme.make_label(right, "Subscription Key", level="small").grid(
+        theme.make_label(right, self.t("settings.azure_subscription_key"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 2),
         )
         _rrow += 1
@@ -2019,7 +2050,7 @@ class App:
         azure_key_entry.configure(show="•")
         _rrow += 1
 
-        theme.make_label(right, "Region (e.g. eastus)", level="small").grid(
+        theme.make_label(right, self.t("settings.azure_region"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 2),
         )
         _rrow += 1
@@ -2028,7 +2059,7 @@ class App:
         azure_region_entry.insert(0, self.cfg.get("azure_region", ""))
         _rrow += 1
         lbl_az = theme.make_label(
-            right, "Get key at portal.azure.com → Cognitive Services → Translator\n2M chars free/month",
+            right, self.t("settings.azure_hint"),
             level="tiny",
         )
         lbl_az.configure(anchor="w", justify="left")
@@ -2040,12 +2071,12 @@ class App:
         _rrow += 1
 
         # DeepL section
-        theme.make_label(right, "DeepL", level="section").grid(
+        theme.make_label(right, self.t("settings.section.deepl"), level="section").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 6),
         )
         _rrow += 1
 
-        theme.make_label(right, "DeepL API Key", level="small").grid(
+        theme.make_label(right, self.t("settings.deepl_api_key"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 2),
         )
         _rrow += 1
@@ -2055,7 +2086,7 @@ class App:
         deepl_key_entry.configure(show="•")
         _rrow += 1
         lbl_dl = theme.make_label(
-            right, "Get key at deepl.com/pro-api (free tier)\n500K chars free/month",
+            right, self.t("settings.deepl_hint"),
             level="tiny",
         )
         lbl_dl.configure(anchor="w", justify="left")
@@ -2067,7 +2098,7 @@ class App:
         _rrow += 1
 
         # Usage summary + cache controls
-        theme.make_label(right, "USAGE THIS MONTH", level="section").grid(
+        theme.make_label(right, self.t("settings.section.usage"), level="section").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 4),
         )
         _rrow += 1
@@ -2171,6 +2202,11 @@ class App:
             self.cfg["default_output"] = out
             new_mode = "Dark" if mode_switch_var.get() else "Light"
             self.cfg["appearance_mode"] = new_mode
+            selected_locale_name = ui_lang_var.get()
+            self.cfg["ui_locale"] = next(
+                (code for code, name in _locale_options if name == selected_locale_name),
+                _current_locale,
+            )
             self.cfg["auto_check_updates"] = auto_updates_var.get()
             self.cfg["debug_mode"] = debug_var.get()
             # Network & API keys
@@ -2261,7 +2297,7 @@ class App:
         dlg = ctk.CTkToplevel(self.root)
         dlg.wm_attributes("-alpha", 0)  # keep invisible until centered
         apply_window_icon(dlg)
-        dlg.title("Update Available")
+        dlg.title(self.t("dialog.update_available_title"))
         dlg.transient(self.root)
         dlg.grab_set()
         dlg.configure(fg_color=p.bg_main)
@@ -2272,10 +2308,10 @@ class App:
         card.grid_columnconfigure(0, weight=1)
 
         theme.make_label(
-            card, f"A new version is available: v{result['version']}", level="subheading",
+            card, self.t("dialog.update_available_heading", version=result['version']), level="subheading",
         ).grid(row=0, column=0, columnspan=2, sticky="w", padx=PAD, pady=(PAD, 4))
         theme.make_label(
-            card, "Download the latest release from GitHub to update.", level="small",
+            card, self.t("dialog.update_available_body"), level="small",
         ).grid(row=1, column=0, columnspan=2, sticky="w", padx=PAD, pady=(0, PAD))
 
         dlg_btn_frame = ctk.CTkFrame(card, fg_color="transparent")
@@ -2285,9 +2321,9 @@ class App:
             webbrowser.open(result.get("url") or RELEASES_URL)
             dlg.destroy()
 
-        theme.make_button(dlg_btn_frame, "Download", command=_download, style="primary",
+        theme.make_button(dlg_btn_frame, self.t("dialog.download"), command=_download, style="primary",
                           height=32).pack(side=tk.LEFT, padx=(0, 8))
-        theme.make_button(dlg_btn_frame, "Later", command=dlg.destroy, style="secondary",
+        theme.make_button(dlg_btn_frame, self.t("dialog.later"), command=dlg.destroy, style="secondary",
                           height=32).pack(side=tk.LEFT)
 
         dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
@@ -2324,7 +2360,7 @@ class App:
         win = ctk.CTkToplevel(self.root)
         win.wm_attributes("-alpha", 0)
         apply_window_icon(win)
-        win.title("Local Model Manager")
+        win.title(self.t("dialog.local_model_manager_title"))
         win.transient(self.root)
         win.grab_set()
         win.configure(fg_color=p.bg_main)
@@ -2381,13 +2417,12 @@ class App:
         lang_icon = get_icon("language", size=20)
         if lang_icon:
             ctk.CTkLabel(hdr, text="", image=lang_icon, width=20).pack(side=tk.LEFT, padx=(0, 8))
-        theme.make_label(hdr, "Local Model Manager", level="heading").pack(side=tk.LEFT)
+        theme.make_label(hdr, self.t("dialog.local_model_manager_heading"), level="heading").pack(side=tk.LEFT)
 
         # --- info note ---
         theme.make_label(
             card,
-            "OPUS-MT models cover one source \u2192 target pair each. "
-            "Download the pairs you need below.",
+            self.t("dialog.local_model_manager_note"),
             level="small", text_color=p.text_muted,
         ).grid(row=1, column=0, sticky="w", padx=PAD, pady=(0, 8))
 
@@ -2407,7 +2442,7 @@ class App:
             header_frame.grid_columnconfigure(ci, weight=weight, minsize=w)
         header_frame.grid_columnconfigure(6, weight=0, minsize=_SCROLLBAR_W)
 
-        _hdr_labels = ["", "Source", "Target", "Size (MB)", "Progress", ""]
+        _hdr_labels = ["", self.t("dialog.local_model_manager.column_source"), self.t("dialog.local_model_manager.column_target"), self.t("dialog.local_model_manager.column_size"), self.t("dialog.local_model_manager.column_progress"), ""]
         for ci, txt in enumerate(_hdr_labels):
             if txt:
                 theme.make_label(header_frame, txt, level="section").grid(
@@ -2445,13 +2480,13 @@ class App:
 
             # Progress label
             if state == "downloading":
-                rw["progress_label"].configure(text="0%", text_color=p.status_info)
+                rw["progress_label"].configure(text=self.t("dialog.local_model_manager.progress.initial"), text_color=p.status_info)
             elif state == "error":
-                rw["progress_label"].configure(text="Error", text_color=p.status_error)
+                rw["progress_label"].configure(text=self.t("dialog.local_model_manager.progress.error"), text_color=p.status_error)
             elif downloaded:
-                rw["progress_label"].configure(text="100%", text_color=p.status_success)
+                rw["progress_label"].configure(text=self.t("dialog.local_model_manager.progress.complete"), text_color=p.status_success)
             else:
-                rw["progress_label"].configure(text="\u2014", text_color=p.text_muted)
+                rw["progress_label"].configure(text=self.t("dialog.local_model_manager.progress.idle"), text_color=p.text_muted)
 
             # Action frame — clear and rebuild
             for child in rw["action_frame"].winfo_children():
@@ -2459,25 +2494,25 @@ class App:
 
             if state == "downloading":
                 theme.make_button(
-                    rw["action_frame"], "Cancel",
+                    rw["action_frame"], self.t("dialog.local_model_manager.cancel"),
                     command=lambda cn=cname: _cancel_download(cn),
                     style="ghost", height=22,
                 ).grid(row=0, column=0)
             elif state == "error":
                 theme.make_button(
-                    rw["action_frame"], "Retry",
+                    rw["action_frame"], self.t("dialog.local_model_manager.retry"),
                     command=lambda cn=cname: _start_download(cn),
                     style="secondary", height=22,
                 ).grid(row=0, column=0)
             elif downloaded:
                 theme.make_button(
-                    rw["action_frame"], "Delete",
+                    rw["action_frame"], self.t("dialog.local_model_manager.delete"),
                     command=lambda cn=cname: _delete_model(cn),
                     style="ghost", height=22,
                 ).grid(row=0, column=0)
             else:
                 theme.make_button(
-                    rw["action_frame"], "Download",
+                    rw["action_frame"], self.t("dialog.local_model_manager.download"),
                     command=lambda cn=cname: _start_download(cn),
                     style="primary", height=22,
                 ).grid(row=0, column=0)
@@ -2587,7 +2622,7 @@ class App:
                         rw = row_widgets.get(cname)
                         if rw and "progress_label" in rw:
                             rw["progress_label"].configure(
-                                text="Converting\u2026", text_color=p.status_info)
+                                text=self.t("dialog.local_model_manager.progress.converting"), text_color=p.status_info)
                     elif line.startswith("PROGRESS "):
                         parts = line.split()
                         if len(parts) == 3:
@@ -2758,11 +2793,11 @@ class App:
                     _delete_model(cname)
 
         theme.make_button(
-            batch_frame, "Download selected",
+            batch_frame, self.t("dialog.local_model_manager.download_selected"),
             command=_batch_download, style="primary", height=28,
         ).pack(side=tk.LEFT, padx=(0, 8))
         theme.make_button(
-            batch_frame, "Delete selected",
+            batch_frame, self.t("dialog.local_model_manager.delete_selected"),
             command=_batch_delete, style="ghost", height=28,
         ).pack(side=tk.LEFT)
 
@@ -2806,7 +2841,7 @@ class App:
         win = ctk.CTkToplevel(self.root)
         win.wm_attributes("-alpha", 0)  # keep invisible until centered
         apply_window_icon(win)
-        win.title("About Verbilo")
+        win.title(self.t("dialog.about_title"))
         win.transient(self.root)
         win.grab_set()
         win.configure(fg_color=p.bg_main)
@@ -2831,28 +2866,28 @@ class App:
         except Exception:
             pass
 
-        theme.make_label(brand_frame, "Verbilo", level="heading").grid(
+        theme.make_label(brand_frame, self.t("dialog.about_heading"), level="heading").grid(
             row=0, column=1, sticky="sw",
         )
         # Small muted beta badge beside the product heading
         theme.make_label(
-            brand_frame, "Made by crt_ (8041q)", level="tiny", text_color=p.text_muted,
+            brand_frame, self.t("dialog.about_byline"), level="tiny", text_color=p.text_muted,
         ).grid(row=0, column=2, sticky="sw", padx=(6, 0))
-        theme.make_label(brand_frame, "File translation tool", level="small").grid(
+        theme.make_label(brand_frame, self.t("dialog.about_subtitle"), level="small").grid(
             row=1, column=1, sticky="nw",
         )
 
         # --- Version & date ---
-        theme.make_label(card, f"Version   v{APP_VERSION}", level="body").grid(
+        theme.make_label(card, self.t("dialog.about_version", version=APP_VERSION), level="body").grid(
             row=1, column=0, sticky="w", padx=PAD, pady=(0, 2),
         )
-        theme.make_label(card, f"Build date   {APP_BUILD_DATE}", level="body").grid(
+        theme.make_label(card, self.t("dialog.about_build_date", build_date=APP_BUILD_DATE), level="body").grid(
             row=2, column=0, sticky="w", padx=PAD, pady=(0, 2),
         )
 
         # --- Copyright ---
         theme.make_label(
-            card, "\u00a9 2026 crt_ (8041q) \u2014  Released under the AGPL-3.0 License",
+            card, self.t("dialog.about_copyright"),
             level="tiny",
         ).grid(row=3, column=0, sticky="w", padx=PAD, pady=(0, PAD))
 
@@ -2864,25 +2899,30 @@ class App:
         check_frame.grid(row=5, column=0, sticky="w", padx=PAD, pady=(0, 4))
 
         update_status_var = tk.StringVar(value="")
+        update_status_type = tk.StringVar(value="")
 
         def _do_check():
-            update_status_var.set("Checking\u2026")
+            update_status_type.set("checking")
+            update_status_var.set(self.t("dialog.about.update.checking"))
             self._set_button_disabled(check_btn, True)
 
             def _on_result(result):
                 self._set_button_disabled(check_btn, False)
                 if result["status"] == "update":
-                    update_status_var.set(f"Update available: v{result['version']}")
+                    update_status_type.set("available")
+                    update_status_var.set(self.t("dialog.about.update.available", version=result['version']))
                     self._show_update_dialog(result)
                 elif result["status"] == "latest":
-                    update_status_var.set("\u2713  You are up to date")
+                    update_status_type.set("latest")
+                    update_status_var.set(self.t("dialog.about.update.latest"))
                 else:
-                    update_status_var.set("Could not check for updates.")
+                    update_status_type.set("error")
+                    update_status_var.set(self.t("dialog.about.update.error"))
 
             self._run_update_check(startup=False, callback=_on_result)
 
         check_btn = theme.make_button(
-            check_frame, "Check for Updates", command=_do_check, style="ghost", height=28,
+            check_frame, self.t("dialog.about.check_for_updates"), command=_do_check, style="ghost", height=28,
         )
         check_btn.pack(side=tk.LEFT)
 
@@ -2891,11 +2931,12 @@ class App:
 
         def _sync_status(*_):
             val = update_status_var.get()
-            if val.startswith("\u2713"):
+            stype = update_status_type.get()
+            if stype == "latest":
                 color = p.status_success
-            elif "Update available" in val:
+            elif stype == "available":
                 color = p.text_secondary
-            elif "Could not" in val:
+            elif stype == "error":
                 color = p.status_error
             else:
                 color = p.text_muted
@@ -2907,11 +2948,14 @@ class App:
         if self._update_check_result:
             r = self._update_check_result
             if r["status"] == "latest":
-                update_status_var.set("\u2713  You are up to date")
+                update_status_type.set("latest")
+                update_status_var.set(self.t("dialog.about.update.latest"))
             elif r["status"] == "update":
-                update_status_var.set(f"Update available: v{r['version']}")
+                update_status_type.set("available")
+                update_status_var.set(self.t("dialog.about.update.available", version=r['version']))
             elif r["status"] == "error":
-                update_status_var.set("Could not check for updates.")
+                update_status_type.set("error")
+                update_status_var.set(self.t("dialog.about.update.error"))
 
         # --- Divider ---
         theme.make_divider(card).grid(row=6, column=0, sticky="ew", padx=PAD, pady=(4, 8))
@@ -2929,11 +2973,11 @@ class App:
         def _open_issue():
             webbrowser.open(ISSUE_URL)
 
-        theme.make_button(links_frame, "View on GitHub", command=_open_github, style="ghost",
+        theme.make_button(links_frame, self.t("dialog.about.github"), command=_open_github, style="ghost",
                           height=28).pack(side=tk.LEFT, padx=(0, theme.scale(8)))
-        theme.make_button(links_frame, "Release Notes", command=_open_releases, style="ghost",
+        theme.make_button(links_frame, self.t("dialog.about.release_notes"), command=_open_releases, style="ghost",
                           height=28).pack(side=tk.LEFT, padx=(0, theme.scale(8)))
-        theme.make_button(links_frame, "Report a Bug", command=_open_issue, style="ghost",
+        theme.make_button(links_frame, self.t("dialog.about.report_bug"), command=_open_issue, style="ghost",
                           height=28).pack(side=tk.LEFT, padx=(0, theme.scale(8)))
 
         win.protocol("WM_DELETE_WINDOW", win.destroy)
