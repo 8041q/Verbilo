@@ -1,5 +1,6 @@
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
+from openpyxl.cell.rich_text import CellRichText, TextBlock
 from typing import Any, Callable
 import logging
 import threading
@@ -9,9 +10,14 @@ from ..utils import CancelledError
 
 logger = logging.getLogger(__name__)
 
-# Control-character pattern: matches C0/C1 control chars except tab, newline, carriage return
+# Control-character pattern: matches C0/C1 control chars except tab, newline, carriage return,
+# plus invisible Unicode format/zero-width characters that can silently corrupt translation.
 _CONTROL_CHAR_RE = re.compile(
-    r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]'
+    r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f'
+    r'\u00ad'          # soft hyphen
+    r'\u200b-\u200d'   # zero-width space / non-joiner / joiner
+    r'\u2060'          # word joiner
+    r'\ufeff]'         # BOM / zero-width no-break space
 )
 
 # Separator used to group multiple cells into a single translation unit.
@@ -33,14 +39,16 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
     # batch-translate XLSX with row-level contextual grouping.
     # When source_lang=="auto" row grouping is skipped so each cell is its own translation
     # unit, letting the API auto-detect the language per cell.
-    wb = load_workbook(filename=input_path)
+    wb = load_workbook(filename=input_path, rich_text=True)
 
     # --- collect every string cell that is writable, grouped by row ---
     # Each row group: list of (cell, sanitized_text) pairs
+    # rich_segs: list of (cell, original_CellRichText, segment_index, sanitized_text)
     RowGroup = list[tuple[Any, str]]
     row_groups: list[RowGroup] = []
     current_row: RowGroup = []
     current_row_key: tuple | None = None  # (sheet_title, row_number)
+    rich_segs: list[tuple[Any, CellRichText, int, str]] = []
 
     for sheet in wb.worksheets:
         for row in sheet.iter_rows(values_only=False):
@@ -49,16 +57,30 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
                 if isinstance(cell, MergedCell):
                     continue
                 val = cell.value
-                if isinstance(val, str) and val.strip() and not val.startswith("="):
-                    row_cells.append((cell, _sanitize_text(val)))
+                if isinstance(val, str) and not val.startswith("="):
+                    sanitized = _sanitize_text(val)
+                    if sanitized.strip():
+                        row_cells.append((cell, sanitized))
+                elif isinstance(val, CellRichText):
+                    for seg_idx, seg in enumerate(val):
+                        if isinstance(seg, TextBlock):
+                            text = seg.text
+                        elif isinstance(seg, str):
+                            text = seg
+                        else:
+                            continue
+                        if text and text.strip():
+                            rich_segs.append((cell, val, seg_idx, _sanitize_text(text)))
             if row_cells:
                 row_groups.append(row_cells)
 
     total_cells = sum(len(rg) for rg in row_groups)
-    logger.info("XLSX '%s': collected %d translatable string cells in %d rows",
-                input_path, total_cells, len(row_groups))
+    logger.info(
+        "XLSX '%s': collected %d plain-text cells in %d rows, %d rich-text segments",
+        input_path, total_cells, len(row_groups), len(rich_segs),
+    )
 
-    if not row_groups:
+    if not row_groups and not rich_segs:
         logger.warning("No translatable text found in XLSX file '%s'", input_path)
         wb.save(output_path)
         return
@@ -88,29 +110,34 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
                 units.append(text)
                 unit_cells.append([(cell, text)])
 
-    # --- batch-translate ---
-    total_units = len(units)
+    # --- batch-translate (plain cells + rich-text segments in one call) ---
+    plain_count = len(units)
+    all_units = units + [t for _, _, _, t in rich_segs]
+    total_units = len(all_units)
     try:
-        translated = translator.translate_batch(units, target_lang, cancel_event=cancel_event)
+        translated_all = translator.translate_batch(all_units, target_lang, cancel_event=cancel_event)
     except CancelledError:
         raise
     except Exception:
         logger.exception("Batch translation failed for XLSX; falling back to per-item")
-        translated = []
-        for t in units:
+        translated_all = []
+        for t in all_units:
             try:
                 r = translator.translate_text(t, target_lang)
-                translated.append(r if r is not None else t)
+                translated_all.append(r if r is not None else t)
             except Exception:
                 logger.exception("Per-item fallback also failed")
-                translated.append(t)
+                translated_all.append(t)
 
     if progress_callback is not None:
         progress_callback(total_units, total_units)
 
-    # --- write results back ---
+    plain_translated = translated_all[:plain_count]
+    rich_translated = translated_all[plain_count:]
+
+    # --- write results back (plain cells) ---
     errors = 0
-    for cells_in_unit, tr_text in zip(unit_cells, translated):
+    for cells_in_unit, tr_text in zip(unit_cells, plain_translated):
         if tr_text is None:
             # Translation returned None — keep originals
             errors += 1
@@ -125,7 +152,19 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
             parts = tr_text.split(_CELL_SEP)
             if len(parts) == len(cells_in_unit):
                 for (cell, orig), part in zip(cells_in_unit, parts):
-                    cell.value = part.strip() if part else orig
+                    translated_part = part.strip() if part else orig
+                    # If the part came back identical to the original the API likely
+                    # skipped it (e.g. mixed-language row — Russian + Chinese grouped
+                    # together; the API translated the dominant language and left the
+                    # minority language segment untouched).  Retry as a standalone call
+                    # so the API sees a clean single-language segment.
+                    if translated_part == orig:
+                        try:
+                            r = translator.translate_text(orig, target_lang)
+                            translated_part = r if r is not None else orig
+                        except Exception:
+                            logger.exception("Per-cell retry failed for unchanged segment")
+                    cell.value = translated_part
             else:
                 # Separator was consumed/mangled by the model — fall back to
                 # per-cell translation for this row
@@ -141,6 +180,33 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
                         logger.exception("Per-cell fallback failed")
                         cell.value = orig
                         errors += 1
+
+    # --- write results back (rich-text cells) ---
+    # Group translated segments by cell so each cell is written exactly once.
+    # cell_rich_updates: id(cell) -> (cell, original_CellRichText, {seg_idx: translated_text})
+    cell_rich_updates: dict[int, tuple[Any, CellRichText, dict[int, str]]] = {}
+    for (cell, rt, seg_idx, _), tr_text in zip(rich_segs, rich_translated):
+        cid = id(cell)
+        if cid not in cell_rich_updates:
+            cell_rich_updates[cid] = (cell, rt, {})
+        if tr_text is not None:
+            cell_rich_updates[cid][2][seg_idx] = tr_text
+
+    for cid, (cell, rt, updates) in cell_rich_updates.items():
+        if not updates:
+            # Every segment translation failed for this cell
+            errors += 1
+            continue
+        new_segs: list[TextBlock | str] = []
+        for i, seg in enumerate(rt):
+            if i in updates:
+                if isinstance(seg, TextBlock):
+                    new_segs.append(TextBlock(seg.font, updates[i]))
+                else:
+                    new_segs.append(updates[i])
+            else:
+                new_segs.append(seg)
+        cell.value = CellRichText(*new_segs)
 
     # Check for cancellation before saving
     if cancel_event is not None and cancel_event.is_set():
