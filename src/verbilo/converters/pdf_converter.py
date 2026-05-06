@@ -278,6 +278,8 @@ def _build_block_html(
     line_styles: list[dict],
     *,
     line_height: float = 1.15,
+    align_override: str | None = None,
+    padding_top: float = 0.0,
 ) -> tuple[str, str]:
     # Build HTML + CSS for *translated* text using the original per-line styles.
     orig_lines = translated.split("\n")
@@ -289,6 +291,8 @@ def _build_block_html(
     for s in line_styles:
         align_counts[s["align"]] = align_counts.get(s["align"], 0) + 1
     dominant_align = max(align_counts, key=align_counts.get)  # type: ignore[arg-type]
+    container_align = align_override or dominant_align
+    top_padding = max(padding_top, 0.0)
 
     parts: list[str] = []
     for i, line_text in enumerate(orig_lines):
@@ -304,7 +308,8 @@ def _build_block_html(
         parts.append(f'<span style="{inline}">{safe}</span>')
 
     html = (
-        f'<div style="text-align:{dominant_align}; margin:0; padding:0;'
+        f'<div style="text-align:{container_align}; margin:0; padding:0;'
+        f' padding-top:{top_padding:.1f}px; box-sizing:border-box;'
         f' white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;">'
         + "<br/>".join(parts)
         + "</div>"
@@ -315,6 +320,43 @@ def _build_block_html(
         f" margin:0; padding:0; line-height:{line_height:.2f};}}"
     )
     return html, css
+
+
+def _placement_overrides_for_block(
+    orig_rect: fitz.Rect,
+    fit_rect: fitz.Rect,
+    line_styles: list[dict],
+) -> dict[str, Any]:
+    if not line_styles or len(line_styles) > 2:
+        return {}
+
+    expanded_x = fit_rect.x0 + 0.5 < orig_rect.x0 and fit_rect.x1 > orig_rect.x1 + 0.5
+    expanded_y = fit_rect.y0 + 0.5 < orig_rect.y0 and fit_rect.y1 > orig_rect.y1 + 0.5
+    if not (expanded_x or expanded_y):
+        return {}
+
+    overrides: dict[str, Any] = {}
+
+    if expanded_x:
+        fit_cx = (fit_rect.x0 + fit_rect.x1) / 2
+        orig_cx = (orig_rect.x0 + orig_rect.x1) / 2
+        if abs(orig_cx - fit_cx) <= max(fit_rect.width * 0.12, 6.0):
+            overrides["align"] = "center"
+
+    if expanded_y:
+        fit_cy = (fit_rect.y0 + fit_rect.y1) / 2
+        orig_cy = (orig_rect.y0 + orig_rect.y1) / 2
+        if abs(orig_cy - fit_cy) <= max(fit_rect.height * 0.18, 4.0):
+            top_inset = max(orig_rect.y0 - fit_rect.y0, 0.0)
+            bottom_inset = max(fit_rect.y1 - orig_rect.y1, 0.0)
+            if top_inset > 1.0 and bottom_inset > 1.0:
+                overrides["padding_top"] = min(
+                    top_inset,
+                    bottom_inset,
+                    max(2.0, fit_rect.height * 0.18),
+                )
+
+    return overrides
 
 
 def _layout_variants_for_block(
@@ -600,6 +642,11 @@ def _fit_block(
             )
             _add_candidate(candidate)
 
+    best = _choose_fit_candidate(candidates, rect, preferred_scale)
+    if best["spare"] >= 0 and best["scale"] >= preferred_scale:
+        probe.close()
+        return fitz.Rect(best["rect"]), float(best["scale"]), float(best["spare"])
+
     if min_x0 < rect.x0:
         wide_seed = fitz.Rect(min_x0, rect.y0, rect.x1 + max_h_exp, rect.y1)
         wide_max_y1 = _free_y1(wide_seed, page_height, obstacles, siblings)
@@ -796,11 +843,24 @@ def translate_pdf(
                         "spare": probe_spare,
                         "variant_name": variant["name"],
                         "variant_priority": variant["priority"],
+                        "line_height": variant["line_height"],
                     })
 
                 plan = _choose_block_plan(plans, orig_rect, preferred_scale)
+                placement = _placement_overrides_for_block(
+                    orig_rect,
+                    plan["rect"],
+                    line_styles,
+                )
+                final_html, final_css = _build_block_html(
+                    tr_text,
+                    line_styles,
+                    line_height=plan["line_height"],
+                    align_override=placement.get("align"),
+                    padding_top=placement.get("padding_top", 0.0),
+                )
                 result = page.insert_htmlbox(
-                    plan["rect"], plan["html"], css=plan["css"], scale_low=0
+                    plan["rect"], final_html, css=final_css, scale_low=0
                 )
                 if result[0] < 0:
                     logger.debug(

@@ -12,6 +12,7 @@ from verbilo.converters.pdf_converter import (
     _choose_block_plan,
     _choose_fit_candidate,
     _fit_block,
+    _placement_overrides_for_block,
     _preferred_scale_for_block,
 )
 
@@ -99,6 +100,57 @@ def test_fit_block_can_use_left_and_top_slack_inside_bounded_cell() -> None:
     assert fit_rect.y1 <= 41.0
     assert fit_rect.x0 < rect.x0 or fit_rect.y0 < rect.y0
     assert spare >= 0
+
+
+def test_fit_block_keeps_anchored_position_when_anchored_fit_is_readable() -> None:
+    html, css = _html_for("Label")
+    rect = fitz.Rect(38, 24, 56, 30)
+    obstacles = [
+        fitz.Rect(10, 10, 11, 44),
+        fitz.Rect(80, 10, 81, 44),
+        fitz.Rect(10, 10, 80, 11),
+        fitz.Rect(10, 44, 80, 45),
+    ]
+
+    fit_rect, scale, spare = _fit_block(
+        html,
+        css,
+        rect,
+        obstacles,
+        [],
+        60,
+        page_width=100,
+        preferred_scale=0.78,
+    )
+
+    assert scale >= 0.78
+    assert spare >= 0
+    assert fit_rect.x0 == rect.x0
+    assert fit_rect.y0 == rect.y0
+
+
+def test_placement_overrides_center_short_label_in_expanded_cell() -> None:
+    orig_rect = fitz.Rect(38, 24, 56, 30)
+    fit_rect = fitz.Rect(14, 14, 77, 41)
+    overrides = _placement_overrides_for_block(
+        orig_rect,
+        fit_rect,
+        [{"align": "left"}],
+    )
+
+    assert overrides["align"] == "center"
+    assert overrides["padding_top"] > 0
+
+
+def test_placement_overrides_skip_anchored_short_label() -> None:
+    rect = fitz.Rect(38, 24, 56, 30)
+    overrides = _placement_overrides_for_block(
+        rect,
+        rect,
+        [{"align": "left"}],
+    )
+
+    assert overrides == {}
 
 
 def test_fit_block_respects_neighboring_siblings() -> None:
