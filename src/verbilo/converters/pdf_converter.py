@@ -35,9 +35,16 @@ logger = logging.getLogger(__name__)
 # ── tuneable constants ──────────────────────────────────────────────────────
 _MIN_CHARS_PER_PAGE  = 20    # avg chars/page below which PDF is treated as scanned
 _SCALE_THRESHOLD     = 0.78  # if insert_htmlbox scale < this, try rect expansion
+_CJK_SCALE_THRESHOLD = 0.86  # CJK-origin blocks need a higher readable floor
+_SCALE_EPSILON       = 0.015 # treat near-identical scales as equivalent
 _MAX_EXPAND_DOWN     = 60.0  # max points a block rect may grow downward
 _EXPAND_STEP         = 6.0   # vertical expansion increment (points)
 _OBSTACLE_MIN_AREA   = 200   # filled drawings smaller than this (pt²) are ignored
+_LINE_OBSTACLE_THICKNESS = 2.5   # thin stroked lines can be table/cell borders
+_LINE_OBSTACLE_MIN_SPAN  = 12.0  # ignore tiny decorative strokes
+_CELL_BOUNDARY_PADDING = 3.0     # keep translated text off line-drawn borders
+_MAX_EXPAND_LEFT = 48.0          # conservative leftward slack inside a cell
+_MAX_EXPAND_UP = 24.0            # conservative upward slack inside a cell
 # ────────────────────────────────────────────────────────────────────────────
 
 
@@ -111,6 +118,40 @@ def _html_escape(text: str) -> str:
             .replace(">", "&gt;")
             .replace('"', "&quot;")
     )
+
+
+def _normalize_lang_code(lang: str) -> str:
+    return lang.strip().replace("_", "-").lower()
+
+
+def _is_cjk_char(ch: str) -> bool:
+    cp = ord(ch)
+    return (
+        0x3400 <= cp <= 0x4DBF or
+        0x4E00 <= cp <= 0x9FFF or
+        0xF900 <= cp <= 0xFAFF or
+        0x3040 <= cp <= 0x30FF or
+        0xAC00 <= cp <= 0xD7AF
+    )
+
+
+def _is_cjk_source_block(text: str, source_lang: str = "auto") -> bool:
+    lang = _normalize_lang_code(source_lang)
+    if lang.startswith(("zh", "ja", "ko")):
+        return True
+
+    visible = [ch for ch in text if not ch.isspace()]
+    if not visible:
+        return False
+
+    cjk_count = sum(1 for ch in visible if _is_cjk_char(ch))
+    return cjk_count >= 2 and (cjk_count / len(visible)) >= 0.35
+
+
+def _preferred_scale_for_block(source_text: str, source_lang: str = "auto") -> float:
+    if _is_cjk_source_block(source_text, source_lang):
+        return _CJK_SCALE_THRESHOLD
+    return _SCALE_THRESHOLD
 
 
 # ── block extraction ─────────────────────────────────────────────────────────
@@ -232,7 +273,12 @@ def _extract_blocks(page: fitz.Page) -> list[dict]:
 
 # ── HTML builder ─────────────────────────────────────────────────────────────
 
-def _build_block_html(translated: str, line_styles: list[dict]) -> tuple[str, str]:
+def _build_block_html(
+    translated: str,
+    line_styles: list[dict],
+    *,
+    line_height: float = 1.15,
+) -> tuple[str, str]:
     # Build HTML + CSS for *translated* text using the original per-line styles.
     orig_lines = translated.split("\n")
     n = len(line_styles)
@@ -258,16 +304,28 @@ def _build_block_html(translated: str, line_styles: list[dict]) -> tuple[str, st
         parts.append(f'<span style="{inline}">{safe}</span>')
 
     html = (
-        f'<div style="text-align:{dominant_align}; margin:0; padding:0;">'
+        f'<div style="text-align:{dominant_align}; margin:0; padding:0;'
+        f' white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;">'
         + "<br/>".join(parts)
         + "</div>"
     )
     css = (
         f"* {{font-family:sans-serif; font-size:{max_size:.1f}px;"
         f" font-weight:normal; font-style:normal; text-decoration:none;"
-        f" margin:0; padding:0; line-height:1.15;}}"
+        f" margin:0; padding:0; line-height:{line_height:.2f};}}"
     )
     return html, css
+
+
+def _layout_variants_for_block(
+    source_text: str,
+    source_lang: str = "auto",
+) -> list[dict[str, Any]]:
+    compact_line_height = 1.00 if _is_cjk_source_block(source_text, source_lang) else 1.08
+    return [
+        {"name": "default", "line_height": 1.15, "priority": 0},
+        {"name": "compact", "line_height": compact_line_height, "priority": 1},
+    ]
 
 
 def _collect_obstacles(page: fitz.Page) -> list[fitz.Rect]:
@@ -282,12 +340,24 @@ def _collect_obstacles(page: fitz.Page) -> list[fitz.Rect]:
 
     try:
         for drawing in page.get_drawings():
+            r = fitz.Rect(drawing["rect"])
+            if r.is_empty:
+                continue
+
+            if drawing.get("stroke_opacity", 1.0) >= 0.1:
+                thin = min(r.width, r.height)
+                span = max(r.width, r.height)
+                if (thin <= _LINE_OBSTACLE_THICKNESS
+                        and span >= _LINE_OBSTACLE_MIN_SPAN):
+                    obs.append(fitz.Rect(r.x0 - 1.0, r.y0 - 1.0,
+                                         r.x1 + 1.0, r.y1 + 1.0))
+                    continue
+
             if drawing.get("fill") is None:
                 continue
             if drawing.get("fill_opacity", 1.0) < 0.1:
                 continue
-            r = fitz.Rect(drawing["rect"])
-            if r.is_empty or r.width * r.height < _OBSTACLE_MIN_AREA:
+            if r.width * r.height < _OBSTACLE_MIN_AREA:
                 continue
             obs.append(r)
     except Exception:
@@ -303,14 +373,33 @@ def _free_y1(
     siblings: list[fitz.Rect],
 ) -> float:
     """Return the lowest y1 reachable from *rect* without colliding with anything."""
-    limit = page_height - 2.0
+    limit = page_height - _CELL_BOUNDARY_PADDING
     for other in obstacles + siblings:
         # Only elements that horizontally overlap with our rect matter
         if other.x0 >= rect.x1 - 1 or other.x1 <= rect.x0 + 1:
             continue
         if other.y0 > rect.y1 and other.y0 < limit:
-            limit = other.y0 - 2.0
+            limit = other.y0 - _CELL_BOUNDARY_PADDING
     return max(limit, rect.y1)
+
+
+def _free_y0(
+    rect: fitz.Rect,
+    obstacles: list[fitz.Rect],
+    siblings: list[fitz.Rect],
+) -> float:
+    """Return the highest safe y0 reachable from *rect* within local boundaries."""
+    limit: float | None = None
+    for other in obstacles + siblings:
+        # Only elements that horizontally overlap with our rect matter
+        if other.x0 >= rect.x1 - 1 or other.x1 <= rect.x0 + 1:
+            continue
+        if other.y1 < rect.y0:
+            bound = other.y1 + _CELL_BOUNDARY_PADDING
+            limit = bound if limit is None else max(limit, bound)
+    if limit is None:
+        return rect.y0
+    return min(limit, rect.y0)
 
 
 def _free_x1(
@@ -320,18 +409,122 @@ def _free_x1(
     siblings: list[fitz.Rect],
 ) -> float:
     # Return the rightmost x1 reachable from *rect* without colliding
-    limit = page_width - 2.0  # minimum right margin
+    limit = page_width - _CELL_BOUNDARY_PADDING
     for other in obstacles + siblings:
         # Only elements that vertically overlap with our rect matter
         if other.y0 >= rect.y1 - 1 or other.y1 <= rect.y0 + 1:
             continue
         if other.x0 > rect.x1 and other.x0 < limit:
-            limit = other.x0 - 2.0
+            limit = other.x0 - _CELL_BOUNDARY_PADDING
     return max(limit, rect.x1)
+
+
+def _free_x0(
+    rect: fitz.Rect,
+    obstacles: list[fitz.Rect],
+    siblings: list[fitz.Rect],
+) -> float:
+    """Return the leftmost safe x0 reachable from *rect* within local boundaries."""
+    limit: float | None = None
+    for other in obstacles + siblings:
+        # Only elements that vertically overlap with our rect matter
+        if other.y0 >= rect.y1 - 1 or other.y1 <= rect.y0 + 1:
+            continue
+        if other.x1 < rect.x0:
+            bound = other.x1 + _CELL_BOUNDARY_PADDING
+            limit = bound if limit is None else max(limit, bound)
+    if limit is None:
+        return rect.x0
+    return min(limit, rect.x0)
 
 
 _MAX_EXPAND_H = 120.0  # max points a block rect may grow rightward
 _EXPAND_H_STEP = 8.0   # horizontal expansion increment (points)
+
+
+def _expansion_values(max_expand: float, step: float) -> list[float]:
+    max_expand = max(0.0, max_expand)
+    values = [0.0]
+    grown = 0.0
+    while grown < max_expand - 0.5:
+        grown += min(step, max_expand - grown)
+        values.append(grown)
+    return values
+
+
+def _rect_growth_area(rect: fitz.Rect, base_rect: fitz.Rect) -> float:
+    return max((rect.width * rect.height) - (base_rect.width * base_rect.height), 0.0)
+
+
+def _choose_fit_candidate(
+    candidates: list[dict[str, Any]],
+    base_rect: fitz.Rect,
+    preferred_scale: float,
+) -> dict[str, Any]:
+    if not candidates:
+        return {"rect": fitz.Rect(base_rect), "spare": -1.0, "scale": 0.0}
+
+    suitable = [
+        c for c in candidates
+        if c["spare"] >= 0 and c["scale"] >= preferred_scale
+    ]
+    if suitable:
+        return min(
+            suitable,
+            key=lambda c: (
+                _rect_growth_area(c["rect"], base_rect),
+                -c["scale"],
+                -c["spare"],
+            ),
+        )
+
+    best_scale = max(c["scale"] for c in candidates)
+    peers = [
+        c for c in candidates
+        if c["scale"] >= best_scale - _SCALE_EPSILON
+    ]
+    return min(
+        peers,
+        key=lambda c: (
+            _rect_growth_area(c["rect"], base_rect),
+            -c["spare"],
+        ),
+    )
+
+
+def _choose_block_plan(
+    plans: list[dict[str, Any]],
+    base_rect: fitz.Rect,
+    preferred_scale: float,
+) -> dict[str, Any]:
+    suitable = [
+        p for p in plans
+        if p["spare"] >= 0 and p["scale"] >= preferred_scale
+    ]
+    if suitable:
+        return min(
+            suitable,
+            key=lambda p: (
+                _rect_growth_area(p["rect"], base_rect),
+                p["variant_priority"],
+                -p["scale"],
+                -p["spare"],
+            ),
+        )
+
+    best_scale = max(p["scale"] for p in plans)
+    peers = [
+        p for p in plans
+        if p["scale"] >= best_scale - _SCALE_EPSILON
+    ]
+    return min(
+        peers,
+        key=lambda p: (
+            _rect_growth_area(p["rect"], base_rect),
+            p["variant_priority"],
+            -p["spare"],
+        ),
+    )
 
 
 # ── fitting logic ─────────────────────────────────────────────────────────────
@@ -344,13 +537,14 @@ def _fit_block(
     siblings: list[fitz.Rect],
     page_height: float,
     page_width: float = 0.0,
-) -> fitz.Rect:
-    # Return the best rect for this block's insert_htmlbox call
+    preferred_scale: float = _SCALE_THRESHOLD,
+) -> tuple[fitz.Rect, float, float]:
+    # Return the best rect and probe metrics for this block's insert_htmlbox call
     if page_width <= 0:
         page_width = rect.x1 + 100
 
-    probe_w = max(rect.width + _MAX_EXPAND_H + 20, 1)
-    probe_h = max(rect.height + _MAX_EXPAND_DOWN + 20, 1)
+    probe_w = max(rect.width + _MAX_EXPAND_LEFT + _MAX_EXPAND_H + 20, 1)
+    probe_h = max(rect.height + _MAX_EXPAND_UP + _MAX_EXPAND_DOWN + 20, 1)
     probe = fitz.open()
     probe.new_page(width=probe_w, height=probe_h)
 
@@ -364,46 +558,90 @@ def _fit_block(
         except Exception:
             return -1.0, 0.0
 
-    # Step 1 — original rect
-    spare, scale = _probe(rect)
-    if spare >= 0 and scale >= _SCALE_THRESHOLD:
-        probe.close()
-        return rect
-
-    # Step 2 — expand rightward only (x0 stays fixed)
     max_x1 = _free_x1(rect, page_width, obstacles, siblings)
     max_h_exp = min(_MAX_EXPAND_H, max_x1 - rect.x1)
+    min_x0 = max(_free_x0(rect, obstacles, siblings), rect.x0 - _MAX_EXPAND_LEFT)
+    min_y0 = max(_free_y0(rect, obstacles, siblings), rect.y0 - _MAX_EXPAND_UP)
 
-    expanded = fitz.Rect(rect)
-    h_grown = 0.0
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[float, float, float, float]] = set()
 
-    while h_grown < max_h_exp - 0.5:
-        step = min(_EXPAND_H_STEP, max_h_exp - h_grown)
-        expanded = fitz.Rect(expanded.x0, expanded.y0,
-                             expanded.x1 + step, expanded.y1)
-        h_grown += step
-        spare, scale = _probe(expanded)
-        if spare >= 0 and scale >= _SCALE_THRESHOLD:
-            probe.close()
-            return expanded
+    def _add_candidate(candidate: fitz.Rect) -> None:
+        if candidate.is_empty or candidate.x1 <= candidate.x0 or candidate.y1 <= candidate.y0:
+            return
+        key = (
+            round(candidate.x0, 3),
+            round(candidate.y0, 3),
+            round(candidate.x1, 3),
+            round(candidate.y1, 3),
+        )
+        if key in seen:
+            return
+        seen.add(key)
 
-    # Step 3 — expand downward (y0 stays fixed)
-    max_y1  = _free_y1(expanded, page_height, obstacles, siblings)
-    max_exp = min(_MAX_EXPAND_DOWN, max_y1 - expanded.y1)
-    v_grown = 0.0
+        spare, scale = _probe(candidate)
+        candidates.append({
+            "rect": candidate,
+            "spare": spare,
+            "scale": scale,
+        })
 
-    while v_grown < max_exp - 0.5:
-        step = min(_EXPAND_STEP, max_exp - v_grown)
-        expanded = fitz.Rect(expanded.x0, expanded.y0,
-                             expanded.x1, expanded.y1 + step)
-        v_grown += step
-        spare, scale = _probe(expanded)
-        if spare >= 0 and scale >= _SCALE_THRESHOLD:
-            probe.close()
-            return expanded
+    for h_grown in _expansion_values(max_h_exp, _EXPAND_H_STEP):
+        expanded = fitz.Rect(rect.x0, rect.y0, rect.x1 + h_grown, rect.y1)
+        max_y1 = _free_y1(expanded, page_height, obstacles, siblings)
+        max_v_exp = min(_MAX_EXPAND_DOWN, max_y1 - expanded.y1)
 
+        for v_grown in _expansion_values(max_v_exp, _EXPAND_STEP):
+            candidate = fitz.Rect(
+                expanded.x0,
+                expanded.y0,
+                expanded.x1,
+                expanded.y1 + v_grown,
+            )
+            _add_candidate(candidate)
+
+    if min_x0 < rect.x0:
+        wide_seed = fitz.Rect(min_x0, rect.y0, rect.x1 + max_h_exp, rect.y1)
+        wide_max_y1 = _free_y1(wide_seed, page_height, obstacles, siblings)
+        _add_candidate(
+            fitz.Rect(
+                min_x0,
+                rect.y0,
+                rect.x1 + max_h_exp,
+                wide_seed.y1 + min(_MAX_EXPAND_DOWN, wide_max_y1 - wide_seed.y1),
+            )
+        )
+
+    if min_y0 < rect.y0:
+        top_seed = fitz.Rect(rect.x0, min_y0, rect.x1, rect.y1)
+        top_max_y1 = _free_y1(top_seed, page_height, obstacles, siblings)
+        _add_candidate(
+            fitz.Rect(
+                rect.x0,
+                min_y0,
+                rect.x1,
+                top_seed.y1 + min(_MAX_EXPAND_DOWN, top_max_y1 - top_seed.y1),
+            )
+        )
+
+    if min_x0 < rect.x0 or min_y0 < rect.y0:
+        cell_seed = fitz.Rect(min_x0, min_y0, rect.x1, rect.y1)
+        cell_max_x1 = _free_x1(cell_seed, page_width, obstacles, siblings)
+        cell_x1 = cell_seed.x1 + min(_MAX_EXPAND_H, cell_max_x1 - cell_seed.x1)
+        cell_rect = fitz.Rect(min_x0, min_y0, cell_x1, rect.y1)
+        cell_max_y1 = _free_y1(cell_rect, page_height, obstacles, siblings)
+        _add_candidate(
+            fitz.Rect(
+                min_x0,
+                min_y0,
+                cell_x1,
+                cell_rect.y1 + min(_MAX_EXPAND_DOWN, cell_max_y1 - cell_rect.y1),
+            )
+        )
+
+    best = _choose_fit_candidate(candidates, rect, preferred_scale)
     probe.close()
-    return expanded  # scale_low=0 on the real call will handle residual overflow
+    return fitz.Rect(best["rect"]), float(best["scale"]), float(best["spare"])
 
 
 # ── main entry point ─────────────────────────────────────────────────────────
@@ -524,6 +762,7 @@ def translate_pdf(
             line_styles = block["line_styles"]
             line_rects  = block.get("line_rects", [])
             siblings    = [r for i, r in enumerate(all_rects) if i != bi]
+            preferred_scale = _preferred_scale_for_block(block["text"], source_lang)
 
             # Redact per-line rects instead of the whole block rect so that
             # vector drawings (table lines, shapes) within the block area
@@ -535,19 +774,45 @@ def translate_pdf(
                 page.add_redact_annot(orig_rect, fill=None)  # type: ignore[arg-type]
             page.apply_redactions(images=0)  # type: ignore[arg-type]
 
-            html, css = _build_block_html(tr_text, line_styles)
-
             try:
-                fit_rect = _fit_block(
-                    html, css, orig_rect,
-                    obstacles, siblings, page_height,
-                    page_width=page_width,
+                plans: list[dict[str, Any]] = []
+                for variant in _layout_variants_for_block(block["text"], source_lang):
+                    html, css = _build_block_html(
+                        tr_text,
+                        line_styles,
+                        line_height=variant["line_height"],
+                    )
+                    fit_rect, probe_scale, probe_spare = _fit_block(
+                        html, css, orig_rect,
+                        obstacles, siblings, page_height,
+                        page_width=page_width,
+                        preferred_scale=preferred_scale,
+                    )
+                    plans.append({
+                        "html": html,
+                        "css": css,
+                        "rect": fit_rect,
+                        "scale": probe_scale,
+                        "spare": probe_spare,
+                        "variant_name": variant["name"],
+                        "variant_priority": variant["priority"],
+                    })
+
+                plan = _choose_block_plan(plans, orig_rect, preferred_scale)
+                result = page.insert_htmlbox(
+                    plan["rect"], plan["html"], css=plan["css"], scale_low=0
                 )
-                result = page.insert_htmlbox(fit_rect, html, css=css, scale_low=0)
                 if result[0] < 0:
                     logger.debug(
                         "insert_htmlbox overflow page %d block %d rect=%s",
-                        page_num + 1, bi, fit_rect,
+                        page_num + 1, bi, plan["rect"],
+                    )
+                elif result[1] < preferred_scale:
+                    logger.debug(
+                        "insert_htmlbox compressed page %d block %d variant=%s scale=%.3f probe=%.3f spare=%.2f preferred=%.3f rect=%s",
+                        page_num + 1, bi, plan["variant_name"], result[1],
+                        plan["scale"], plan["spare"], preferred_scale,
+                        plan["rect"],
                     )
             except Exception:
                 logger.exception(
