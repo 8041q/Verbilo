@@ -910,11 +910,14 @@ class OllamaSemanticTranslator:
 
     def _semantic_system_prompt(self) -> str:
         return (
-            "You are a translation engine for layout-constrained documents. Translate the user text into the target language. "
-            "Return only the translation. Preserve meaning, tone, and document role. Prefer concise natural wording over literal wording "
-            "when the source is Chinese or when a literal translation would become verbose. Do not add explanations, notes, or commentary. "
-            "Preserve meaningful line breaks. For labels, headings, numbers, or wording-sensitive text, stay closer to the source. "
-            "If several translations are valid, choose the shortest natural wording that still preserves the source meaning. "
+            "You are a translation engine for layout-constrained documents. "
+            "Output ONLY the translated text, nothing else — no explanations, no notes, no commentary, no alternatives. "
+            "Preserve meaning, tone, and document role. Preserve meaningful line breaks. "
+            "Chinese source texts are compact; their translations must be equally compact. "
+            "Do not add qualifiers, articles, connectives, or words not implied by the source. "
+            "A short source phrase must yield a short target phrase, never a full sentence. "
+            "For labels, headings, numbers, or wording-sensitive text, stay close to the source wording. "
+            "If several translations are valid, always choose the shortest natural wording that preserves the source meaning. "
             "When the payload includes capacity_chars and source_visible_chars, treat capacity_chars as the available character budget "
             "for the translation. If source_visible_chars is near or above capacity_chars, use the tightest natural wording possible "
             "without dropping required meaning."
@@ -950,6 +953,9 @@ class OllamaSemanticTranslator:
                 "think": False,
                 "options": {
                     "temperature": 0.2,
+                    "top_p": 0.8,
+                    "top_k": 20,
+                    "presence_penalty": 1.0,
                 },
                 "messages": [
                     {"role": "user", "content": user_prompt},
@@ -972,6 +978,9 @@ class OllamaSemanticTranslator:
                 "think": False,
                 "options": {
                     "temperature": 0.2,
+                    "top_p": 0.8,
+                    "top_k": 20,
+                    "presence_penalty": 1.0,
                 },
                 "messages": [
                     {"role": "system", "content": system_prompt},
@@ -996,6 +1005,9 @@ class OllamaSemanticTranslator:
                 "format": "json",
                 "options": {
                     "temperature": 0.2,
+                    "top_p": 0.8,
+                    "top_k": 20,
+                    "presence_penalty": 1.0,
                 },
                 "messages": [
                     {"role": "system", "content": system_prompt},
