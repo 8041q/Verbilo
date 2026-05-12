@@ -34,6 +34,8 @@
 - **Formatting Preserved**: DOCX run-level, XLSX cell and in-place PDF Editing are preserved. 
 - **Multi-Engine Detection**: Lingua, FastText — choose your preferred engine. (quality / speed)
 - **Batching for Efficiency**: Segments are batched to reduce API calls and avoid rate limits.
+- **Semantic Translation**: Uses a dual-model approach - a translation model plus a smaller companion advisor that classifies blocks before LLM calls, with pre-routing and batch grouping to minimise latency.
+- **GUI Language**: Interface available in English and Chinese Simplified (ZH-Hans), selectable in Settings.
 
 ## Known limitations
 
@@ -77,10 +79,32 @@ In the GUI sidebar you can choose the translation engine:
 - Microsoft Azure Translator ~ requires a Subscription Key and Region.
 - DeepL ~ requires a DeepL API key (Free or Pro).
 - Local (offline) ~ free and unlimited use, requires download of each language model source+target
+- Ollama (local LLM) ~ free and unlimited use, requires [Ollama] running locally.
 
 **Settings → Network & API keys** to configure
 
 If any API method is selected without credentials, the GUI will show a warning instead of starting the job.
+
+### Local AI translation via Ollama (offline, no API key)
+
+Verbilo can use local Ollama models as the translation engine for DOCX, XLSX, and PDF. The role differs by file type:
+
+- **DOCX / XLSX** — Ollama is the primary (and only) translator; it handles all text directly.
+- **PDF** — Ollama works alongside the selected primary engine (Google, DeepL, etc.). Because translating Chinese to English typically expands text by 2–3×, some blocks would overflow their original bounding boxes. Ollama receives both the source text and the physical character budget of each box, translating only the layout-constrained blocks while the primary engine handles the rest.
+
+| | **HY-MT 1.5 1.8B** · Tencent | **Qwen3.5 4B** · Alibaba |
+|---|---|---|
+| Size | ~1.1 GB | ~2.4 GB |
+| Languages | 33 major languages | Broad coverage |
+| Speed | Faster (smaller model) | Slower |
+| PDF routing | All blocks | Layout-constrained blocks only |
+| DOCX / XLSX | ✓ | ✓ |
+
+**HY-MT** is a purpose-built translation model. For PDF it translates every block directly; for DOCX/XLSX it translates all text as the primary engine.
+
+**Qwen** is a general-purpose LLM. For PDF, it first classifies each block to decide which need layout-constrained translation and which can go to the primary engine - giving smarter results on complex layouts. For DOCX/XLSX it also acts as the primary translator.
+
+> Ollama is installed automatically on first use. Models are downloaded on first translation and stored in `%USERPROFILE%\.ollama\models\` (Windows), outside the app folder.
 
 
 

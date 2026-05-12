@@ -30,7 +30,7 @@ _SEMANTIC_L1_CACHE: dict[str, dict[str, dict[str, str]]] = {}
 _SEMANTIC_L1_CACHE_LOCK = threading.Lock()
 _SEMANTIC_BATCH_MAX_ITEMS = 8
 _SEMANTIC_BATCH_MAX_CHARS = 4000
-_OLLAMA_SEMANTIC_CACHE_VERSION = "v2"
+_OLLAMA_SEMANTIC_CACHE_VERSION = "v3"
 _HAN_CHAR_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 
 # Models that only do translation (plain-text prompt, no system message, no JSON).
@@ -62,6 +62,21 @@ _LANG_CODE_TO_NAME: dict[str, str] = {
     "zu": "Zulu",
 }
 
+# Chinese-language names for target languages used in the HY-MT ZH-source prompt template.
+# Based on the official HY-MT 1.5 supported language list.
+_HYMT_ZH_LANG_NAMES: dict[str, str] = {
+    "ar": "阿拉伯语", "bn": "孟加拉语", "bo": "藏语", "cs": "捷克语",
+    "de": "德语", "en": "英语", "es": "西班牙语", "fa": "波斯语",
+    "fr": "法语", "gu": "古吉拉特语", "he": "希伯来语", "hi": "印地语",
+    "id": "印尼语", "it": "意大利语", "ja": "日语", "kk": "哈萨克语",
+    "km": "高棉语", "ko": "韩语", "mn": "蒙古语", "mr": "马拉地语",
+    "ms": "马来语", "my": "缅甸语", "nl": "荷兰语", "pl": "波兰语",
+    "pt": "葡萄牙语", "ru": "俄语", "ta": "泰米尔语", "te": "泰卢固语",
+    "th": "泰语", "tl": "菲律宾语", "tr": "土耳其语", "ug": "维吾尔语",
+    "uk": "乌克兰语", "ur": "乌尔都语", "vi": "越南语", "yue": "粤语",
+    "zh-tw": "繁体中文", "zh-hant": "繁体中文",
+}
+
 
 class _OllamaInstallerBusyError(RuntimeError):
     pass
@@ -87,7 +102,7 @@ def is_translation_only_ollama_model(model: str) -> bool:
 
 def ollama_supports_non_pdf_translation(model: str) -> bool:
     normalized = _normalize_ollama_model_name(model, default=DEFAULT_OLLAMA_MODEL).lower()
-    return normalized.startswith("qwen")
+    return normalized.startswith("qwen") or _is_translation_only_model(normalized)
 
 
 def _has_han_text(text: str) -> bool:
@@ -998,8 +1013,9 @@ class OllamaSemanticTranslator:
         lang_lower = target_lang.lower()
         lang_name = _LANG_CODE_TO_NAME.get(lang_lower, target_lang)
         if _uses_hymt_chinese_prompt(source_lang, text):
+            zh_lang_name = _HYMT_ZH_LANG_NAMES.get(lang_lower, lang_name)
             return (
-                f"将以下文本翻译为{lang_name}，注意只需要输出翻译后的结果，不要额外解释：\n{text}"
+                f"将以下文本翻译为{zh_lang_name}，注意只需要输出翻译后的结果，不要额外解释：\n{text}"
             )
         return (
             f"Translate the following segment into {lang_name}, without additional explanation.\n{text}"
@@ -1018,10 +1034,10 @@ class OllamaSemanticTranslator:
                 "stream": False,
                 "think": False,
                 "options": {
-                    "temperature": 0.2,
-                    "top_p": 0.8,
+                    "temperature": 0.7,
+                    "top_p": 0.6,
                     "top_k": 20,
-                    "presence_penalty": 1.0,
+                    "repeat_penalty": 1.05,
                 },
                 "messages": [
                     {"role": "user", "content": user_prompt},
@@ -1192,7 +1208,7 @@ class OllamaSemanticTranslator:
             return "empty"
 
         visible_source = " ".join(str(source_text or "").split())
-        if visible_source and visible_translated == visible_source and _uses_hymt_chinese_prompt(source_lang, source_text):
+        if visible_source and visible_translated == visible_source:
             return "unchanged-source"
         return None
 

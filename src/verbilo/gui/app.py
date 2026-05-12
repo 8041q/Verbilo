@@ -1965,8 +1965,8 @@ class App:
             btn.pack(side=tk.LEFT, padx=(0, 6))
             return btn
 
-        _ollama_model_btn_qwen   = _make_ollama_model_btn(_ollama_model_frame, "Qwen3.5 4B  ·  Alibaba",    "qwen3.5:4b")
-        _ollama_model_btn_hymt  = _make_ollama_model_btn(_ollama_model_frame, "HY-MT 1.5 1.8B  ·  Tencent", "demonbyron/HY-MT1.5-1.8B")
+        _ollama_model_btn_qwen   = _make_ollama_model_btn(_ollama_model_frame, "Qwen3.5 4B",    "qwen3.5:4b")
+        _ollama_model_btn_hymt  = _make_ollama_model_btn(_ollama_model_frame, "HY-MT 1.5 1.8B", "demonbyron/HY-MT1.5-1.8B")
 
         def _refresh_ollama_model_btns():
             p_now = theme.get()
@@ -1991,13 +1991,6 @@ class App:
                     )
 
         _refresh_ollama_model_btns()
-        _rrow += 1
-
-        ollama_hint_lbl = theme.make_label(
-            right, self.t("settings.ollama_hint"), level="tiny",
-        )
-        ollama_hint_lbl.configure(anchor="w", justify="left", wraplength=theme.scale(400))
-        ollama_hint_lbl.grid(row=_rrow, column=0, sticky="ew", pady=(0, 6))
         _rrow += 1
 
         ollama_pull_row = ctk.CTkFrame(right, fg_color="transparent")
