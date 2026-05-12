@@ -880,6 +880,7 @@ class OllamaSemanticTranslator:
         source_visible_chars: int = 0,
         line_count: int = 1,
         cancel_event: Optional[threading.Event],
+        _retry: bool = False,
     ) -> str | None:
         if not text or not text.strip():
             return text
@@ -892,16 +893,21 @@ class OllamaSemanticTranslator:
                 cancel_event,
             )
         else:
-            system_prompt, user_prompt = self._build_prompt(
-                text=text,
-                source_lang=source_lang,
-                target_lang=target_lang,
-                content_hint=content_hint,
-                strategy=strategy,
-                capacity_chars=capacity_chars,
-                source_visible_chars=source_visible_chars,
-                line_count=line_count,
-            )
+            if _retry:
+                system_prompt, user_prompt = self._build_retry_prompt(
+                    text=text, target_lang=target_lang,
+                )
+            else:
+                system_prompt, user_prompt = self._build_prompt(
+                    text=text,
+                    source_lang=source_lang,
+                    target_lang=target_lang,
+                    content_hint=content_hint,
+                    strategy=strategy,
+                    capacity_chars=capacity_chars,
+                    source_visible_chars=source_visible_chars,
+                    line_count=line_count,
+                )
             translated = _run_cancellable(
                 lambda: self._request_translation(system_prompt, user_prompt),
                 cancel_event,
@@ -909,6 +915,46 @@ class OllamaSemanticTranslator:
 
         raw_translated = str(translated or "")
         normalized = self._post_process_semantic_translation(text, raw_translated)
+
+        # Guard 1: empty output (Qwen returned only a think block or nothing)
+        if not normalized.strip():
+            logger.debug(
+                "Semantic translator returned empty output for source_len=%d; treating as failure",
+                len(text),
+            )
+            return None
+
+        # Guard 2: echo-back detection for non-HY-MT (Qwen) models.
+        # If the source is predominantly Chinese and the output is also predominantly
+        # Chinese but the target language is not Chinese, Qwen echoed the source.
+        if not _is_translation_only_model(self._model) and not target_lang.lower().startswith("zh"):
+            src_chars = len(text)
+            src_cjk = len(_HAN_CHAR_RE.findall(text))
+            out_cjk = len(_HAN_CHAR_RE.findall(normalized))
+            if src_chars > 0 and src_cjk / src_chars > 0.25 and out_cjk / max(len(normalized), 1) > 0.25:
+                if not _retry:
+                    logger.debug(
+                        "Qwen echo-back on first attempt, retrying with simplified prompt: %r",
+                        text[:60],
+                    )
+                    return self._translate_one(
+                        text=text,
+                        target_lang=target_lang,
+                        source_lang=source_lang,
+                        content_hint=content_hint,
+                        strategy=strategy,
+                        capacity_chars=capacity_chars,
+                        source_visible_chars=source_visible_chars,
+                        line_count=line_count,
+                        cancel_event=cancel_event,
+                        _retry=True,
+                    )
+                logger.warning(
+                    "Qwen returned source-language text (likely untranslated) on retry; keeping original: %r",
+                    text[:60],
+                )
+                return None
+
         failure_reason = self._translation_only_failure_reason(
             source_text=text,
             translated_text=normalized,
@@ -936,6 +982,8 @@ class OllamaSemanticTranslator:
             "For labels, headings, numbers, or wording-sensitive text, stay close to the source wording. "
             "If several translations are valid, always choose the shortest natural wording that preserves the source meaning. "
             "If the source contains the literal marker ⟪SEP⟫, copy every ⟪SEP⟫ marker to the output unchanged and in the same order. "
+            "Numeric placeholder tokens in the form [[N0]], [[N1]], … and unit tokens in the form [[U0]], [[U1]], … must be copied "
+            "verbatim into the output in the same position relative to the surrounding translated words. Never translate, remove, or expand them. "
             "When the payload includes capacity_chars and source_visible_chars, treat capacity_chars as the available character budget "
             "for the translation. If source_visible_chars is near or above capacity_chars, use the tightest natural wording possible "
             "without dropping required meaning."
@@ -1069,6 +1117,15 @@ class OllamaSemanticTranslator:
             ensure_ascii=False,
         )
         return system_prompt, user_prompt
+
+    def _build_retry_prompt(self, *, text: str, target_lang: str) -> tuple[str, str]:
+        lang_name = _LANG_CODE_TO_NAME.get(target_lang.lower(), target_lang)
+        system_prompt = (
+            f"You are a translator. Translate the text given by the user into {lang_name}. "
+            "Output ONLY the translation. Do not repeat the source text. "
+            "For proper nouns and company names, output a transliteration or descriptive English translation."
+        )
+        return system_prompt, text
 
     def _build_prompt(
         self,

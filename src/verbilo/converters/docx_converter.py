@@ -147,7 +147,8 @@ def _translate_and_writeback(
                 if len(translated_parts) != len(texts):
                     raise ValueError("translate_batch returned wrong number of results")
                 for idx, i in enumerate(group):
-                    units[i].write_back(translated_parts[idx])
+                    if translated_parts[idx] is not None:
+                        units[i].write_back(translated_parts[idx])
                 if progress_callback is not None:
                     progress_callback(gi + 1, total_groups)
                 continue
@@ -168,7 +169,8 @@ def _translate_and_writeback(
         for i in group:
             try:
                 result = translate_fn(units[i].source_text, target_lang)
-                units[i].write_back(result)
+                if result is not None:
+                    units[i].write_back(result)
             except CancelledError:
                 raise
             except Exception:
