@@ -20,7 +20,7 @@ CONFIG_FILENAME = ".verbilo_gui.json"
 _DEFAULT_CONFIG: Dict[str, Any] = {
     "debug_mode": False,
     "ui_locale": "en",
-    "pdf_semantic_enabled": False,
+    "ollama_enabled": False,
     "ollama_model": "qwen3.5:4b",
     "ollama_base_url": "http://127.0.0.1:11434",
 }
@@ -42,13 +42,18 @@ def load_config() -> Dict[str, Any]:
         return dict(_DEFAULT_CONFIG)
     cfg = dict(_DEFAULT_CONFIG)
     cfg.update(data)
+    if "ollama_enabled" not in data and "pdf_semantic_enabled" in data:
+        cfg["ollama_enabled"] = bool(data["pdf_semantic_enabled"])
     return cfg
 
 
 def save_config(cfg: Dict[str, Any]) -> None:
     p = _config_path()
     try:
-        text = json.dumps(cfg, indent=2, ensure_ascii=False)
+        serialized = dict(cfg)
+        if "ollama_enabled" in serialized:
+            serialized.pop("pdf_semantic_enabled", None)
+        text = json.dumps(serialized, indent=2, ensure_ascii=False)
         # ensure parent folder exists
         parent = p.parent
         if not parent.exists():

@@ -22,7 +22,9 @@ _CONTROL_CHAR_RE = re.compile(
 
 # Separator used to group multiple cells into a single translation unit.
 # Chosen to be extremely unlikely in real spreadsheet data.
-_CELL_SEP = "\n\u27EASEP\u27EB\n"
+_CELL_SEP_TOKEN = "\u27EASEP\u27EB"
+_CELL_SEP = f"\n{_CELL_SEP_TOKEN}\n"
+_CELL_SEP_SPLIT_RE = re.compile(rf"\s*{re.escape(_CELL_SEP_TOKEN)}\s*")
 
 # Maximum characters per grouped row before falling back to per-cell.
 _GROUP_MAX_CHARS = 4000
@@ -33,6 +35,14 @@ def _sanitize_text(text: str) -> str:
     text = unicodedata.normalize("NFC", text)
     text = _CONTROL_CHAR_RE.sub("", text)
     return text
+
+
+def _split_grouped_row_translation(text: str) -> list[str]:
+    if _CELL_SEP in text:
+        return text.split(_CELL_SEP)
+    if _CELL_SEP_TOKEN not in text:
+        return [text]
+    return _CELL_SEP_SPLIT_RE.split(text)
 
 
 def translate_xlsx(input_path: str, output_path: str, translator: Any, target_lang: str, *, cancel_event: threading.Event | None = None, source_lang: str = "auto", progress_callback: 'Callable[[int, int], None] | None' = None):
@@ -149,7 +159,7 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
             cell.value = tr_text
         else:
             # Grouped row — split on separator
-            parts = tr_text.split(_CELL_SEP)
+            parts = _split_grouped_row_translation(tr_text)
             if len(parts) == len(cells_in_unit):
                 for (cell, orig), part in zip(cells_in_unit, parts):
                     translated_part = part.strip() if part else orig

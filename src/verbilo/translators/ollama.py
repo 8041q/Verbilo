@@ -81,6 +81,15 @@ def _is_translation_only_model(model: str) -> bool:
     return any(lowered.startswith(prefix) for prefix in _TRANSLATION_ONLY_MODEL_PREFIXES)
 
 
+def is_translation_only_ollama_model(model: str) -> bool:
+    return _is_translation_only_model(model)
+
+
+def ollama_supports_non_pdf_translation(model: str) -> bool:
+    normalized = _normalize_ollama_model_name(model, default=DEFAULT_OLLAMA_MODEL).lower()
+    return normalized.startswith("qwen")
+
+
 def _has_han_text(text: str) -> bool:
     return bool(_HAN_CHAR_RE.search(text or ""))
 
@@ -138,6 +147,14 @@ def ollama_pdf_required_models(
         seen.add(lowered)
         required_models.append(candidate)
     return required_models
+
+
+def ollama_required_models(
+    model: str = DEFAULT_OLLAMA_MODEL,
+    *,
+    advisor_model: str | None = None,
+) -> list[str]:
+    return ollama_pdf_required_models(model, advisor_model=advisor_model)
 
 
 def _normalize_base_url(base_url: str) -> str:
@@ -918,6 +935,7 @@ class OllamaSemanticTranslator:
             "A short source phrase must yield a short target phrase, never a full sentence. "
             "For labels, headings, numbers, or wording-sensitive text, stay close to the source wording. "
             "If several translations are valid, always choose the shortest natural wording that preserves the source meaning. "
+            "If the source contains the literal marker ⟪SEP⟫, copy every ⟪SEP⟫ marker to the output unchanged and in the same order. "
             "When the payload includes capacity_chars and source_visible_chars, treat capacity_chars as the available character budget "
             "for the translation. If source_visible_chars is near or above capacity_chars, use the tightest natural wording possible "
             "without dropping required meaning."

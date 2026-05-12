@@ -1897,17 +1897,17 @@ class App:
         theme.make_divider(right).grid(row=_rrow, column=0, sticky="ew", pady=(4, 8))
         _rrow += 1
 
-        # Semantic PDF section
-        theme.make_label(right, self.t("settings.section.semantic_pdf"), level="section").grid(
+        # Ollama / Qwen section
+        theme.make_label(right, self.t("settings.section.ollama"), level="section").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 6),
         )
         _rrow += 1
 
-        semantic_pdf_var = tk.BooleanVar(value=bool(self.cfg.get("pdf_semantic_enabled", False)))
-        semantic_pdf_cb = ctk.CTkCheckBox(
+        ollama_enabled_var = tk.BooleanVar(value=bool(self.cfg.get("ollama_enabled", False)))
+        ollama_enabled_cb = ctk.CTkCheckBox(
             right,
-            text=self.t("settings.semantic_pdf_enabled"),
-            variable=semantic_pdf_var,
+            text=self.t("settings.ollama_enabled"),
+            variable=ollama_enabled_var,
             onvalue=True,
             offvalue=False,
             checkmark_color=p.bg_main,
@@ -1917,7 +1917,7 @@ class App:
             text_color=p.text_secondary,
             font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]),
         )
-        semantic_pdf_cb.grid(row=_rrow, column=0, sticky="w", pady=(0, 4))
+        ollama_enabled_cb.grid(row=_rrow, column=0, sticky="w", pady=(0, 4))
         _rrow += 1
 
         theme.make_label(right, self.t("settings.ollama_base_url"), level="small").grid(
@@ -1994,7 +1994,7 @@ class App:
         _rrow += 1
 
         ollama_hint_lbl = theme.make_label(
-            right, self.t("settings.ollama_pdf_hint"), level="tiny",
+            right, self.t("settings.ollama_hint"), level="tiny",
         )
         ollama_hint_lbl.configure(anchor="w", justify="left", wraplength=theme.scale(400))
         ollama_hint_lbl.grid(row=_rrow, column=0, sticky="ew", pady=(0, 6))
@@ -2069,10 +2069,10 @@ class App:
 
             def _worker():
                 try:
-                    from ..translators.ollama import ollama_pdf_required_models, pull_ollama_models
+                    from ..translators.ollama import ollama_required_models, pull_ollama_models
 
                     pull_ollama_models(
-                        ollama_pdf_required_models(model_name),
+                        ollama_required_models(model_name),
                         base_url=base_url,
                         proxies=proxies,
                         status_callback=lambda message: _set_ollama_pull_status(message),
@@ -2478,7 +2478,7 @@ class App:
             )
             self.cfg["auto_check_updates"] = auto_updates_var.get()
             self.cfg["debug_mode"] = debug_var.get()
-            self.cfg["pdf_semantic_enabled"] = semantic_pdf_var.get()
+            self.cfg["ollama_enabled"] = ollama_enabled_var.get()
             self.cfg["ollama_base_url"] = ollama_base_url_entry.get().strip()
             self.cfg["ollama_model"] = ollama_model_var.get()
             # Network & API keys
@@ -3581,8 +3581,8 @@ class App:
         azure_region = self.cfg.get("azure_region", "")
         deepl_api_key = self.cfg.get("deepl_api_key", "")
         local_model_dir = _get_local_model_dir_from_cfg(self.cfg)
-        ollama_pdf_config = {
-            "enabled": bool(self.cfg.get("pdf_semantic_enabled", False)),
+        ollama_config = {
+            "enabled": bool(self.cfg.get("ollama_enabled", False)),
             "model": str(self.cfg.get("ollama_model", "")).strip(),
             "base_url": str(self.cfg.get("ollama_base_url", "")).strip(),
         }
@@ -3699,7 +3699,7 @@ class App:
             azure_region=azure_region,
             deepl_api_key=deepl_api_key,
             local_model_dir=local_model_dir,
-            ollama_pdf_config=ollama_pdf_config,
+            ollama_config=ollama_config,
         )
 
     def _cancel(self):

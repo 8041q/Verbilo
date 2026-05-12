@@ -33,13 +33,14 @@ def translate_file(
     progress_callback: Callable[[int, int], None] | None = None,
     advisor: AdvisorBase | None = None,
     semantic_translator: Translator | None = None,
+    translator_override: Translator | None = None,
 ):
     # source_lang="auto" translates everything; cancel_event raises CancelledError before saving
     p = Path(input_path)
     if not p.exists():
         raise FileNotFoundError(input_path)
 
-    translator = TranslatorFactory.get(
+    translator = translator_override or TranslatorFactory.get(
         translator_name,
         source_lang=source_lang or "auto",
         detector=detector,
