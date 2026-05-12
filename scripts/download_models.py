@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Download helper for FastText and OPUS-MT models used by the app.
+# Download helper for FastText, OPUS-MT, and Ollama models used by the app.
 #
 # Needed dependencies (not needed for the GUI, only this file):
 #   ctranslate2, transformers, huggingface_hub, pyyaml
@@ -36,6 +36,16 @@ _COPY_FILES = ["source.spm", "target.spm", "tokenizer_config.json"]
 _SSL_UNVERIFIED = ssl.create_default_context()
 _SSL_UNVERIFIED.check_hostname = False
 _SSL_UNVERIFIED.verify_mode = ssl.CERT_NONE
+
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from src.verbilo.translators.ollama import (
+    DEFAULT_OLLAMA_BASE_URL,
+    DEFAULT_OLLAMA_MODEL,
+    ollama_pdf_required_models,
+    pull_ollama_models,
+)
 
 
   
@@ -88,6 +98,31 @@ def download(url: str, dest_path: str) -> None:
                 f.write(chunk)
                 received += len(chunk)
                 print(f"PROGRESS {received} {total}", flush=True)
+
+
+def download_ollama_model(
+    model: str = DEFAULT_OLLAMA_MODEL,
+    *,
+    base_url: str = DEFAULT_OLLAMA_BASE_URL,
+) -> None:
+    print("PHASE ollama-pull", flush=True)
+    print(f"Pulling Ollama model '{model}' from {base_url}", flush=True)
+
+    last_status = ""
+
+    def _status(message: str) -> None:
+        nonlocal last_status
+        if message == last_status:
+            return
+        last_status = message
+        print(message, flush=True)
+
+    pull_ollama_models(
+        ollama_pdf_required_models(model),
+        base_url=base_url,
+        status_callback=_status,
+    )
+    print(f"Model '{model}' is ready in Ollama.", flush=True)
 
 
 def _try_download(url: str, dest_path: str) -> bool:
@@ -505,7 +540,7 @@ def download_opus_mt(slug: str, dest_dir: Optional[str] = None,
 # CLI
   
 def main():
-    parser = argparse.ArgumentParser(description="Download FastText and/or OPUS-MT models.")
+    parser = argparse.ArgumentParser(description="Download FastText, OPUS-MT, and Ollama models.")
     sub = parser.add_subparsers(dest="command")
 
     ft = sub.add_parser("fasttext", help="Download the FastText language-detection model")
@@ -524,6 +559,13 @@ def main():
     opus.add_argument("--hf-repo", default=None,
                       help="HuggingFace repo name for the original model")
 
+    ollama = sub.add_parser("ollama", help="Pull an Ollama model for semantic PDF translation")
+    ollama.add_argument("model", nargs="?", default=DEFAULT_OLLAMA_MODEL,
+                        help="Model name to pull, e.g. 'qwen3:4b'")
+    ollama.add_argument("--base-url", "--host", dest="base_url",
+                        default=DEFAULT_OLLAMA_BASE_URL,
+                        help="Ollama server URL")
+
     args = parser.parse_args()
 
     if args.command == "opus-mt":
@@ -532,6 +574,12 @@ def main():
                              hf_repo=args.hf_repo)
         except Exception as e:
             print(f"OPUS-MT download failed: {e}", file=sys.stderr)
+            sys.exit(1)
+    elif args.command == "ollama":
+        try:
+            download_ollama_model(args.model, base_url=args.base_url)
+        except Exception as e:
+            print(f"Ollama pull failed: {e}", file=sys.stderr)
             sys.exit(1)
     else:
         dest = getattr(args, "dest", _DEFAULT_DEST)

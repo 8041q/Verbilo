@@ -6,11 +6,42 @@ from pathlib import Path
 from typing import Callable, Iterable, Union, Optional, Any
 import tkinter as tk
 import traceback
+from urllib.parse import urlparse
 
 from ..main import translate_file
 from ..utils import CancelledError
 
 SUPPORTED_EXTS = (".docx", ".pdf", ".xlsx", ".xls")
+
+
+def _normalize_ollama_pdf_config(cfg: Optional[dict[str, Any]]) -> dict[str, Any]:
+    from ..translators.ollama import DEFAULT_OLLAMA_BASE_URL, DEFAULT_OLLAMA_MODEL, resolve_ollama_pdf_models
+
+    raw = cfg or {}
+    semantic_model = str(raw.get("model") or DEFAULT_OLLAMA_MODEL).strip() or DEFAULT_OLLAMA_MODEL
+    resolved_models = resolve_ollama_pdf_models(
+        semantic_model,
+        advisor_model=str(raw.get("advisor_model") or "").strip() or None,
+    )
+    return {
+        "enabled": bool(raw.get("enabled")),
+        "model": resolved_models["semantic_model"],
+        "advisor_model": resolved_models["advisor_model"],  # may be None for translation-only models
+        "base_url": (
+            str(raw.get("base_url") or DEFAULT_OLLAMA_BASE_URL).strip()
+            or DEFAULT_OLLAMA_BASE_URL
+        ),
+    }
+
+
+def _ollama_client_proxies(base_url: str, proxies: dict | None) -> dict | None:
+    candidate = (base_url or "http://127.0.0.1:11434").strip() or "http://127.0.0.1:11434"
+    if "://" not in candidate:
+        candidate = f"http://{candidate}"
+    hostname = urlparse(candidate).hostname or ""
+    if hostname.lower() in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
+        return None
+    return proxies
 
 
 def list_supported_files(path: str) -> list[str]:
@@ -97,6 +128,7 @@ class Worker:
         google_project_id: str = "",
         google_sa_json: str = "",
         local_model_dir: str = "",
+        ollama_pdf_config: Optional[dict[str, Any]] = None,
     ):
         if self._thread and self._thread.is_alive():
             raise RuntimeError("Worker already running")
@@ -111,7 +143,7 @@ class Worker:
                 engine, proxies, google_api_key, baidu_appid, baidu_appkey,
                 azure_key, azure_region, deepl_api_key,
                 baidu_tier, google_project_id, google_sa_json,
-                local_model_dir,
+                local_model_dir, ollama_pdf_config,
             ),
             daemon=True,
         )
@@ -124,8 +156,49 @@ class Worker:
              engine, proxies, google_api_key, baidu_appid, baidu_appkey,
              azure_key="", azure_region="", deepl_api_key="",
              baidu_tier="standard", google_project_id="", google_sa_json="",
-             local_model_dir=""):
+             local_model_dir="", ollama_pdf_config=None):
         import os
+
+        normalized_ollama_pdf_config = _normalize_ollama_pdf_config(ollama_pdf_config)
+        pdf_advisor = None
+        pdf_semantic_translator = None
+
+        def _get_pdf_ollama_components():
+            nonlocal pdf_advisor, pdf_semantic_translator
+            if not normalized_ollama_pdf_config["enabled"]:
+                return None, None
+            if pdf_advisor is None or pdf_semantic_translator is None:
+                from ..translators.ollama import OllamaSemanticTranslator, ensure_ollama_models, ollama_pdf_required_models
+
+                ollama_base_url = normalized_ollama_pdf_config["base_url"]
+                ollama_proxies = _ollama_client_proxies(ollama_base_url, proxies)
+                semantic_model = normalized_ollama_pdf_config["model"]
+                advisor_model = normalized_ollama_pdf_config["advisor_model"]
+
+                ensure_ollama_models(
+                    ollama_pdf_required_models(semantic_model, advisor_model=advisor_model),
+                    base_url=ollama_base_url,
+                    proxies=proxies,
+                    status_callback=lambda message: log_cb(f"Ollama: {message}"),
+                )
+
+                if advisor_model is None:
+                    from ..advisors.null import NullAdvisor
+                    pdf_advisor = NullAdvisor()
+                else:
+                    from ..advisors.ollama import OllamaAdvisor
+                    pdf_advisor = OllamaAdvisor(
+                        model=advisor_model,
+                        base_url=ollama_base_url,
+                        proxies=ollama_proxies,
+                    )
+                pdf_semantic_translator = OllamaSemanticTranslator(
+                    model=semantic_model,
+                    source_lang=source_lang,
+                    base_url=ollama_base_url,
+                    proxies=ollama_proxies,
+                )
+            return pdf_advisor, pdf_semantic_translator
 
         # Compute file-size weights for smooth global progress
         file_sizes = []
@@ -165,6 +238,10 @@ class Worker:
             try:
                 progress_cb(f, "started", None)
                 log_cb(f"Translating {name} ...")
+                advisor = None
+                semantic_translator = None
+                if Path(f).suffix.lower() == ".pdf":
+                    advisor, semantic_translator = _get_pdf_ollama_components()
                 out = translate_file(
                     f, target_lang, output_dir, translator_name,
                     source_lang=source_lang,
@@ -183,6 +260,8 @@ class Worker:
                     google_sa_json=google_sa_json,
                     local_model_dir=local_model_dir,
                     progress_callback=_file_progress,
+                    advisor=advisor,
+                    semantic_translator=semantic_translator,
                 )
                 elapsed = time.perf_counter() - t0
 

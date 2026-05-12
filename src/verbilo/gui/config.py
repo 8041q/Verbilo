@@ -20,6 +20,9 @@ CONFIG_FILENAME = ".verbilo_gui.json"
 _DEFAULT_CONFIG: Dict[str, Any] = {
     "debug_mode": False,
     "ui_locale": "en",
+    "pdf_semantic_enabled": False,
+    "ollama_model": "qwen3.5:4b",
+    "ollama_base_url": "http://127.0.0.1:11434",
 }
 
 

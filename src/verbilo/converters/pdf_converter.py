@@ -24,10 +24,12 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import fitz  # PyMuPDF >= 1.24
+from ..advisors import NullAdvisor
 from ..utils import CancelledError
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,10 @@ _LINE_OBSTACLE_MIN_SPAN  = 12.0  # ignore tiny decorative strokes
 _CELL_BOUNDARY_PADDING = 3.0     # keep translated text off line-drawn borders
 _MAX_EXPAND_LEFT = 48.0          # conservative leftward slack inside a cell
 _MAX_EXPAND_UP = 24.0            # conservative upward slack inside a cell
+_HEURISTIC_LITERAL_MAX_CHARS = 18
+_HEURISTIC_LABEL_MAX_CHARS = 42
+_HEURISTIC_ROOMY_FREE_RATIO = 0.72
+_HEURISTIC_ROOMY_CJK_FREE_RATIO = 0.33
 # ────────────────────────────────────────────────────────────────────────────
 
 
@@ -297,21 +303,26 @@ def _build_block_html(
     parts: list[str] = []
     for i, line_text in enumerate(orig_lines):
         s = line_styles[min(i, n - 1)]
+        # Use block-level <div> per line so PyMuPDF's HTML renderer treats each
+        # line as its own block — inline <span>+<br/> can collapse onto one line
+        # when consecutive spans have different font sizes or the renderer treats
+        # the break as optional whitespace.
         inline = (
             f"font-size:{s['size']:.1f}px;"
             f"font-weight:{s['weight']};"
             f"font-style:{s['style']};"
             f"color:{s['color']};"
             f"text-decoration:none;"
+            f"margin:0; padding:0;"
+            f"overflow-wrap:anywhere; word-break:break-word;"
         )
         safe = _html_escape(line_text)
-        parts.append(f'<span style="{inline}">{safe}</span>')
+        parts.append(f'<div style="{inline}">{safe}</div>')
 
     html = (
         f'<div style="text-align:{container_align}; margin:0; padding:0;'
-        f' padding-top:{top_padding:.1f}px; box-sizing:border-box;'
-        f' white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;">'
-        + "<br/>".join(parts)
+        f' padding-top:{top_padding:.1f}px; box-sizing:border-box;">'
+        + "".join(parts)
         + "</div>"
     )
     css = (
@@ -327,11 +338,16 @@ def _placement_overrides_for_block(
     fit_rect: fitz.Rect,
     line_styles: list[dict],
 ) -> dict[str, Any]:
-    if not line_styles or len(line_styles) > 2:
+    if not line_styles:
         return {}
 
+    # Detect any horizontal or upward expansion.  The original `len > 2` guard
+    # was removed: multi-line blocks need the same padding_top correction as
+    # short blocks when the rect was pushed upward into free space — without it,
+    # text renders above the original block area and overlaps nearby shapes.
     expanded_x = fit_rect.x0 + 0.5 < orig_rect.x0 and fit_rect.x1 > orig_rect.x1 + 0.5
-    expanded_y = fit_rect.y0 + 0.5 < orig_rect.y0 and fit_rect.y1 > orig_rect.y1 + 0.5
+    # Check for upward expansion regardless of whether y1 also moved.
+    expanded_y = fit_rect.y0 + 0.5 < orig_rect.y0
     if not (expanded_x or expanded_y):
         return {}
 
@@ -344,17 +360,26 @@ def _placement_overrides_for_block(
             overrides["align"] = "center"
 
     if expanded_y:
-        fit_cy = (fit_rect.y0 + fit_rect.y1) / 2
-        orig_cy = (orig_rect.y0 + orig_rect.y1) / 2
-        if abs(orig_cy - fit_cy) <= max(fit_rect.height * 0.18, 4.0):
-            top_inset = max(orig_rect.y0 - fit_rect.y0, 0.0)
-            bottom_inset = max(fit_rect.y1 - orig_rect.y1, 0.0)
-            if top_inset > 1.0 and bottom_inset > 1.0:
-                overrides["padding_top"] = min(
-                    top_inset,
-                    bottom_inset,
-                    max(2.0, fit_rect.height * 0.18),
-                )
+        top_inset = max(orig_rect.y0 - fit_rect.y0, 0.0)
+        bottom_inset = max(fit_rect.y1 - orig_rect.y1, 0.0)
+        if top_inset > 1.0:
+            if bottom_inset > 1.0:
+                # Symmetric expansion: centre check — only pad if the expanded
+                # rect is roughly centred on the original (otherwise the rect
+                # grew asymmetrically and the scale/flow already handles it).
+                fit_cy  = (fit_rect.y0 + fit_rect.y1) / 2
+                orig_cy = (orig_rect.y0 + orig_rect.y1) / 2
+                if abs(orig_cy - fit_cy) <= max(fit_rect.height * 0.18, 4.0):
+                    overrides["padding_top"] = min(
+                        top_inset,
+                        bottom_inset,
+                        max(2.0, fit_rect.height * 0.18),
+                    )
+            else:
+                # Upward-only expansion: unconditionally offset text back down
+                # to where the original block started so it doesn't float above
+                # shapes that live between fit_rect.y0 and orig_rect.y0.
+                overrides["padding_top"] = top_inset
 
     return overrides
 
@@ -691,6 +716,282 @@ def _fit_block(
     return fitz.Rect(best["rect"]), float(best["scale"]), float(best["spare"])
 
 
+def _strategy_for_block(block: dict[str, Any]) -> str:
+    strategy = str(block.get("strategy", "free")).strip().lower()
+    if strategy in {"literal", "semantic", "free"}:
+        return strategy
+    return "free"
+
+
+def _visible_block_text(text: str) -> str:
+    return " ".join(str(text or "").split())
+
+
+def _block_line_count(text: str) -> int:
+    return len([line for line in str(text or "").splitlines() if line.strip()]) or 1
+
+
+def _looks_numeric_or_tabular_text(text: str) -> bool:
+    visible_chars = [ch for ch in str(text or "") if not ch.isspace()]
+    if len(visible_chars) < 4:
+        return False
+
+    numericish = sum(
+        1
+        for ch in visible_chars
+        if ch.isdigit() or ch in "%$€£¥:：/.,-+()[]{}<>|"
+    )
+    return any(ch.isdigit() for ch in visible_chars) and (numericish / len(visible_chars)) >= 0.55
+
+
+def _looks_label_like_text(text: str) -> bool:
+    visible = _visible_block_text(text)
+    if not visible or len(visible) > _HEURISTIC_LABEL_MAX_CHARS:
+        return False
+    if _block_line_count(text) > 2:
+        return False
+    if visible.endswith((":", "：")):
+        return True
+    if any(mark in visible for mark in (":", "：")) and len(visible) <= 32:
+        return True
+    if len(visible.split()) <= 6 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 /&+().,-]{0,41}", visible):
+        return True
+    return False
+
+
+def _heuristic_strategy_for_block(
+    block: dict[str, Any],
+    *,
+    source_lang: str,
+    capacity_chars: int,
+    content_hint: str,
+) -> tuple[str, str] | None:
+    text = str(block.get("text", ""))
+    visible = _visible_block_text(text)
+    line_count = _block_line_count(text)
+
+    if not visible:
+        return "free", "heuristic-empty"
+    if content_hint == "heading":
+        return "literal", "heuristic-heading"
+    if line_count <= 2 and len(visible) <= _HEURISTIC_LITERAL_MAX_CHARS:
+        return "literal", "heuristic-short"
+    if _looks_numeric_or_tabular_text(text):
+        return "literal", "heuristic-numeric"
+    if _looks_label_like_text(text):
+        return "literal", "heuristic-label"
+    if content_hint != "body" or capacity_chars <= 0:
+        return None
+
+    visible_len = len(visible)
+    if _is_cjk_source_block(text, source_lang):
+        if line_count >= 2 and visible_len >= 16 and visible_len <= capacity_chars * _HEURISTIC_ROOMY_CJK_FREE_RATIO:
+            return "free", "heuristic-roomy-cjk"
+        return None
+
+    if visible_len >= 24 and visible_len <= capacity_chars * _HEURISTIC_ROOMY_FREE_RATIO:
+        return "free", "heuristic-roomy"
+    return None
+
+
+def _preroute_obvious_blocks(
+    page_blocks: list[tuple[int, list[dict[str, Any]]]],
+    source_lang: str,
+) -> list[tuple[int, list[dict[str, Any]]]]:
+    heuristic_advisor = NullAdvisor()
+
+    for _, blocks in page_blocks:
+        page_font_baseline = heuristic_advisor._page_font_baseline(blocks)
+        for block in blocks:
+            preset_reason = str(block.get("advisor_reason", "")).strip()
+            if preset_reason and _strategy_for_block(block) in {"literal", "semantic", "free"}:
+                continue
+
+            capacity_chars = heuristic_advisor.estimate_capacity_chars(block)
+            content_hint = heuristic_advisor.infer_content_hint(block, page_font_baseline)
+            decision = _heuristic_strategy_for_block(
+                block,
+                source_lang=source_lang,
+                capacity_chars=capacity_chars,
+                content_hint=content_hint,
+            )
+            if decision is None:
+                continue
+
+            strategy, reason = decision
+            block["capacity_chars"] = capacity_chars
+            block["content_hint"] = content_hint
+            block["strategy"] = strategy
+            block["advisor_reason"] = reason
+
+    return page_blocks
+
+
+def _engine_name_for_translator(translator: Any) -> str:
+    engine_name = getattr(translator, "_engine_name", "")
+    if isinstance(engine_name, str) and engine_name.strip():
+        return engine_name
+    return translator.__class__.__name__.lower()
+
+
+def _normalize_translation_results(
+    texts: list[str],
+    translated: object | None,
+) -> tuple[list[str], list[int]]:
+    results: list[str] = []
+    failed_indices: list[int] = []
+    items = translated if isinstance(translated, (list, tuple)) else []
+
+    for idx, text in enumerate(texts):
+        item = items[idx] if idx < len(items) else None
+        if item is None:
+            results.append(text)
+            failed_indices.append(idx)
+        else:
+            results.append(str(item))
+
+    return results, failed_indices
+
+
+def _translate_units_with_fallback(
+    translator: Any,
+    texts: list[str],
+    target_lang: str,
+    *,
+    cancel_event: threading.Event | None = None,
+    log_prefix: str = "Batch translation",
+) -> tuple[list[str], list[int]]:
+    if not texts:
+        return [], []
+
+    failed_indices: list[int]
+    try:
+        batch_results = translator.translate_batch(
+            texts,
+            target_lang,
+            cancel_event=cancel_event,
+        )
+    except CancelledError:
+        raise
+    except Exception:
+        logger.exception("%s failed; falling back to per-item", log_prefix)
+        batch_results = None
+
+    results, failed_indices = _normalize_translation_results(texts, batch_results)
+    if not failed_indices:
+        return results, []
+
+    remaining_failures: list[int] = []
+    for idx in failed_indices:
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError("Translation cancelled")
+        try:
+            item = translator.translate_text(texts[idx], target_lang)
+        except CancelledError:
+            raise
+        except Exception:
+            logger.exception("%s per-item fallback failed", log_prefix)
+            remaining_failures.append(idx)
+            results[idx] = texts[idx]
+            continue
+
+        if item is None:
+            remaining_failures.append(idx)
+            results[idx] = texts[idx]
+        else:
+            results[idx] = item
+
+    return results, remaining_failures
+
+
+def _translate_blocks_with_fallback(
+    translator: Any,
+    blocks: list[dict[str, Any]],
+    target_lang: str,
+    *,
+    cancel_event: threading.Event | None = None,
+    log_prefix: str = "Semantic translation",
+) -> tuple[list[str], list[int]]:
+    if not blocks:
+        return [], []
+
+    translate_blocks = getattr(translator, "translate_blocks", None)
+    texts = [str(block.get("text", "")) for block in blocks]
+
+    if callable(translate_blocks):
+        try:
+            batch_results = translate_blocks(
+                blocks,
+                target_lang,
+                cancel_event=cancel_event,
+            )
+        except CancelledError:
+            raise
+        except Exception:
+            logger.exception("%s failed; falling back to per-item", log_prefix)
+        else:
+            results, failed_indices = _normalize_translation_results(texts, batch_results)
+            if not failed_indices:
+                return results, []
+
+            remaining_failures: list[int] = []
+            for idx in failed_indices:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CancelledError("Translation cancelled")
+                try:
+                    item = translator.translate_text(texts[idx], target_lang)
+                except CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("%s per-item fallback failed", log_prefix)
+                    remaining_failures.append(idx)
+                    results[idx] = texts[idx]
+                    continue
+
+                if item is None:
+                    remaining_failures.append(idx)
+                    results[idx] = texts[idx]
+                else:
+                    results[idx] = item
+
+            return results, remaining_failures
+
+    return _translate_units_with_fallback(
+        translator,
+        texts,
+        target_lang,
+        cancel_event=cancel_event,
+        log_prefix=log_prefix,
+    )
+
+
+def _classify_blocks(
+    page_blocks: list[tuple[int, list[dict[str, Any]]]],
+    advisor: Any,
+    source_lang: str,
+    target_lang: str,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> list[tuple[int, list[dict[str, Any]]]]:
+    active_advisor = advisor or NullAdvisor()
+    return active_advisor.classify_blocks(
+        page_blocks,
+        source_lang,
+        target_lang,
+        cancel_event=cancel_event,
+    )
+
+
+def _insert_literal_block(
+    page: fitz.Page,
+    translated_text: str,
+    orig_rect: fitz.Rect,
+    line_styles: list[dict[str, Any]],
+) -> tuple[float, float]:
+    html, css = _build_block_html(translated_text, line_styles)
+    return page.insert_htmlbox(orig_rect, html, css=css, scale_low=0)
+
+
 # ── main entry point ─────────────────────────────────────────────────────────
 
 def translate_pdf(
@@ -701,7 +1002,9 @@ def translate_pdf(
     *,
     cancel_event: threading.Event | None = None,
     source_lang: str = "auto",
-    progress_callback: 'Callable[[int, int], None] | None' = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    advisor: Any | None = None,
+    semantic_translator: Any | None = None,
 ) -> str | None:
     # Translate a PDF in-place while preserving the original layout
     src = fitz.open(input_path)
@@ -716,9 +1019,9 @@ def translate_pdf(
 
     errors = 0
 
-    # Progress: num_pages (extract) + 1 (translate) + num_pages (redact)
+    # Progress: num_pages (extract) + 1 (classify) + 1 (translate) + num_pages (redact)
     _n_pages = src.page_count
-    _total_steps = _n_pages + 1 + _n_pages
+    _total_steps = _n_pages + 2 + _n_pages
     _steps_done = 0
 
     def _report(done: int) -> None:
@@ -729,9 +1032,6 @@ def translate_pdf(
 
     # ── Phase 1: extract ──────────────────────────────────────────────────────
     page_blocks: list[tuple[int, list[dict]]] = []
-    all_units:   list[str] = []
-    unit_map:    list[tuple[int, int]] = []
-
     for page_num in range(src.page_count):
         if cancel_event is not None and cancel_event.is_set():
             src.close()
@@ -743,44 +1043,90 @@ def translate_pdf(
         pdi = len(page_blocks)
         page_blocks.append((page_num, blocks))
 
-        for bi, block in enumerate(blocks):
-            all_units.append(block["text"])
-            unit_map.append((pdi, bi))
-
         _report(page_num + 1)
 
+    classify_started = time.perf_counter()
+    page_blocks = _classify_blocks(
+        _preroute_obvious_blocks(page_blocks, source_lang),
+        advisor,
+        source_lang,
+        target_lang,
+        cancel_event=cancel_event,
+    )
+    classify_elapsed = time.perf_counter() - classify_started
+    logger.info("PDF semantic classification finished in %.2fs", classify_elapsed)
+    _report(_n_pages + 1)
+
     # ── Phase 2: translate ────────────────────────────────────────────────────
-    if all_units:
-        try:
-            all_translated = translator.translate_batch(
-                all_units, target_lang, cancel_event=cancel_event
+    primary_entries: list[tuple[int, int]] = []
+    primary_units: list[str] = []
+    semantic_entries: list[tuple[int, int]] = []
+    semantic_blocks: list[dict[str, Any]] = []
+
+    _semantic_all = getattr(semantic_translator, "_translate_all_blocks", False)
+    for pdi, (_, blocks) in enumerate(page_blocks):
+        for bi, block in enumerate(blocks):
+            block["source_lang"] = source_lang
+            strategy = _strategy_for_block(block)
+            if semantic_translator is not None and (strategy == "semantic" or _semantic_all):
+                semantic_entries.append((pdi, bi))
+                semantic_blocks.append(block)
+            else:
+                primary_entries.append((pdi, bi))
+                primary_units.append(block["text"])
+
+    primary_results, primary_failures = _translate_units_with_fallback(
+        translator,
+        primary_units,
+        target_lang,
+        cancel_event=cancel_event,
+        log_prefix="Primary PDF translation",
+    )
+    errors += len(primary_failures)
+    primary_engine = _engine_name_for_translator(translator)
+    for idx, (pdi, bi) in enumerate(primary_entries):
+        blocks = page_blocks[pdi][1]
+        blocks[bi]["translated"] = primary_results[idx]
+        blocks[bi]["translation_engine"] = primary_engine
+
+    semantic_started = time.perf_counter()
+    if semantic_entries:
+        semantic_results, semantic_failures = _translate_blocks_with_fallback(
+            semantic_translator,
+            semantic_blocks,
+            target_lang,
+            cancel_event=cancel_event,
+            log_prefix="Semantic PDF translation",
+        )
+        semantic_engine = _engine_name_for_translator(semantic_translator)
+        semantic_engines = [semantic_engine] * len(semantic_entries)
+
+        if semantic_failures:
+            fallback_units = [semantic_blocks[idx]["text"] for idx in semantic_failures]
+            fallback_results, fallback_failures = _translate_units_with_fallback(
+                translator,
+                fallback_units,
+                target_lang,
+                cancel_event=cancel_event,
+                log_prefix="Semantic fallback translation",
             )
-        except CancelledError:
-            src.close()
-            raise
-        except Exception:
-            logger.exception("Batch translation failed; falling back to per-item")
-            all_translated = []
-            for t in all_units:
-                try:
-                    r = translator.translate_text(t, target_lang)
-                    all_translated.append(r if r is not None else t)
-                except Exception:
-                    logger.exception("Per-item fallback failed")
-                    all_translated.append(t)
-                    errors += 1
-    else:
-        all_translated = []
+            for local_idx, fallback_text in zip(semantic_failures, fallback_results):
+                semantic_results[local_idx] = fallback_text
+                semantic_engines[local_idx] = primary_engine
+            errors += len(fallback_failures)
 
-    # Attach translated text to each block
-    for unit_idx, (pdi, bi) in enumerate(unit_map):
-        _, blocks = page_blocks[pdi]
-        tr = all_translated[unit_idx] if unit_idx < len(all_translated) else None
-        blocks[bi]["translated"] = tr if tr is not None else blocks[bi]["text"]
-        if tr is None:
-            errors += 1
+        for idx, (pdi, bi) in enumerate(semantic_entries):
+            blocks = page_blocks[pdi][1]
+            blocks[bi]["translated"] = semantic_results[idx]
+            blocks[bi]["translation_engine"] = semantic_engines[idx]
+    semantic_elapsed = time.perf_counter() - semantic_started
+    logger.info(
+        "PDF semantic translation finished in %.2fs for %s blocks",
+        semantic_elapsed,
+        len(semantic_entries),
+    )
 
-    _report(_n_pages + 1)  # extraction + translation done
+    _report(_n_pages + 2)  # extraction + classification + translation done
 
     # ── Phase 3: redact + insert ──────────────────────────────────────────────
     for pdi, (page_num, blocks) in enumerate(page_blocks):
@@ -798,7 +1144,8 @@ def translate_pdf(
         # Collect obstacles before redaction (image/drawing positions are stable)
         obstacles = _collect_obstacles(page)
 
-        all_rects = [b["rect"] for b in blocks]
+        all_rects    = [fitz.Rect(b["rect"]) for b in blocks]
+        placed_rects: list[fitz.Rect | None] = [None] * len(blocks)
 
         # Process each block individually: redact then insert.  If insertion
         # fails the original text is already gone so we attempt to re-insert
@@ -808,8 +1155,14 @@ def translate_pdf(
             orig_rect   = block["rect"]
             line_styles = block["line_styles"]
             line_rects  = block.get("line_rects", [])
-            siblings    = [r for i, r in enumerate(all_rects) if i != bi]
+            # Use the actual placed rect for each sibling when available so
+            # expanded blocks are treated as obstacles by subsequent blocks.
+            siblings    = [
+                placed_rects[i] if placed_rects[i] is not None else all_rects[i]
+                for i in range(len(all_rects)) if i != bi
+            ]
             preferred_scale = _preferred_scale_for_block(block["text"], source_lang)
+            strategy = _strategy_for_block(block)
 
             # Redact per-line rects instead of the whole block rect so that
             # vector drawings (table lines, shapes) within the block area
@@ -822,57 +1175,93 @@ def translate_pdf(
             page.apply_redactions(images=0)  # type: ignore[arg-type]
 
             try:
-                plans: list[dict[str, Any]] = []
-                for variant in _layout_variants_for_block(block["text"], source_lang):
-                    html, css = _build_block_html(
+                if strategy == "literal":
+                    result = _insert_literal_block(
+                        page,
+                        tr_text,
+                        orig_rect,
+                        line_styles,
+                    )
+                    placed_rects[bi] = orig_rect
+                    if result[0] < 0:
+                        logger.debug(
+                            "literal insert_htmlbox overflow page %d block %d rect=%s",
+                            page_num + 1, bi, orig_rect,
+                        )
+                    elif result[1] < preferred_scale:
+                        logger.debug(
+                            "literal insert_htmlbox compressed page %d block %d scale=%.3f preferred=%.3f rect=%s",
+                            page_num + 1, bi, result[1], preferred_scale, orig_rect,
+                        )
+                    logger.debug(
+                        "placed page=%d bi=%d strategy=literal engine=%s src_len=%d tr_len=%d cap=%d rect=%s",
+                        page_num + 1, bi,
+                        block.get("engine", "-"),
+                        len(block["text"]), len(tr_text),
+                        block.get("capacity_chars", 0),
+                        orig_rect,
+                    )
+                else:
+                    plans: list[dict[str, Any]] = []
+                    for variant in _layout_variants_for_block(block["text"], source_lang):
+                        html, css = _build_block_html(
+                            tr_text,
+                            line_styles,
+                            line_height=variant["line_height"],
+                        )
+                        fit_rect, probe_scale, probe_spare = _fit_block(
+                            html, css, orig_rect,
+                            obstacles, siblings, page_height,
+                            page_width=page_width,
+                            preferred_scale=preferred_scale,
+                        )
+                        plans.append({
+                            "html": html,
+                            "css": css,
+                            "rect": fit_rect,
+                            "scale": probe_scale,
+                            "spare": probe_spare,
+                            "variant_name": variant["name"],
+                            "variant_priority": variant["priority"],
+                            "line_height": variant["line_height"],
+                        })
+
+                    plan = _choose_block_plan(plans, orig_rect, preferred_scale)
+                    placement = _placement_overrides_for_block(
+                        orig_rect,
+                        plan["rect"],
+                        line_styles,
+                    )
+                    final_html, final_css = _build_block_html(
                         tr_text,
                         line_styles,
-                        line_height=variant["line_height"],
+                        line_height=plan["line_height"],
+                        align_override=placement.get("align"),
+                        padding_top=placement.get("padding_top", 0.0),
                     )
-                    fit_rect, probe_scale, probe_spare = _fit_block(
-                        html, css, orig_rect,
-                        obstacles, siblings, page_height,
-                        page_width=page_width,
-                        preferred_scale=preferred_scale,
+                    result = page.insert_htmlbox(
+                        plan["rect"], final_html, css=final_css, scale_low=0
                     )
-                    plans.append({
-                        "html": html,
-                        "css": css,
-                        "rect": fit_rect,
-                        "scale": probe_scale,
-                        "spare": probe_spare,
-                        "variant_name": variant["name"],
-                        "variant_priority": variant["priority"],
-                        "line_height": variant["line_height"],
-                    })
-
-                plan = _choose_block_plan(plans, orig_rect, preferred_scale)
-                placement = _placement_overrides_for_block(
-                    orig_rect,
-                    plan["rect"],
-                    line_styles,
-                )
-                final_html, final_css = _build_block_html(
-                    tr_text,
-                    line_styles,
-                    line_height=plan["line_height"],
-                    align_override=placement.get("align"),
-                    padding_top=placement.get("padding_top", 0.0),
-                )
-                result = page.insert_htmlbox(
-                    plan["rect"], final_html, css=final_css, scale_low=0
-                )
-                if result[0] < 0:
+                    placed_rects[bi] = plan["rect"]
+                    if result[0] < 0:
+                        logger.debug(
+                            "insert_htmlbox overflow page %d block %d rect=%s",
+                            page_num + 1, bi, plan["rect"],
+                        )
+                    elif result[1] < preferred_scale:
+                        logger.debug(
+                            "insert_htmlbox compressed page %d block %d variant=%s scale=%.3f probe=%.3f spare=%.2f preferred=%.3f rect=%s",
+                            page_num + 1, bi, plan["variant_name"], result[1],
+                            plan["scale"], plan["spare"], preferred_scale,
+                            plan["rect"],
+                        )
                     logger.debug(
-                        "insert_htmlbox overflow page %d block %d rect=%s",
-                        page_num + 1, bi, plan["rect"],
-                    )
-                elif result[1] < preferred_scale:
-                    logger.debug(
-                        "insert_htmlbox compressed page %d block %d variant=%s scale=%.3f probe=%.3f spare=%.2f preferred=%.3f rect=%s",
-                        page_num + 1, bi, plan["variant_name"], result[1],
-                        plan["scale"], plan["spare"], preferred_scale,
-                        plan["rect"],
+                        "placed page=%d bi=%d strategy=%s engine=%s src_len=%d tr_len=%d cap=%d orig=%s placed=%s",
+                        page_num + 1, bi, strategy,
+                        block.get("engine", "-"),
+                        len(block["text"]), len(tr_text),
+                        block.get("capacity_chars", 0),
+                        orig_rect, plan["rect"],
                     )
             except Exception:
                 logger.exception(
@@ -880,6 +1269,7 @@ def translate_pdf(
                     page_num + 1, bi,
                 )
                 # Fallback: re-insert original text so the area isn't blank
+                placed_rects[bi] = orig_rect
                 try:
                     fb_html, fb_css = _build_block_html(
                         block["text"], line_styles
@@ -894,7 +1284,7 @@ def translate_pdf(
                     )
                 errors += 1
 
-        _report(_n_pages + 1 + pdi + 1)  # extract + translate + pages redacted so far
+        _report(_n_pages + 2 + pdi + 1)  # extract + classify + translate + pages redacted so far
 
     # ── Save ──────────────────────────────────────────────────────────────────
     if cancel_event is not None and cancel_event.is_set():

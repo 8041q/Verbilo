@@ -1,7 +1,9 @@
 from pathlib import Path
 import threading
 from typing import Callable
+from .advisors import AdvisorBase, NullAdvisor
 from .translators.factory import TranslatorFactory
+from .translators.base import Translator
 from .converters import docx_converter, xlsx_converter, pdf_converter
 from .utils.io import resolve_output_path
 from .utils import CancelledError
@@ -29,6 +31,8 @@ def translate_file(
     google_sa_json: str = "",
     local_model_dir: str = "",
     progress_callback: Callable[[int, int], None] | None = None,
+    advisor: AdvisorBase | None = None,
+    semantic_translator: Translator | None = None,
 ):
     # source_lang="auto" translates everything; cancel_event raises CancelledError before saving
     p = Path(input_path)
@@ -58,6 +62,8 @@ def translate_file(
         raise ValueError("target_lang must be a non-empty language code (e.g. 'en', 'pt')")
 
     suffix = p.suffix.lower()
+    if advisor is None:
+        advisor = NullAdvisor()
 
     # Resolve output path after any conversion so the suffix/filename is correct
     output_path = resolve_output_path(p, output_path)
@@ -67,7 +73,17 @@ def translate_file(
     elif suffix in (".xls", ".xlsx"):
         xlsx_converter.translate_xlsx(str(p), str(output_path), translator, target_lang, cancel_event=cancel_event, source_lang=source_lang, progress_callback=progress_callback)
     elif suffix == ".pdf":
-        result = pdf_converter.translate_pdf(str(p), str(output_path), translator, target_lang, cancel_event=cancel_event, source_lang=source_lang, progress_callback=progress_callback)
+        result = pdf_converter.translate_pdf(
+            str(p),
+            str(output_path),
+            translator,
+            target_lang,
+            cancel_event=cancel_event,
+            source_lang=source_lang,
+            progress_callback=progress_callback,
+            advisor=advisor,
+            semantic_translator=semantic_translator,
+        )
         if result == "skipped-ocr":
             return "skipped-ocr"
     else:

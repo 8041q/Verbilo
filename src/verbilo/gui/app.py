@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import queue
 import sys
 import threading
 import urllib.request
@@ -918,6 +919,9 @@ class App:
         self.completed_files = 0
         self._running = False
 
+        # Thread-safe log queue: worker threads put messages here; main thread drains it
+        self._log_queue: queue.SimpleQueue = queue.SimpleQueue()
+
         # Mapping: treeview iid -> filepath
         self._tree_ids: dict[str, str] = {}
         # Mapping: filepath -> treeview iid
@@ -940,6 +944,9 @@ class App:
         # Schedule at multiple points to beat any late CTk icon re-application
         self.root.after(100, _reapply_icon)
         self.root.after(500, _reapply_icon)
+
+        # Start log queue drain loop (runs every 50 ms on the main thread)
+        self._poll_log_queue()
 
         # Update check state (populated by background thread on startup)
         self._update_check_result: dict | None = None
@@ -1890,6 +1897,268 @@ class App:
         theme.make_divider(right).grid(row=_rrow, column=0, sticky="ew", pady=(4, 8))
         _rrow += 1
 
+        # Semantic PDF section
+        theme.make_label(right, self.t("settings.section.semantic_pdf"), level="section").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 6),
+        )
+        _rrow += 1
+
+        semantic_pdf_var = tk.BooleanVar(value=bool(self.cfg.get("pdf_semantic_enabled", False)))
+        semantic_pdf_cb = ctk.CTkCheckBox(
+            right,
+            text=self.t("settings.semantic_pdf_enabled"),
+            variable=semantic_pdf_var,
+            onvalue=True,
+            offvalue=False,
+            checkmark_color=p.bg_main,
+            fg_color=p.accent,
+            hover_color=p.accent_hover,
+            border_color=p.border,
+            text_color=p.text_secondary,
+            font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]),
+        )
+        semantic_pdf_cb.grid(row=_rrow, column=0, sticky="w", pady=(0, 4))
+        _rrow += 1
+
+        theme.make_label(right, self.t("settings.ollama_base_url"), level="small").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 4),
+        )
+        _rrow += 1
+        ollama_base_url_entry = theme.make_entry(right, height=28)
+        ollama_base_url_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 1))
+        ollama_base_url_entry.insert(0, self.cfg.get("ollama_base_url", "http://127.0.0.1:11434"))
+        _rrow += 1
+
+        ollama_url_hint_lbl = theme.make_label(
+            right, self.t("settings.ollama_base_url_hint"), level="tiny",
+        )
+        ollama_url_hint_lbl.configure(anchor="w", justify="left", wraplength=theme.scale(400))
+        ollama_url_hint_lbl.grid(row=_rrow, column=0, sticky="ew", pady=(0, 6))
+        _rrow += 1
+
+        theme.make_label(right, self.t("settings.ollama_model"), level="small").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 4),
+        )
+        _rrow += 1
+
+        _OLLAMA_MODEL_OPTIONS = ["qwen3.5:4b", "demonbyron/HY-MT1.5-1.8B"]
+        _saved_ollama_model = self.cfg.get("ollama_model", "qwen3.5:4b")
+        if _saved_ollama_model not in _OLLAMA_MODEL_OPTIONS:
+            _saved_ollama_model = _OLLAMA_MODEL_OPTIONS[0]
+        ollama_model_var = ctk.StringVar(value=_saved_ollama_model)
+
+        _ollama_model_frame = ctk.CTkFrame(right, fg_color="transparent")
+        _ollama_model_frame.grid(row=_rrow, column=0, sticky="w", pady=(0, 4))
+
+        def _make_ollama_model_btn(parent, label, value):
+            def _select():
+                ollama_model_var.set(value)
+                _refresh_ollama_model_btns()
+                _check_model_availability(value, ollama_base_url_entry.get().strip())
+            btn = ctk.CTkButton(
+                parent, text=label, width=140, height=28,
+                corner_radius=theme.BUTTON_CORNER_RADIUS,
+                border_width=1,
+                font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_SMALL[1]),
+                command=_select,
+            )
+            btn.pack(side=tk.LEFT, padx=(0, 6))
+            return btn
+
+        _ollama_model_btn_qwen   = _make_ollama_model_btn(_ollama_model_frame, "Qwen3.5 4B  ·  Alibaba",    "qwen3.5:4b")
+        _ollama_model_btn_hymt  = _make_ollama_model_btn(_ollama_model_frame, "HY-MT 1.5 1.8B  ·  Tencent", "demonbyron/HY-MT1.5-1.8B")
+
+        def _refresh_ollama_model_btns():
+            p_now = theme.get()
+            selected = ollama_model_var.get()
+            for btn, val in (
+                (_ollama_model_btn_qwen,  "qwen3.5:4b"),
+                (_ollama_model_btn_hymt, "demonbyron/HY-MT1.5-1.8B"),
+            ):
+                if val == selected:
+                    btn.configure(
+                        fg_color=p_now.accent,
+                        hover_color=p_now.accent_hover,
+                        text_color=p_now.text_on_accent,
+                        border_color=p_now.accent_pressed,
+                    )
+                else:
+                    btn.configure(
+                        fg_color="transparent",
+                        hover_color=p_now.bg_card,
+                        text_color=p_now.text_secondary,
+                        border_color=p_now.border,
+                    )
+
+        _refresh_ollama_model_btns()
+        _rrow += 1
+
+        ollama_hint_lbl = theme.make_label(
+            right, self.t("settings.ollama_pdf_hint"), level="tiny",
+        )
+        ollama_hint_lbl.configure(anchor="w", justify="left", wraplength=theme.scale(400))
+        ollama_hint_lbl.grid(row=_rrow, column=0, sticky="ew", pady=(0, 6))
+        _rrow += 1
+
+        ollama_pull_row = ctk.CTkFrame(right, fg_color="transparent")
+        ollama_pull_row.grid(row=_rrow, column=0, sticky="w", pady=(0, 4))
+
+        ollama_pull_status_lbl = theme.make_label(
+            right,
+            self.t("settings.ollama_pull.idle"),
+            level="tiny",
+            text_color=p.text_muted,
+        )
+        ollama_pull_status_lbl.configure(anchor="w", justify="left", wraplength=theme.scale(400))
+
+        ollama_pull_active = [False]
+
+        def _set_ollama_pull_status(message: str, *, color: str | None = None, running: bool | None = None):
+            def _update():
+                if not win.winfo_exists():
+                    return
+                ollama_pull_status_lbl.configure(text=message, text_color=color or p.text_muted)
+                if running is not None:
+                    ollama_pull_active[0] = running
+                    self._set_button_disabled(ollama_pull_btn, running)
+                    self._set_button_disabled(ollama_remove_btn, running)
+
+            try:
+                self.root.after(0, _update)
+            except Exception:
+                pass
+
+        def _check_model_availability(model_name: str, base_url: str) -> None:
+            """Background check: update status label with live model availability."""
+            if ollama_pull_active[0]:
+                return
+
+            def _worker():
+                from ..translators.ollama import check_ollama_model_available
+                available = check_ollama_model_available(
+                    model_name,
+                    base_url or "http://127.0.0.1:11434",
+                )
+                if ollama_pull_active[0]:
+                    return
+                if available:
+                    _set_ollama_pull_status(
+                        self.t("settings.ollama_model.available"),
+                        color=p.status_success,
+                    )
+                else:
+                    _set_ollama_pull_status(
+                        self.t("settings.ollama_model.not_available"),
+                    )
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        def _pull_ollama_model_from_settings():
+            if ollama_pull_active[0]:
+                return
+
+            model_name = ollama_model_var.get()
+            base_url = ollama_base_url_entry.get().strip() or "http://127.0.0.1:11434"
+            proxy_url = proxy_entry.get().strip()
+            proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else None
+
+            _set_ollama_pull_status(
+                self.t("settings.ollama_pull.running", model=model_name),
+                running=True,
+            )
+
+            def _worker():
+                try:
+                    from ..translators.ollama import ollama_pdf_required_models, pull_ollama_models
+
+                    pull_ollama_models(
+                        ollama_pdf_required_models(model_name),
+                        base_url=base_url,
+                        proxies=proxies,
+                        status_callback=lambda message: _set_ollama_pull_status(message),
+                    )
+                except Exception as exc:
+                    logger.exception("Ollama model pull failed")
+                    _set_ollama_pull_status(
+                        self.t("settings.ollama_pull.idle"),
+                        running=False,
+                    )
+                    return
+
+                _set_ollama_pull_status(
+                    self.t("settings.ollama_pull.success", model=model_name),
+                    color=p.status_success,
+                    running=False,
+                )
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        ollama_pull_btn = theme.make_button(
+            ollama_pull_row,
+            self.t("settings.pull_ollama_model"),
+            command=_pull_ollama_model_from_settings,
+            style="secondary",
+            height=26,
+        )
+        ollama_pull_btn.pack(side=tk.LEFT)
+
+        def _remove_ollama_model_from_settings():
+            if ollama_pull_active[0]:
+                return
+
+            model_name = ollama_model_var.get()
+            base_url = ollama_base_url_entry.get().strip() or "http://127.0.0.1:11434"
+            proxy_url = proxy_entry.get().strip()
+            proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else None
+
+            _set_ollama_pull_status(
+                self.t("settings.ollama_remove.running", model=model_name),
+                running=True,
+            )
+
+            def _worker():
+                try:
+                    from ..translators.ollama import remove_ollama_model
+                    remove_ollama_model(model_name, base_url=base_url, proxies=proxies)
+                except Exception:
+                    logger.exception("Ollama model removal failed")
+                    _set_ollama_pull_status(
+                        self.t("settings.ollama_remove.error"),
+                        running=False,
+                    )
+                    return
+
+                _set_ollama_pull_status(
+                    self.t("settings.ollama_remove.success", model=model_name),
+                    color=p.status_success,
+                    running=False,
+                )
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        ollama_remove_btn = theme.make_button(
+            ollama_pull_row,
+            self.t("settings.remove_ollama_model"),
+            command=_remove_ollama_model_from_settings,
+            style="secondary",
+            height=26,
+        )
+        ollama_remove_btn.pack(side=tk.LEFT, padx=(6, 0))
+        _rrow += 1
+
+        ollama_pull_status_lbl.grid(row=_rrow, column=0, sticky="ew", pady=(0, 8))
+        _rrow += 1
+
+        # Kick off an immediate live model availability check
+        _check_model_availability(
+            ollama_model_var.get(),
+            ollama_base_url_entry.get().strip(),
+        )
+
+        # Divider
+        theme.make_divider(right).grid(row=_rrow, column=0, sticky="ew", pady=(4, 8))
+        _rrow += 1
+
         # Google Cloud section
         theme.make_label(right, self.t("settings.section.google_cloud"), level="section").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 6),
@@ -2209,6 +2478,9 @@ class App:
             )
             self.cfg["auto_check_updates"] = auto_updates_var.get()
             self.cfg["debug_mode"] = debug_var.get()
+            self.cfg["pdf_semantic_enabled"] = semantic_pdf_var.get()
+            self.cfg["ollama_base_url"] = ollama_base_url_entry.get().strip()
+            self.cfg["ollama_model"] = ollama_model_var.get()
             # Network & API keys
             self.cfg["proxy_url"] = proxy_entry.get().strip()
             self.cfg["google_api_key"] = google_key_entry.get().strip()
@@ -3309,6 +3581,11 @@ class App:
         azure_region = self.cfg.get("azure_region", "")
         deepl_api_key = self.cfg.get("deepl_api_key", "")
         local_model_dir = _get_local_model_dir_from_cfg(self.cfg)
+        ollama_pdf_config = {
+            "enabled": bool(self.cfg.get("pdf_semantic_enabled", False)),
+            "model": str(self.cfg.get("ollama_model", "")).strip(),
+            "base_url": str(self.cfg.get("ollama_base_url", "")).strip(),
+        }
 
         # Validate credentials for engines that require them
         if engine == "baidu" and (not baidu_appid or not baidu_appkey):
@@ -3422,6 +3699,7 @@ class App:
             azure_region=azure_region,
             deepl_api_key=deepl_api_key,
             local_model_dir=local_model_dir,
+            ollama_pdf_config=ollama_pdf_config,
         )
 
     def _cancel(self):
@@ -3491,18 +3769,39 @@ class App:
         self.root.after(0, _update)
 
     def _log(self, msg: str):
-        # thread-safe log; "__worker_done__" signals the run is done
-        if msg == "__worker_done__":
-            self.root.after(0, lambda: self._finish_run() if self._running else None)
+        # thread-safe: safe to call from any thread
+        self._log_queue.put(msg)
+
+    def _poll_log_queue(self):
+        # Processes ONE message per call so that Tk can run its widget-repaint
+        # idle callbacks between insertions — each line appears immediately.
+        #
+        # When a message is found, reschedule via after_idle: this fires only
+        # after all pending events (including widget redraws) have been processed,
+        # so the text widget repaints before the next message is inserted.
+        # When the queue is empty, fall back to a 50 ms timer to avoid spinning.
+        try:
+            msg = self._log_queue.get_nowait()
+        except queue.Empty:
+            self.root.after(50, self._poll_log_queue)
+            return
+        except Exception:
+            self.root.after(50, self._poll_log_queue)
             return
 
-        def append():
-            self.log.configure(state="normal")
-            self.log.insert("end", msg + "\n")
-            self.log.see("end")
-            self.log.configure(state="disabled")
+        try:
+            if msg == "__worker_done__":
+                if self._running:
+                    self._finish_run()
+            else:
+                self.log.configure(state="normal")
+                self.log.insert("end", msg + "\n")
+                self.log.see("end")
+                self.log.configure(state="disabled")
+        except Exception:
+            pass
 
-        self.root.after(0, append)
+        self.root.after_idle(self._poll_log_queue)
 
     def _finish_run(self, cancelled: bool = False):
         if not self._running:
