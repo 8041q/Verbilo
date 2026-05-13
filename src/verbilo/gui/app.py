@@ -922,6 +922,8 @@ class App:
         self.total_files = 0
         self.completed_files = 0
         self._running = False
+        self._ollama_pull_lock = threading.Lock()
+        self._ollama_install_cancel: threading.Event | None = None
 
         # Thread-safe log queue: worker threads put messages here; main thread drains it
         self._log_queue: queue.SimpleQueue = queue.SimpleQueue()
@@ -2053,6 +2055,9 @@ class App:
         def _pull_ollama_model_from_settings():
             if ollama_pull_active[0]:
                 return
+            if not self._ollama_pull_lock.acquire(blocking=False):
+                _set_ollama_pull_status(self.t("settings.ollama_pull.already_running"))
+                return
 
             model_name = ollama_model_var.get()
             base_url = ollama_base_url_entry.get().strip() or "http://127.0.0.1:11434"
@@ -2064,6 +2069,9 @@ class App:
                 running=True,
             )
 
+            cancel_event = threading.Event()
+            self._ollama_install_cancel = cancel_event
+
             def _worker():
                 try:
                     from ..translators.ollama import ollama_required_models, pull_ollama_models
@@ -2073,6 +2081,7 @@ class App:
                         base_url=base_url,
                         proxies=proxies,
                         status_callback=lambda message: _set_ollama_pull_status(message),
+                        cancel_event=cancel_event,
                     )
                 except Exception as exc:
                     logger.exception("Ollama model pull failed")
@@ -2080,6 +2089,8 @@ class App:
                         self.t("settings.ollama_pull.idle"),
                         running=False,
                     )
+                    self._ollama_install_cancel = None
+                    self._ollama_pull_lock.release()
                     return
 
                 _set_ollama_pull_status(
@@ -2087,6 +2098,8 @@ class App:
                     color=p.status_success,
                     running=False,
                 )
+                self._ollama_install_cancel = None
+                self._ollama_pull_lock.release()
 
             threading.Thread(target=_worker, daemon=True).start()
 
@@ -2502,19 +2515,26 @@ class App:
                 self._apply_debug_mode()
             except Exception:
                 pass
+            if self._ollama_install_cancel is not None:
+                self._ollama_install_cancel.set()
+            win.destroy()
+
+        def _on_settings_close():
+            if self._ollama_install_cancel is not None:
+                self._ollama_install_cancel.set()
             win.destroy()
 
         theme.make_button(btn_frame, self.t("settings.save"), command=_save_and_close, style="primary",
                           height=28).pack(
             side=tk.LEFT, padx=(0, 6),
         )
-        theme.make_button(btn_frame, self.t("sidebar.cancel"), command=win.destroy, style="secondary",
+        theme.make_button(btn_frame, self.t("sidebar.cancel"), command=_on_settings_close, style="secondary",
                           height=28).pack(
             side=tk.LEFT,
         )
 
         # Title-bar X acts as Cancel (discard changes)
-        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        win.protocol("WM_DELETE_WINDOW", _on_settings_close)
         win.update_idletasks()
         def _show_settings():
             center_window(win, parent=self.root)
@@ -3596,6 +3616,29 @@ class App:
             "model": str(self.cfg.get("ollama_model", "")).strip(),
             "base_url": str(self.cfg.get("ollama_base_url", "")).strip(),
         }
+
+        # Semantic translation pre-flight: ensure Ollama is installed and the server is running
+        if ollama_config["enabled"]:
+            from ..translators.ollama import (
+                OllamaNotInstalledError,
+                _ensure_ollama_server_no_install,
+                DEFAULT_OLLAMA_BASE_URL as _DEFAULT_OLLAMA_URL,
+            )
+            _ollama_url = ollama_config["base_url"] or _DEFAULT_OLLAMA_URL
+            try:
+                _ensure_ollama_server_no_install(_ollama_url, proxies=proxies)
+            except OllamaNotInstalledError:
+                messagebox.showwarning(
+                    self.t("message.ollama_not_ready_title"),
+                    self.t("message.ollama_not_ready_body"),
+                )
+                return
+            except RuntimeError:
+                messagebox.showwarning(
+                    self.t("message.ollama_not_ready_title"),
+                    self.t("message.ollama_server_unreachable_body"),
+                )
+                return
 
         # Validate credentials for engines that require them
         if engine == "baidu" and (not baidu_appid or not baidu_appkey):

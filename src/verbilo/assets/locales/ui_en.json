@@ -75,6 +75,7 @@
     "settings.ollama_pull.running": "Pulling {model}...",
     "settings.ollama_pull.success": "Pulled {model}.",
     "settings.ollama_pull.error": "Pull failed: {error}",
+    "settings.ollama_pull.already_running": "Pull already in progress. Please wait...",
     "settings.ollama_remove.running": "Removing {model}...",
     "settings.ollama_remove.success": "Removed {model}.",
     "settings.ollama_remove.error": "Removal failed. Check the log.",
@@ -182,7 +183,10 @@
     "log.cache_clear_error": "Error clearing cache: {error}",
     "log.output_path_missing": "Error: Output path \"{output}\" does not exist - translation cancelled.",
     "message.missing_dependency_title": "Missing dependency",
-    "message.missing_dependency_body": "customtkinter is required for GUI. Install with:\n\n    pip install customtkinter"
+    "message.missing_dependency_body": "customtkinter is required for GUI. Install with:\n\n    pip install customtkinter",
+    "message.ollama_not_ready_title": "Semantic Translation Not Ready",
+    "message.ollama_not_ready_body": "Ollama is not installed or the server could not be reached.\n\nPlease open Settings and click \"Pull Model\" first to set it up.",
+    "message.ollama_server_unreachable_body": "Ollama is installed but the server could not be started.\n\nPlease start Ollama manually and try again."
   },
   "language_names": {
     "af": "Afrikaans",

@@ -85,6 +85,25 @@ class _OllamaInstallerBusyError(RuntimeError):
     pass
 
 
+class OllamaNotInstalledError(RuntimeError):
+    pass
+
+
+def is_ollama_available(
+    base_url: str = DEFAULT_OLLAMA_BASE_URL,
+    *,
+    proxies: dict | None = None,
+) -> bool:
+    """Return True if Ollama appears to be installed or already running.
+
+    Checks the server first (fastest), then falls back to checking for the
+    Ollama executable on disk.  Never installs, starts, or modifies anything.
+    """
+    if _is_ollama_server_reachable(_normalize_base_url(base_url), timeout=2.0, proxies=proxies):
+        return True
+    return _find_ollama_executable() is not None
+
+
 def _normalize_ollama_model_name(model: str | None, *, default: str) -> str:
     return str(model or default).strip() or default
 
@@ -298,12 +317,17 @@ def _wait_for_ollama_installation(
         status_callback("Waiting for Ollama installer...")
 
     deadline = time.monotonic() + timeout
+    _next_status_at = time.monotonic() + 2.0
     while time.monotonic() < deadline:
         executable = _find_ollama_executable()
         if executable is not None:
             return executable
         if _is_ollama_server_reachable(base_url, timeout=2.0, proxies=proxies):
             return None
+        now = time.monotonic()
+        if status_callback is not None and now >= _next_status_at:
+            status_callback("Waiting for Ollama to finish installing...")
+            _next_status_at = now + 2.0
         time.sleep(_OLLAMA_READY_POLL_INTERVAL)
     return None
 
@@ -313,7 +337,11 @@ def _is_ollama_installer_busy_error(detail: str) -> bool:
     return "ollamasetup.exe" in lowered and "being used by another process" in lowered
 
 
-def _install_ollama_windows(status_callback: Optional[Callable[[str], None]] = None) -> None:
+def _install_ollama_windows(
+    status_callback: Optional[Callable[[str], None]] = None,
+    *,
+    cancel_event: Optional[threading.Event] = None,
+) -> None:
     if status_callback is not None:
         status_callback("Installing Ollama runtime...")
 
@@ -325,13 +353,41 @@ def _install_ollama_windows(status_callback: Optional[Callable[[str], None]] = N
         "-Command",
         f"irm {_OLLAMA_INSTALL_URL} | iex",
     ]
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if platform.system().lower() == "windows" else 0
     try:
-        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+        proc = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            creationflags=creationflags,
+        )
     except OSError as exc:
         raise RuntimeError(f"Could not start PowerShell to install Ollama: {exc}") from exc
 
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
+    # Watchdog thread: terminates the installer process immediately when the
+    # caller signals cancellation (e.g. the settings window was closed).
+    if cancel_event is not None:
+        def _watchdog() -> None:
+            cancel_event.wait()
+            proc.terminate()
+        threading.Thread(target=_watchdog, daemon=True).start()
+
+    output_lines: list[str] = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        stripped = line.rstrip("\r\n")
+        if stripped:
+            output_lines.append(stripped)
+            if status_callback is not None:
+                status_callback(f"Installing: {stripped}")
+    proc.wait()
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("Ollama installation was cancelled.")
+
+    if proc.returncode != 0:
+        detail = "\n".join(output_lines[-5:]) if output_lines else f"exit code {proc.returncode}"
         if _is_ollama_installer_busy_error(detail):
             raise _OllamaInstallerBusyError(detail)
         raise RuntimeError(f"Ollama installation failed: {detail}")
@@ -388,6 +444,7 @@ def _ensure_ollama_server(
     *,
     proxies: dict | None = None,
     status_callback: Optional[Callable[[str], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> str:
     root_url = _normalize_base_url(base_url)
     if _is_ollama_server_reachable(root_url, timeout=2.0, proxies=proxies):
@@ -405,7 +462,7 @@ def _ensure_ollama_server(
                 f"Cannot reach Ollama at {root_url}, and automatic installation is only supported on Windows."
             )
         try:
-            _install_ollama_windows(status_callback=status_callback)
+            _install_ollama_windows(status_callback=status_callback, cancel_event=cancel_event)
         except _OllamaInstallerBusyError:
             if status_callback is not None:
                 status_callback("Ollama installer already running; waiting for it to finish...")
@@ -421,6 +478,49 @@ def _ensure_ollama_server(
             )
         if _wait_for_ollama_server(root_url, timeout=5.0, proxies=proxies):
             return root_url
+
+    if _wait_for_ollama_server(root_url, timeout=2.0, proxies=proxies):
+        return root_url
+
+    if status_callback is not None:
+        status_callback("Starting Ollama runtime...")
+    try:
+        _start_ollama_server(root_url, executable=executable, proxies=proxies)
+    except OSError as exc:
+        raise RuntimeError(f"Could not start Ollama from {executable}: {exc}") from exc
+
+    if status_callback is not None:
+        status_callback("Waiting for Ollama runtime...")
+    if not _wait_for_ollama_server(root_url, timeout=_OLLAMA_READY_TIMEOUT, proxies=proxies):
+        raise RuntimeError(f"Could not reach Ollama at {root_url} after starting it.")
+    return root_url
+
+
+def _ensure_ollama_server_no_install(
+    base_url: str = DEFAULT_OLLAMA_BASE_URL,
+    *,
+    proxies: dict | None = None,
+    status_callback: Optional[Callable[[str], None]] = None,
+) -> str:
+    """Like _ensure_ollama_server but raises OllamaNotInstalledError instead of installing.
+
+    Will start the Ollama server process if the executable exists but the server
+    is not running.  Never downloads or installs anything.
+    """
+    root_url = _normalize_base_url(base_url)
+    if _is_ollama_server_reachable(root_url, timeout=2.0, proxies=proxies):
+        return root_url
+
+    if not _is_local_ollama_url(root_url):
+        raise RuntimeError(
+            f"Cannot reach Ollama at {root_url}. Please ensure the remote Ollama server is running."
+        )
+
+    executable = _find_ollama_executable()
+    if executable is None:
+        raise OllamaNotInstalledError(
+            "Ollama is not installed. Please open Settings and click 'Pull Model' to install it."
+        )
 
     if _wait_for_ollama_server(root_url, timeout=2.0, proxies=proxies):
         return root_url
@@ -501,7 +601,7 @@ def ensure_ollama_models(
     proxies: dict | None = None,
     status_callback: Optional[Callable[[str], None]] = None,
 ) -> str:
-    root_url = _ensure_ollama_server(
+    root_url = _ensure_ollama_server_no_install(
         base_url,
         proxies=proxies,
         status_callback=status_callback,
@@ -510,16 +610,10 @@ def ensure_ollama_models(
     for model_name in [_normalize_ollama_model_name(model, default=DEFAULT_OLLAMA_MODEL) for model in models]:
         if model_name.lower() in available_models:
             continue
-        if status_callback is not None:
-            status_callback(f"Pulling {model_name}...")
-        _pull_ollama_model_via_api(
-            model_name,
-            base_url=root_url,
-            timeout=timeout,
-            proxies=proxies,
-            status_callback=status_callback,
+        raise RuntimeError(
+            f"Ollama model '{model_name}' is not downloaded. "
+            "Please open Settings and click 'Pull Model' first."
         )
-        available_models.add(model_name.lower())
     return root_url
 
 
@@ -591,13 +685,14 @@ def pull_ollama_models(
     timeout: float = 600.0,
     proxies: dict | None = None,
     status_callback: Optional[Callable[[str], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> dict[str, dict[str, Any]]:
     root_url = _normalize_base_url(base_url)
 
     if status_callback is not None:
         status_callback(f"Connecting to {root_url}")
 
-    _ensure_ollama_server(root_url, proxies=proxies, status_callback=status_callback)
+    _ensure_ollama_server(root_url, proxies=proxies, status_callback=status_callback, cancel_event=cancel_event)
     results: dict[str, dict[str, Any]] = {}
     for model_name in [_normalize_ollama_model_name(model, default=DEFAULT_OLLAMA_MODEL) for model in models]:
         results[model_name] = _pull_ollama_model_via_api(

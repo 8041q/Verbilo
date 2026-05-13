@@ -74,8 +74,7 @@
     "settings.ollama_model.not_available": "尚未下载。",
     "settings.ollama_pull.running": "正在拉取 {model}...",
     "settings.ollama_pull.success": "已拉取 {model}。",
-    "settings.ollama_pull.error": "拉取失败：{error}",
-    "settings.ollama_remove.running": "正在删除 {model}...",
+    "settings.ollama_pull.error": "拉取失败：{error}",    "settings.ollama_pull.already_running": "拉取已在进行中，请稍候…",    "settings.ollama_remove.running": "正在删除 {model}...",
     "settings.ollama_remove.success": "已删除 {model}。",
     "settings.ollama_remove.error": "删除失败，请查看日志。",
     "settings.section.google_cloud": "GOOGLE CLOUD",
@@ -182,7 +181,10 @@
     "log.cache_clear_error": "清除缓存时出错：{error}",
     "log.output_path_missing": "错误：输出路径 \"{output}\" 不存在，翻译已取消。",
     "message.missing_dependency_title": "缺少依赖",
-    "message.missing_dependency_body": "图形界面需要 customtkinter。安装命令：\n\n    pip install customtkinter"
+    "message.missing_dependency_body": "图形界面需要 customtkinter。安装命令：\n\n    pip install customtkinter",
+    "message.ollama_not_ready_title": "语义翻译不可用",
+    "message.ollama_not_ready_body": "Ollama 未安装或服务器无法访问。\n\n请打开设置并点击\"拉取模型\"以完成设置。",
+    "message.ollama_server_unreachable_body": "Ollama 已安装，但服务器无法启动。\n\n请手动启动 Ollama 后重试。"
   },
   "language_names": {
     "af": "南非语",
