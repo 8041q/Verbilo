@@ -77,6 +77,9 @@ _HYMT_ZH_LANG_NAMES: dict[str, str] = {
     "zh-tw": "繁体中文", "zh-hant": "繁体中文",
 }
 
+# All language codes supported by HY-MT (targets + ZH source variants).
+_HYMT_SUPPORTED_LANG_CODES: frozenset[str] = frozenset(_HYMT_ZH_LANG_NAMES) | {"zh", "zh-cn"}
+
 
 class _OllamaInstallerBusyError(RuntimeError):
     pass
@@ -103,6 +106,15 @@ def is_translation_only_ollama_model(model: str) -> bool:
 def ollama_supports_non_pdf_translation(model: str) -> bool:
     normalized = _normalize_ollama_model_name(model, default=DEFAULT_OLLAMA_MODEL).lower()
     return normalized.startswith("qwen") or _is_translation_only_model(normalized)
+
+
+def ollama_get_supported_lang_codes(model: str) -> frozenset[str] | None:
+    """Return the set of ISO 639-1 language codes supported by *model*, or
+    ``None`` if the model has no known language restriction (e.g. Qwen)."""
+    normalized = _normalize_ollama_model_name(model, default=DEFAULT_OLLAMA_MODEL).lower()
+    if _is_translation_only_model(normalized):
+        return _HYMT_SUPPORTED_LANG_CODES
+    return None
 
 
 def _has_han_text(text: str) -> bool:

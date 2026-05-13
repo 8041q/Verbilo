@@ -672,6 +672,10 @@ class SearchableComboBox:
             self.set(fallback)
         if self._popup and self._popup.winfo_exists():
             self._close()
+        # Suppress the focus-in open that fires when a dialog closes and focus
+        # returns to this entry after a programmatic refresh.
+        self._suppress_open = True
+        self._frame.after(300, lambda: setattr(self, "_suppress_open", False))
     
 
     def refresh_colors(self):
@@ -3476,12 +3480,25 @@ class App:
         # Non-local engines: original logic
         # Target: filter by engine only (detector doesn't restrict target)
         tgt_filtered = _filter_by_engine(lang_opts, engine_key)
+
+        # Source: intersection of engine-supported and detector-supported
+        src_filtered = _filter_by_engine(_filter_by_detector(lang_opts, detector), engine_key)
+
+        # Ollama post-filter: if a model with a known language restriction is
+        # active, narrow both lists to the languages it actually supports.
+        if self.cfg.get("ollama_enabled"):
+            from ..translators.ollama import ollama_get_supported_lang_codes
+            _ollama_codes = ollama_get_supported_lang_codes(
+                self.cfg.get("ollama_model", "")
+            )
+            if _ollama_codes is not None:
+                tgt_filtered = [(c, n) for c, n in tgt_filtered if c.lower() in _ollama_codes]
+                src_filtered = [(c, n) for c, n in src_filtered if c.lower() in _ollama_codes]
+
         tgt_display = [self._format_language_option(code, name) for code, name in tgt_filtered]
         self._lang_map = {self._format_language_option(code, name): code for code, name in tgt_filtered}
         self.target_lang_box.update_values(tgt_display)
 
-        # Source: intersection of engine-supported and detector-supported
-        src_filtered = _filter_by_engine(_filter_by_detector(lang_opts, detector), engine_key)
         src_display = [self._format_language_option(code, name) for code, name in src_filtered]
         auto_detect_label = self.t("sidebar.auto_detect")
         source_values = [auto_detect_label] + src_display
