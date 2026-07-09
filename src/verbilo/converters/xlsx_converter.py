@@ -1,14 +1,54 @@
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
 from openpyxl.cell.rich_text import CellRichText, TextBlock
+import openpyxl.packaging.manifest as _opxl_manifest
 from typing import Any, Callable
 import logging
+import os
+import os.path
 import threading
 import unicodedata
 import re
+import posixpath
+from zipfile import ZipFile, ZIP_DEFLATED
+from io import BytesIO
 from ..utils import CancelledError
 
 logger = logging.getLogger(__name__)
+
+
+def _patch_openpyxl_mimetypes() -> None:
+    # openpyxl's Manifest._register_mimetypes() KeyErrors when the workbook's zip package contains a file extension it doesn't have a MIME type for
+    known_extra_types = {
+        ".webp": "image/webp",
+        ".wmf": "image/wmf",
+        ".mpo": "image/mpo",
+        ".avif": "image/avif",
+        ".heic": "image/heic",
+        ".heif": "image/heif",
+    }
+    for ext, mime in known_extra_types.items():
+        _opxl_manifest.mimetypes.add_type(mime, ext)
+
+    def _safe_register_mimetypes(self, filenames):
+        for fn in filenames:
+            ext = os.path.splitext(fn)[-1]
+            if not ext:
+                continue
+            try:
+                mime = _opxl_manifest.mimetypes.types_map[True][ext]
+            except KeyError:
+                logger.warning(
+                    "Unknown MIME type for embedded file extension '%s' in XLSX package; "
+                    "defaulting to application/octet-stream", ext,
+                )
+                mime = "application/octet-stream"
+            self.Default.append(_opxl_manifest.FileExtension(ext[1:], mime))
+
+    _opxl_manifest.Manifest._register_mimetypes = _safe_register_mimetypes
+
+
+_patch_openpyxl_mimetypes()
 
 # Control-character pattern: matches C0/C1 control chars except tab, newline, carriage return,
 # plus invisible Unicode format/zero-width characters that can silently corrupt translation.
@@ -29,6 +69,65 @@ _CELL_SEP_SPLIT_RE = re.compile(rf"\s*{re.escape(_CELL_SEP_TOKEN)}\s*")
 # Maximum characters per grouped row before falling back to per-cell.
 _GROUP_MAX_CHARS = 4000
 
+# Symbol-only pattern: matches strings entirely composed of punctuation,
+# symbols, geometric shapes (including "►" U+25B6), etc. with no
+# translatable content.  Sending these to translation APIs causes
+# hallucinations (OPUS-MT) or symbol mangling (Google/DeepL → ">>>").
+_SYMBOL_ONLY_RE = re.compile(
+    r'^[\s'
+    r'\u0021-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u007E'
+    r'\u00A0-\u00BF'
+    r'\u2000-\u206F'
+    r'\u2190-\u21FF'
+    r'\u2300-\u23FF'
+    r'\u2460-\u24FF'
+    r'\u2500-\u257F'
+    r'\u2580-\u259F'
+    r'\u25A0-\u25FF'
+    r'\u2600-\u26FF'
+    r'\u2700-\u27BF'
+    r'\u3000-\u303F'
+    r'\uFE50-\uFE6F'
+    r'\uFF00-\uFF0F\uFF1A-\uFF20\uFF3B-\uFF40\uFF5B-\uFF65'
+    r'\uFF66-\uFFEF'
+    r']+$'
+)
+
+
+def _is_symbol_char(c: str) -> bool:
+    cp = ord(c)
+    return (
+        0x0021 <= cp <= 0x002F or 0x003A <= cp <= 0x0040 or
+        0x005B <= cp <= 0x0060 or 0x007B <= cp <= 0x007E or
+        0x00A0 <= cp <= 0x00BF or
+        0x2000 <= cp <= 0x206F or 0x2190 <= cp <= 0x21FF or
+        0x2300 <= cp <= 0x23FF or 0x2460 <= cp <= 0x24FF or
+        0x2500 <= cp <= 0x257F or 0x2580 <= cp <= 0x259F or
+        0x25A0 <= cp <= 0x25FF or 0x2600 <= cp <= 0x26FF or
+        0x2700 <= cp <= 0x27BF or
+        (0x3000 <= cp <= 0x303F) or
+        0xFE50 <= cp <= 0xFE6F or
+        (0xFF00 <= cp <= 0xFF0F) or
+        0xFF1A <= cp <= 0xFF20 or
+        0xFF3B <= cp <= 0xFF40 or 0xFF5B <= cp <= 0xFF65 or
+        0xFF66 <= cp <= 0xFFEF or
+        c in ' \t\n\r'
+    )
+
+
+def _is_symbol_only(text: str) -> bool:
+    return bool(_SYMBOL_ONLY_RE.match(text))
+
+
+def _strip_symbol_frame(text: str) -> tuple[str, str, str]:
+    i = 0
+    while i < len(text) and _is_symbol_char(text[i]):
+        i += 1
+    j = len(text)
+    while j > i and _is_symbol_char(text[j - 1]):
+        j -= 1
+    return text[:i], text[i:j], text[j:]
+
 
 def _sanitize_text(text: str) -> str:
     # Normalize Unicode and strip problematic control characters
@@ -45,16 +144,155 @@ def _split_grouped_row_translation(text: str) -> list[str]:
     return _CELL_SEP_SPLIT_RE.split(text)
 
 
+def _save_preserving_orphan_rels(wb, output_path: str, input_path: str) -> None:
+    import xml.etree.ElementTree as _ET
+    _RELS_NS = 'http://schemas.openxmlformats.org/package/2006/relationships'
+
+    buf = BytesIO()
+    wb.save(buf)
+
+    original_archive = getattr(wb, 'vba_archive', None)
+    if original_archive is None:
+        with open(output_path, 'wb') as f:
+            f.write(buf.getvalue())
+        return
+
+    # ── 1. Read both archives into memory ─────────────────────────────
+    saved_bytes = buf.getvalue()
+    saved_files: dict[str, bytes] = {}
+    with ZipFile(BytesIO(saved_bytes), 'r') as z:
+        for name in z.namelist():
+            saved_files[name] = z.read(name)
+
+    original_files: dict[str, bytes] = {}
+    for name in original_archive.namelist():
+        original_files[name] = original_archive.read(name)
+
+    # ── 2. Find orphan parts ──────────────────────────────────────────
+    # Parts under xl/ that exist in the original but not in the saved
+    # archive — openpyxl dropped them because it doesn't understand them.
+    orphan_all: dict[str, bytes] = {
+        name: data for name, data in original_files.items()
+        if name.startswith('xl/') and name not in saved_files
+    }
+
+    if not orphan_all:
+        with open(output_path, 'wb') as f:
+            f.write(buf.getvalue())
+        return
+
+    orphan_media = {n: d for n, d in orphan_all.items() if n.startswith('xl/media/')}
+    orphan_parts = {n: d for n, d in orphan_all.items() if not n.startswith('xl/media/')}
+
+    # ── 3. Rebuild the zip with orphan parts injected ─────────────────
+    # Write these separately to avoid duplicates (merge logic below).
+    _WB_RELS = 'xl/_rels/workbook.xml.rels'
+    _CT = '[Content_Types].xml'
+    _deferred = {_WB_RELS, _CT}
+
+    out_buf = BytesIO()
+    with ZipFile(out_buf, 'w', ZIP_DEFLATED) as zout:
+        for name, data in saved_files.items():
+            if name not in _deferred:
+                zout.writestr(name, data)
+        for name, data in orphan_media.items():
+            zout.writestr(name, data)
+        for name, data in orphan_parts.items():
+            zout.writestr(name, data)
+
+        # ── 4. Merge workbook.xml.rels ────────────────────────────────
+        saved_rels = saved_files.get(_WB_RELS, b'')
+        orig_rels = original_files.get(_WB_RELS, b'')
+        wb_rels = saved_rels  # fallback
+        if saved_rels and orig_rels:
+            saved_root = _ET.fromstring(saved_rels)
+            saved_targets = {child.get('Target') for child in saved_root}
+            orig_root = _ET.fromstring(orig_rels)
+            changed = False
+            for child in orig_root:
+                target = child.get('Target')
+                if not target:
+                    continue
+                norm_target = posixpath.normpath(target).replace('\\', '/')
+                orphan_path = f'xl/{norm_target}' if not norm_target.startswith('xl/') else norm_target
+                if orphan_path in orphan_all and target not in saved_targets:
+                    elem = _ET.SubElement(saved_root, f'{{{_RELS_NS}}}Relationship')
+                    elem.set('Id', child.get('Id'))
+                    elem.set('Type', child.get('Type'))
+                    elem.set('Target', child.get('Target'))
+                    saved_targets.add(target)
+                    changed = True
+            if changed:
+                wb_rels = _ET.tostring(saved_root, xml_declaration=True, encoding='UTF-8')
+            else:
+                wb_rels = saved_rels
+        zout.writestr(_WB_RELS, wb_rels)
+
+        # ── 5. Merge [Content_Types].xml ──────────────────────────────
+        saved_ct = saved_files.get(_CT, b'')
+        orig_ct = original_files.get(_CT, b'')
+        ct_xml = saved_ct  # fallback
+        if saved_ct and orig_ct:
+            _CT_NS = 'http://schemas.openxmlformats.org/package/2006/content-types'
+            saved_root = _ET.fromstring(saved_ct)
+            orig_root = _ET.fromstring(orig_ct)
+
+            saved_defaults = {
+                child.get('Extension')
+                for child in saved_root
+                if child.tag.endswith('Default') and child.get('Extension')
+            }
+            saved_overrides = {
+                child.get('PartName')
+                for child in saved_root
+                if child.tag.endswith('Override') and child.get('PartName')
+            }
+            changed = False
+
+            for name in orphan_media:
+                ext = os.path.splitext(name)[-1].lstrip('.')
+                if ext and ext not in saved_defaults:
+                    for child in orig_root:
+                        if child.tag.endswith('Default') and child.get('Extension') == ext:
+                            elem = _ET.SubElement(saved_root, f'{{{_CT_NS}}}Default')
+                            elem.set('Extension', ext)
+                            elem.set('ContentType', child.get('ContentType'))
+                            saved_defaults.add(ext)
+                            changed = True
+                            break
+
+            for name in orphan_parts:
+                part_name = '/' + name.replace('\\', '/')
+                if part_name not in saved_overrides:
+                    for child in orig_root:
+                        if child.tag.endswith('Override') and child.get('PartName') == part_name:
+                            elem = _ET.SubElement(saved_root, f'{{{_CT_NS}}}Override')
+                            elem.set('PartName', part_name)
+                            elem.set('ContentType', child.get('ContentType'))
+                            saved_overrides.add(part_name)
+                            changed = True
+                            break
+
+            if changed:
+                ct_xml = _ET.tostring(saved_root, xml_declaration=True, encoding='UTF-8')
+            else:
+                ct_xml = saved_ct
+        zout.writestr(_CT, ct_xml)
+
+    with open(output_path, 'wb') as f:
+        f.write(out_buf.getvalue())
+
+
 def translate_xlsx(input_path: str, output_path: str, translator: Any, target_lang: str, *, cancel_event: threading.Event | None = None, source_lang: str = "auto", progress_callback: 'Callable[[int, int], None] | None' = None):
     # batch-translate XLSX with row-level contextual grouping.
     # When source_lang=="auto" row grouping is skipped so each cell is its own translation
     # unit, letting the API auto-detect the language per cell.
-    wb = load_workbook(filename=input_path, rich_text=True)
+    wb = load_workbook(filename=input_path, rich_text=True, keep_vba=True)
 
     # --- collect every string cell that is writable, grouped by row ---
-    # Each row group: list of (cell, sanitized_text) pairs
+    # Each row group: list of (cell, core_text, symbol_prefix, symbol_suffix)
     # rich_segs: list of (cell, original_CellRichText, segment_index, sanitized_text)
-    RowGroup = list[tuple[Any, str]]
+    RowGroup = list[tuple[Any, str, str, str]]
     row_groups: list[RowGroup] = []
     current_row: RowGroup = []
     current_row_key: tuple | None = None  # (sheet_title, row_number)
@@ -69,8 +307,17 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
                 val = cell.value
                 if isinstance(val, str) and not val.startswith("="):
                     sanitized = _sanitize_text(val)
-                    if sanitized.strip():
-                        row_cells.append((cell, sanitized))
+                    if not sanitized.strip():
+                        continue
+                    # Skip cells that are entirely symbols (no translatable content)
+                    if _is_symbol_only(sanitized):
+                        continue
+                    # Strip leading/trailing symbol frames to protect them from
+                    # API mangling (e.g. "►" → ">>>" by Google/DeepL).
+                    sym_pref, sym_core, sym_suff = _strip_symbol_frame(sanitized)
+                    if not sym_core.strip():
+                        continue
+                    row_cells.append((cell, sym_core, sym_pref, sym_suff))
                 elif isinstance(val, CellRichText):
                     for seg_idx, seg in enumerate(val):
                         if isinstance(seg, TextBlock):
@@ -92,7 +339,7 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
 
     if not row_groups and not rich_segs:
         logger.warning("No translatable text found in XLSX file '%s'", input_path)
-        wb.save(output_path)
+        _save_preserving_orphan_rels(wb, output_path, input_path)
         return
 
     # --- build translation units: group rows or send individually ---
@@ -107,7 +354,7 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
     group_rows = source_lang != "auto"
 
     for rg in row_groups:
-        row_texts = [t for _, t in rg]
+        row_texts = [t for _, t, _, _ in rg]
         total_chars = sum(len(t) for t in row_texts)
 
         if group_rows and len(rg) > 1 and total_chars <= _GROUP_MAX_CHARS:
@@ -115,10 +362,9 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
             units.append(_CELL_SEP.join(row_texts))
             unit_cells.append(rg)
         else:
-            # Send each cell individually (row too large, single cell, or auto mode)
-            for cell, text in rg:
-                units.append(text)
-                unit_cells.append([(cell, text)])
+            for cell, core, pref, suff in rg:
+                units.append(core)
+                unit_cells.append([(cell, core, pref, suff)])
 
     # --- batch-translate (plain cells + rich-text segments in one call) ---
     plain_count = len(units)
@@ -154,27 +400,21 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
             continue
 
         if len(cells_in_unit) == 1:
-            # Single cell unit — direct assignment
-            cell, orig = cells_in_unit[0]
-            cell.value = tr_text
+            cell, orig, sym_pref, sym_suff = cells_in_unit[0]
+            cell.value = sym_pref + tr_text + sym_suff
         else:
             # Grouped row — split on separator
             parts = _split_grouped_row_translation(tr_text)
             if len(parts) == len(cells_in_unit):
-                for (cell, orig), part in zip(cells_in_unit, parts):
+                for (cell, orig, sym_pref, sym_suff), part in zip(cells_in_unit, parts):
                     translated_part = part.strip() if part else orig
-                    # If the part came back identical to the original the API likely
-                    # skipped it (e.g. mixed-language row — Russian + Chinese grouped
-                    # together; the API translated the dominant language and left the
-                    # minority language segment untouched).  Retry as a standalone call
-                    # so the API sees a clean single-language segment.
                     if translated_part == orig:
                         try:
                             r = translator.translate_text(orig, target_lang)
                             translated_part = r if r is not None else orig
                         except Exception:
                             logger.exception("Per-cell retry failed for unchanged segment")
-                    cell.value = translated_part
+                    cell.value = sym_pref + translated_part + sym_suff
             else:
                 # Separator was consumed/mangled by the model — fall back to
                 # per-cell translation for this row
@@ -182,13 +422,13 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
                     "XLSX row separator mismatch: expected %d, got %d; per-cell fallback",
                     len(cells_in_unit), len(parts),
                 )
-                for cell, orig in cells_in_unit:
+                for cell, orig, sym_pref, sym_suff in cells_in_unit:
                     try:
                         r = translator.translate_text(orig, target_lang)
-                        cell.value = r if r is not None else orig
+                        cell.value = sym_pref + (r if r is not None else orig) + sym_suff
                     except Exception:
                         logger.exception("Per-cell fallback failed")
-                        cell.value = orig
+                        cell.value = sym_pref + orig + sym_suff
                         errors += 1
 
     # --- write results back (rich-text cells) ---
@@ -222,6 +462,7 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
     if cancel_event is not None and cancel_event.is_set():
         raise CancelledError("Translation cancelled before saving XLSX")
 
-    wb.save(output_path)
+    _save_preserving_orphan_rels(wb, output_path, input_path)
     if errors:
         raise RuntimeError(f"Translation completed with {errors} failed cells")
+    
