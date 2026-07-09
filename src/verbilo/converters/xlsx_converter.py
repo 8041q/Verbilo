@@ -70,9 +70,7 @@ _CELL_SEP_SPLIT_RE = re.compile(rf"\s*{re.escape(_CELL_SEP_TOKEN)}\s*")
 _GROUP_MAX_CHARS = 4000
 
 # Symbol-only pattern: matches strings entirely composed of punctuation,
-# symbols, geometric shapes (including "►" U+25B6), etc. with no
-# translatable content.  Sending these to translation APIs causes
-# hallucinations (OPUS-MT) or symbol mangling (Google/DeepL → ">>>").
+# symbols, geometric shapes (including "►" U+25B6)
 _SYMBOL_ONLY_RE = re.compile(
     r'^[\s'
     r'\u0021-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u007E'
@@ -129,6 +127,55 @@ def _strip_symbol_frame(text: str) -> tuple[str, str, str]:
     return text[:i], text[i:j], text[j:]
 
 
+def _strip_symbol_frame_multiline(text: str) -> tuple[str, list[tuple[str, str]]]:
+    # Returns (core_text, frames) where core_text is the per-line-stripped text rejoined with "\n", and frames[i] = (prefix_i, suffix_i) is what was stripped from line i (either may be "").
+    
+    lines = text.split("\n")
+    core_lines: list[str] = []
+    frames: list[tuple[str, str]] = []
+    for line in lines:
+        pref, core, suff = _strip_symbol_frame(line)
+        core_lines.append(core)
+        frames.append((pref, suff))
+    return "\n".join(core_lines), frames
+
+
+def _reattach_symbol_frame_multiline(translated: str, frames: list[tuple[str, str]]) -> str:
+    # Inverse of _strip_symbol_frame_multiline. Reattaches each line's own frame after translation, matching lines positionally.
+    if not frames:
+        return translated
+    t_lines = translated.split("\n")
+    if len(t_lines) == len(frames):
+        return "\n".join(
+            pref + line + suff
+            for line, (pref, suff) in zip(t_lines, frames)
+        )
+    logger.debug(
+        "XLSX symbol-frame line count mismatch: expected %d lines, got %d; "
+        "recovering frame(s) without positional match",
+        len(frames), len(t_lines),
+    )
+
+    unique_frames = set(frames)
+    if len(unique_frames) == 1:
+        pref, suff = frames[0]
+        return "\n".join(pref + line + suff for line in t_lines)
+
+    non_empty_frames = {f for f in unique_frames if f != ("", "")}
+    if len(non_empty_frames) == 1:
+        pref, suff = non_empty_frames.pop()
+        return "\n".join(
+            pref + line + suff if line.strip() else line
+            for line in t_lines
+        )
+
+    prefixes = [p for p, _ in frames if p]
+    suffixes = [s for _, s in frames if s]
+    lead = "".join(dict.fromkeys(prefixes))
+    trail = "".join(dict.fromkeys(suffixes))
+    return lead + translated + trail
+
+
 def _sanitize_text(text: str) -> str:
     # Normalize Unicode and strip problematic control characters
     text = unicodedata.normalize("NFC", text)
@@ -144,12 +191,69 @@ def _split_grouped_row_translation(text: str) -> list[str]:
     return _CELL_SEP_SPLIT_RE.split(text)
 
 
-def _save_preserving_orphan_rels(wb, output_path: str, input_path: str) -> None:
+def _patch_formula_values(zip_bytes: bytes, formula_cache: list[dict[str, object]]) -> bytes | None:
+    # openpyxl strips the <v> element of formula cells during save.  This patches the serialised zip in memory, restoring cached values from the snapshot taken at load time.
+    import xml.etree.ElementTree as _ET
+    _SML_URI = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+    _ET.register_namespace('', _SML_URI)
+    _SML_NS = '{' + _SML_URI + '}'
+
+    out_buf = BytesIO()
+    changed = False
+    with ZipFile(BytesIO(zip_bytes), 'r') as zin:
+        with ZipFile(out_buf, 'w', ZIP_DEFLATED) as zout:
+            for name in zin.namelist():
+                data = zin.read(name)
+                cache_entry: dict[str, object] | None = None
+                if name.startswith('xl/worksheets/sheet') and name.endswith('.xml'):
+                    stem = name[len('xl/worksheets/sheet'):-len('.xml')]
+                    try:
+                        idx = int(stem) - 1
+                        if 0 <= idx < len(formula_cache):
+                            cache_entry = formula_cache[idx]
+                    except (ValueError, IndexError):
+                        pass
+
+                if cache_entry:
+                    root = _ET.fromstring(data)
+                    patched = False
+                    for row in root.findall(f'.//{_SML_NS}row'):
+                        for cell in row.findall(f'{_SML_NS}c'):
+                            f_elem = cell.find(f'{_SML_NS}f')
+                            v_elem = cell.find(f'{_SML_NS}v')
+                            ref = cell.get('r')
+                            if f_elem is not None and ref in cache_entry:
+                                v_ok = v_elem is not None and v_elem.text is not None and v_elem.text.strip() != ''
+                                if not v_ok:
+                                    if v_elem is None:
+                                        v = _ET.SubElement(cell, f'{_SML_NS}v')
+                                    else:
+                                        v = v_elem
+                                    v.text = str(cache_entry[ref])
+                                    patched = True
+                    if patched:
+                        data = _ET.tostring(root, xml_declaration=True, encoding='UTF-8')
+                        changed = True
+                zout.writestr(name, data)
+
+    if not changed:
+        return None
+    return out_buf.getvalue()
+
+
+def _save_preserving_orphan_rels(wb, output_path: str, input_path: str, _formula_cache: list[dict[str, object]] | None = None) -> None:
     import xml.etree.ElementTree as _ET
     _RELS_NS = 'http://schemas.openxmlformats.org/package/2006/relationships'
 
     buf = BytesIO()
     wb.save(buf)
+
+    if _formula_cache:
+        _saved_bytes = buf.getvalue()
+        _patched = _patch_formula_values(_saved_bytes, _formula_cache)
+        if _patched is not None:
+            buf = BytesIO()
+            buf.write(_patched)
 
     original_archive = getattr(wb, 'vba_archive', None)
     if original_archive is None:
@@ -289,14 +393,23 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
     # unit, letting the API auto-detect the language per cell.
     wb = load_workbook(filename=input_path, rich_text=True, keep_vba=True)
 
+    _formula_cache: list[dict[str, object]] = []
+    for _sheet in wb.worksheets:
+        _cache: dict[str, object] = {}
+        for _row in _sheet.iter_rows():
+            for _cell in _row:
+                if _cell.data_type == 'f' and _cell.value is not None:
+                    _cache[_cell.coordinate] = _cell.value
+        _formula_cache.append(_cache)
+
     # --- collect every string cell that is writable, grouped by row ---
     # Each row group: list of (cell, core_text, symbol_prefix, symbol_suffix)
     # rich_segs: list of (cell, original_CellRichText, segment_index, sanitized_text)
-    RowGroup = list[tuple[Any, str, str, str]]
+    RowGroup = list[tuple[Any, str, list[tuple[str, str]]]]
     row_groups: list[RowGroup] = []
     current_row: RowGroup = []
     current_row_key: tuple | None = None  # (sheet_title, row_number)
-    rich_segs: list[tuple[Any, CellRichText, int, str]] = []
+    rich_segs: list[tuple[Any, CellRichText, int, str, list[tuple[str, str]]]] = []
 
     for sheet in wb.worksheets:
         for row in sheet.iter_rows(values_only=False):
@@ -312,12 +425,10 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
                     # Skip cells that are entirely symbols (no translatable content)
                     if _is_symbol_only(sanitized):
                         continue
-                    # Strip leading/trailing symbol frames to protect them from
-                    # API mangling (e.g. "►" → ">>>" by Google/DeepL).
-                    sym_pref, sym_core, sym_suff = _strip_symbol_frame(sanitized)
+                    sym_core, frames = _strip_symbol_frame_multiline(sanitized)
                     if not sym_core.strip():
                         continue
-                    row_cells.append((cell, sym_core, sym_pref, sym_suff))
+                    row_cells.append((cell, sym_core, frames))
                 elif isinstance(val, CellRichText):
                     for seg_idx, seg in enumerate(val):
                         if isinstance(seg, TextBlock):
@@ -326,8 +437,17 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
                             text = seg
                         else:
                             continue
-                        if text and text.strip():
-                            rich_segs.append((cell, val, seg_idx, _sanitize_text(text)))
+                        if not (text and text.strip()):
+                            continue
+                        sanitized = _sanitize_text(text)
+                        if not sanitized.strip():
+                            continue
+                        if _is_symbol_only(sanitized):
+                            continue
+                        sym_core, frames = _strip_symbol_frame_multiline(sanitized)
+                        if not sym_core.strip():
+                            continue
+                        rich_segs.append((cell, val, seg_idx, sym_core, frames))
             if row_cells:
                 row_groups.append(row_cells)
 
@@ -339,7 +459,7 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
 
     if not row_groups and not rich_segs:
         logger.warning("No translatable text found in XLSX file '%s'", input_path)
-        _save_preserving_orphan_rels(wb, output_path, input_path)
+        _save_preserving_orphan_rels(wb, output_path, input_path, _formula_cache)
         return
 
     # --- build translation units: group rows or send individually ---
@@ -354,7 +474,7 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
     group_rows = source_lang != "auto"
 
     for rg in row_groups:
-        row_texts = [t for _, t, _, _ in rg]
+        row_texts = [t for _, t, _ in rg]
         total_chars = sum(len(t) for t in row_texts)
 
         if group_rows and len(rg) > 1 and total_chars <= _GROUP_MAX_CHARS:
@@ -362,13 +482,13 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
             units.append(_CELL_SEP.join(row_texts))
             unit_cells.append(rg)
         else:
-            for cell, core, pref, suff in rg:
+            for cell, core, frames in rg:
                 units.append(core)
-                unit_cells.append([(cell, core, pref, suff)])
+                unit_cells.append([(cell, core, frames)])
 
     # --- batch-translate (plain cells + rich-text segments in one call) ---
     plain_count = len(units)
-    all_units = units + [t for _, _, _, t in rich_segs]
+    all_units = units + [t for _, _, _, t, _ in rich_segs]
     total_units = len(all_units)
     try:
         translated_all = translator.translate_batch(all_units, target_lang, cancel_event=cancel_event)
@@ -400,13 +520,13 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
             continue
 
         if len(cells_in_unit) == 1:
-            cell, orig, sym_pref, sym_suff = cells_in_unit[0]
-            cell.value = sym_pref + tr_text + sym_suff
+            cell, orig, frames = cells_in_unit[0]
+            cell.value = _reattach_symbol_frame_multiline(tr_text, frames)
         else:
             # Grouped row — split on separator
             parts = _split_grouped_row_translation(tr_text)
             if len(parts) == len(cells_in_unit):
-                for (cell, orig, sym_pref, sym_suff), part in zip(cells_in_unit, parts):
+                for (cell, orig, frames), part in zip(cells_in_unit, parts):
                     translated_part = part.strip() if part else orig
                     if translated_part == orig:
                         try:
@@ -414,7 +534,7 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
                             translated_part = r if r is not None else orig
                         except Exception:
                             logger.exception("Per-cell retry failed for unchanged segment")
-                    cell.value = sym_pref + translated_part + sym_suff
+                    cell.value = _reattach_symbol_frame_multiline(translated_part, frames)
             else:
                 # Separator was consumed/mangled by the model — fall back to
                 # per-cell translation for this row
@@ -422,25 +542,25 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
                     "XLSX row separator mismatch: expected %d, got %d; per-cell fallback",
                     len(cells_in_unit), len(parts),
                 )
-                for cell, orig, sym_pref, sym_suff in cells_in_unit:
+                for cell, orig, frames in cells_in_unit:
                     try:
                         r = translator.translate_text(orig, target_lang)
-                        cell.value = sym_pref + (r if r is not None else orig) + sym_suff
+                        cell.value = _reattach_symbol_frame_multiline(r if r is not None else orig, frames)
                     except Exception:
                         logger.exception("Per-cell fallback failed")
-                        cell.value = sym_pref + orig + sym_suff
+                        cell.value = _reattach_symbol_frame_multiline(orig, frames)
                         errors += 1
 
     # --- write results back (rich-text cells) ---
     # Group translated segments by cell so each cell is written exactly once.
     # cell_rich_updates: id(cell) -> (cell, original_CellRichText, {seg_idx: translated_text})
     cell_rich_updates: dict[int, tuple[Any, CellRichText, dict[int, str]]] = {}
-    for (cell, rt, seg_idx, _), tr_text in zip(rich_segs, rich_translated):
+    for (cell, rt, seg_idx, _, frames), tr_text in zip(rich_segs, rich_translated):
         cid = id(cell)
         if cid not in cell_rich_updates:
             cell_rich_updates[cid] = (cell, rt, {})
         if tr_text is not None:
-            cell_rich_updates[cid][2][seg_idx] = tr_text
+            cell_rich_updates[cid][2][seg_idx] = _reattach_symbol_frame_multiline(tr_text, frames)
 
     for cid, (cell, rt, updates) in cell_rich_updates.items():
         if not updates:
@@ -462,7 +582,6 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
     if cancel_event is not None and cancel_event.is_set():
         raise CancelledError("Translation cancelled before saving XLSX")
 
-    _save_preserving_orphan_rels(wb, output_path, input_path)
+    _save_preserving_orphan_rels(wb, output_path, input_path, _formula_cache)
     if errors:
         raise RuntimeError(f"Translation completed with {errors} failed cells")
-    
