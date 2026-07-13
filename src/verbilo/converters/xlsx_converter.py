@@ -527,14 +527,8 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
             parts = _split_grouped_row_translation(tr_text)
             if len(parts) == len(cells_in_unit):
                 for (cell, orig, frames), part in zip(cells_in_unit, parts):
-                    translated_part = part.strip() if part else orig
-                    if translated_part == orig:
-                        try:
-                            r = translator.translate_text(orig, target_lang)
-                            translated_part = r if r is not None else orig
-                        except Exception:
-                            logger.exception("Per-cell retry failed for unchanged segment")
-                    cell.value = _reattach_symbol_frame_multiline(translated_part, frames)
+                  translated_part = part.strip() if part else orig
+                  cell.value = _reattach_symbol_frame_multiline(translated_part, frames)
             else:
                 # Separator was consumed/mangled by the model — fall back to
                 # per-cell translation for this row
