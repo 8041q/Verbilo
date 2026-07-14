@@ -69,6 +69,80 @@ _CELL_SEP_SPLIT_RE = re.compile(rf"\s*{re.escape(_CELL_SEP_TOKEN)}\s*")
 # Maximum characters per grouped row before falling back to per-cell.
 _GROUP_MAX_CHARS = 4000
 
+# ── Protected-term glossary ────────────────────────────────────────────────
+# Uses a bracket pair distinct from the existing ⟨rN⟩/⟨sN⟩ (DOCX/PDF run tags) and ⟪SEP⟫ (row-grouping) markers so the three schemes never collide.
+_GLOSSARY_OPEN = "\u27E6"   # ⟦
+_GLOSSARY_CLOSE = "\u27E7"  # ⟧
+_GLOSSARY_TOKEN_RE = re.compile(re.escape(_GLOSSARY_OPEN) + r"G\d+" + re.escape(_GLOSSARY_CLOSE))
+
+# ISO 4217 currency codes commonly seen in pricing/trade documents.
+_CURRENCY_CODES: frozenset[str] = frozenset({
+    "USD", "EUR", "GBP", "JPY", "CNY", "RMB", "HKD", "AUD", "CAD", "CHF",
+    "SGD", "NZD", "SEK", "NOK", "DKK", "INR", "KRW", "MXN", "BRL", "ZAR",
+    "RUB", "TRY", "AED", "SAR", "THB", "MYR", "IDR", "PHP", "VND", "TWD",
+    "PLN", "CZK", "HUF", "ILS", "EGP", "NGN", "PKR", "BDT", "CLP", "COP",
+})
+
+# Incoterms 2020 delivery terms.
+_INCOTERMS: frozenset[str] = frozenset({
+    "EXW", "FCA", "FAS", "FOB", "CFR", "CIF", "CPT", "CIP", "DAP", "DPU", "DDP",
+})
+
+# Common trade / shipping / packaging abbreviations found on catalog and packing-list spreadsheets.
+_TRADE_ABBREVIATIONS: frozenset[str] = frozenset({
+    "CBM", "CTN", "CTNS", "PCS", "SET", "SETS", "KGS", "MT", "GW", "NW",
+    "QTY", "MOQ", "SKU", "PO", "ETA", "ETD", "FCL", "LCL", "TEU", "HS",
+})
+
+_DEFAULT_GLOSSARY_TERMS: frozenset[str] = _CURRENCY_CODES | _INCOTERMS | _TRADE_ABBREVIATIONS
+_glossary_pattern_cache: dict[frozenset, re.Pattern] = {}
+
+
+def _build_glossary_pattern(extra_terms: frozenset | None) -> re.Pattern | None:
+    terms = _DEFAULT_GLOSSARY_TERMS | extra_terms if extra_terms else _DEFAULT_GLOSSARY_TERMS
+    if not terms:
+        return None
+    cached = _glossary_pattern_cache.get(terms)
+    if cached is not None:
+        return cached
+    # Longest-first so multi-word/longer codes aren't shadowed by shorter ones.
+    ordered = sorted(terms, key=len, reverse=True)
+    pattern = re.compile(r"\b(?:%s)\b" % "|".join(re.escape(t) for t in ordered))
+    _glossary_pattern_cache[terms] = pattern
+    return pattern
+
+
+def _protect_glossary_terms(text: str, extra_terms: frozenset | None) -> tuple[str, dict[str, str]]:
+    # Replace glossary terms in *text* with opaque placeholder tokens
+    pattern = _build_glossary_pattern(extra_terms)
+    if pattern is None:
+        return text, {}
+
+    token_map: dict[str, str] = {}
+    counter = 0
+
+    def _sub(m: re.Match) -> str:
+        nonlocal counter
+        token = f"{_GLOSSARY_OPEN}G{counter}{_GLOSSARY_CLOSE}"
+        token_map[token] = m.group(0)
+        counter += 1
+        return token
+
+    return pattern.sub(_sub, text), token_map
+
+
+def _restore_glossary_terms(text: str, token_map: dict[str, str]) -> str:
+    if not token_map:
+        return text
+    for token, original in token_map.items():
+        text = text.replace(token, original)
+    return text
+
+
+def _glossary_tokens_intact(text: str) -> bool:
+    # True if every placeholder was successfully replaced (none left over
+    return _GLOSSARY_TOKEN_RE.search(text) is None
+
 # Symbol-only pattern: matches strings entirely composed of punctuation,
 # symbols, geometric shapes (including "►" U+25B6)
 _SYMBOL_ONLY_RE = re.compile(
@@ -387,10 +461,12 @@ def _save_preserving_orphan_rels(wb, output_path: str, input_path: str, _formula
         f.write(out_buf.getvalue())
 
 
-def translate_xlsx(input_path: str, output_path: str, translator: Any, target_lang: str, *, cancel_event: threading.Event | None = None, source_lang: str = "auto", progress_callback: 'Callable[[int, int], None] | None' = None):
+def translate_xlsx(input_path: str, output_path: str, translator: Any, target_lang: str, *, cancel_event: threading.Event | None = None, source_lang: str = "auto", progress_callback: 'Callable[[int, int], None] | None' = None, protected_terms: list[str] | None = None):
     # batch-translate XLSX with row-level contextual grouping.
     # When source_lang=="auto" row grouping is skipped so each cell is its own translation
     # unit, letting the API auto-detect the language per cell.
+    extra_glossary_terms = frozenset(t.strip() for t in protected_terms if t and t.strip()) if protected_terms else None
+
     wb = load_workbook(filename=input_path, rich_text=True, keep_vba=True)
 
     _formula_cache: list[dict[str, object]] = []
@@ -468,6 +544,12 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
     units: list[str] = []
     # Map: unit_index -> list of (cell, original_text) to write back
     unit_cells: list[list[tuple[Any, str]]] = []
+    # Parallel to `units`: the raw (unprotected) unit text and its glossary
+    # token map, so we can restore terms after translation and — if a
+    # placeholder got mangled in transit — fall back to translating the
+    # original unprotected text instead of leaking a raw "⟦G0⟧" token.
+    unit_raw_texts: list[str] = []
+    unit_glossary_maps: list[dict[str, str]] = []
 
     # In auto-detect mode do NOT group cells — every cell is its own unit so the
     # translation API sees a single-language segment and can auto-detect correctly.
@@ -479,16 +561,30 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
 
         if group_rows and len(rg) > 1 and total_chars <= _GROUP_MAX_CHARS:
             # Group the row into a single unit with separators
-            units.append(_CELL_SEP.join(row_texts))
+            raw_unit = _CELL_SEP.join(row_texts)
+            protected, gmap = _protect_glossary_terms(raw_unit, extra_glossary_terms)
+            units.append(protected)
+            unit_raw_texts.append(raw_unit)
+            unit_glossary_maps.append(gmap)
             unit_cells.append(rg)
         else:
             for cell, core, frames in rg:
-                units.append(core)
+                protected, gmap = _protect_glossary_terms(core, extra_glossary_terms)
+                units.append(protected)
+                unit_raw_texts.append(core)
+                unit_glossary_maps.append(gmap)
                 unit_cells.append([(cell, core, frames)])
+
+    rich_raw_texts = [t for _, _, _, t, _ in rich_segs]
+    rich_protected_pairs = [_protect_glossary_terms(t, extra_glossary_terms) for t in rich_raw_texts]
+    rich_units = [p for p, _ in rich_protected_pairs]
+    rich_glossary_maps = [g for _, g in rich_protected_pairs]
 
     # --- batch-translate (plain cells + rich-text segments in one call) ---
     plain_count = len(units)
-    all_units = units + [t for _, _, _, t, _ in rich_segs]
+    all_units = units + rich_units
+    all_raw_texts = unit_raw_texts + rich_raw_texts
+    all_glossary_maps = unit_glossary_maps + rich_glossary_maps
     total_units = len(all_units)
     try:
         translated_all = translator.translate_batch(all_units, target_lang, cancel_event=cancel_event)
@@ -507,6 +603,25 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
 
     if progress_callback is not None:
         progress_callback(total_units, total_units)
+
+    # --- restore protected glossary terms ---
+    for i, (tr_text, gmap, raw_text) in enumerate(zip(translated_all, all_glossary_maps, all_raw_texts)):
+        if tr_text is None or not gmap:
+            continue
+        restored = _restore_glossary_terms(tr_text, gmap)
+        if _glossary_tokens_intact(restored):
+            translated_all[i] = restored
+            continue
+        # A placeholder token survived mangled (rare, but possible with some
+        # engines) — re-translate the original unprotected text for just
+        # this unit rather than leaving a raw "⟦G0⟧" token in the output.
+        logger.debug("XLSX glossary token mismatch for unit; re-translating without protection")
+        try:
+            r = translator.translate_text(raw_text, target_lang)
+            translated_all[i] = r if r is not None else raw_text
+        except Exception:
+            logger.exception("Glossary-mismatch fallback translation failed")
+            translated_all[i] = raw_text
 
     plain_translated = translated_all[:plain_count]
     rich_translated = translated_all[plain_count:]

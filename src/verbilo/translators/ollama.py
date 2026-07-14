@@ -481,6 +481,11 @@ def _ensure_ollama_server(
 
     if _wait_for_ollama_server(root_url, timeout=2.0, proxies=proxies):
         return root_url
+    
+    if executable is None:
+        raise RuntimeError(
+            f"Ollama server is not running, and the executable path could not be located to start it."
+        )
 
     if status_callback is not None:
         status_callback("Starting Ollama runtime...")
@@ -753,9 +758,11 @@ class OllamaSemanticTranslator:
         timeout: float = 30.0,
         base_url: str = DEFAULT_OLLAMA_BASE_URL,
         proxies: dict | None = None,
+        domain_hint: str | None = None,
     ) -> None:
         self._model = model
         self._source_lang = source_lang or "auto"
+        self._domain_hint = (domain_hint or "").strip() or None
         self._engine_name = f"ollama-semantic:{model.lower()}:{_OLLAMA_SEMANTIC_CACHE_VERSION}"
         self._base_url = _normalize_base_url(base_url)
         self._session = make_session(
@@ -1094,7 +1101,7 @@ class OllamaSemanticTranslator:
         return normalized
 
     def _semantic_system_prompt(self) -> str:
-        return (
+        prompt = (
             "You are a translation engine for layout-constrained documents. "
             "Output ONLY the translated text, nothing else — no explanations, no notes, no commentary, no alternatives. "
             "Preserve meaning, tone, and document role. Preserve meaningful line breaks. "
@@ -1106,10 +1113,18 @@ class OllamaSemanticTranslator:
             "If the source contains the literal marker ⟪SEP⟫, copy every ⟪SEP⟫ marker to the output unchanged and in the same order. "
             "Numeric placeholder tokens in the form [[N0]], [[N1]], … and unit tokens in the form [[U0]], [[U1]], … must be copied "
             "verbatim into the output in the same position relative to the surrounding translated words. Never translate, remove, or expand them. "
+            "Glossary placeholder tokens in the form ⟦G0⟧, ⟦G1⟧, … mark currency codes, Incoterms, or trade abbreviations that "
+            "have already been protected; copy each one verbatim, in its original position, and never translate, split, or alter it. "
             "When the payload includes capacity_chars and source_visible_chars, treat capacity_chars as the available character budget "
             "for the translation. If source_visible_chars is near or above capacity_chars, use the tightest natural wording possible "
             "without dropping required meaning."
         )
+        if self._domain_hint:
+            prompt += (
+                f" Domain context: {self._domain_hint}. Translate labels and descriptions using the "
+                "standard terminology of that domain rather than a literal word-for-word rendering."
+            )
+        return prompt
 
     def _build_hymt_prompt(self, *, text: str, source_lang: str, target_lang: str) -> str:
         """Build a plain-text prompt for HY-MT translation models.
