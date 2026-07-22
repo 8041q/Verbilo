@@ -35,7 +35,7 @@ _HAN_CHAR_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 
 # Models that only do translation (plain-text prompt, no system message, no JSON).
 # Compared case-insensitively as a prefix match.
-_TRANSLATION_ONLY_MODEL_PREFIXES: frozenset[str] = frozenset({"demonbyron/hy-mt"})
+_TRANSLATION_ONLY_MODEL_PREFIXES: frozenset[str] = frozenset({"demonbyron/hy-mt", "translategemma"})
 
 # Best-effort mapping from ISO 639-1 codes to natural language names used in
 # HY-MT prompt templates.  Unmapped codes fall back to the code itself.
@@ -79,6 +79,26 @@ _HYMT_ZH_LANG_NAMES: dict[str, str] = {
 
 # All language codes supported by HY-MT (targets + ZH source variants).
 _HYMT_SUPPORTED_LANG_CODES: frozenset[str] = frozenset(_HYMT_ZH_LANG_NAMES) | {"zh", "zh-cn"}
+
+# Mapping from Verbilo ISO 639-1 codes to the BCP-47 / CLDR codes expected by
+# TranslateGemma.  Unmapped codes fall back to the code itself.
+_TRANSLATEGEMMA_CODE_MAP: dict[str, str] = {
+    "zh": "zh-Hans", "zh-cn": "zh-Hans", "zh-tw": "zh-Hant",
+    "yue": "zh-Hant",
+}
+
+# Base ISO 639-1 codes supported by TranslateGemma (55 languages).
+_TRANSLATEGEMMA_SUPPORTED_LANG_CODES: frozenset[str] = frozenset({
+    "af", "am", "ar", "az", "be", "bg", "bn", "bs", "ca", "cs", "cy",
+    "da", "de", "el", "en", "eo", "es", "et", "eu", "fa", "fi", "fr",
+    "ga", "gl", "gu", "ha", "he", "hi", "hr", "hu", "hy", "id", "is",
+    "it", "ja", "ka", "kk", "km", "kn", "ko", "ky", "la", "lt", "lv",
+    "mk", "ml", "mn", "mr", "ms", "mt", "my", "ne", "nl", "no", "ny",
+    "om", "pa", "pl", "ps", "pt", "ro", "ru", "rw", "sd", "si", "sk",
+    "sl", "so", "sq", "sr", "sv", "sw", "ta", "te", "tg", "th", "ti",
+    "tl", "tr", "ug", "uk", "ur", "uz", "vi", "wo", "xh", "yi", "yo",
+    "zh", "zu",
+})
 
 
 class _OllamaInstallerBusyError(RuntimeError):
@@ -124,13 +144,15 @@ def is_translation_only_ollama_model(model: str) -> bool:
 
 def ollama_supports_non_pdf_translation(model: str) -> bool:
     normalized = _normalize_ollama_model_name(model, default=DEFAULT_OLLAMA_MODEL).lower()
-    return normalized.startswith("qwen") or _is_translation_only_model(normalized)
+    return normalized.startswith("qwen") or normalized.startswith("mistral") or _is_translation_only_model(normalized)
 
 
 def ollama_get_supported_lang_codes(model: str) -> frozenset[str] | None:
     """Return the set of ISO 639-1 language codes supported by *model*, or
     ``None`` if the model has no known language restriction (e.g. Qwen)."""
     normalized = _normalize_ollama_model_name(model, default=DEFAULT_OLLAMA_MODEL).lower()
+    if normalized.startswith("translategemma"):
+        return _TRANSLATEGEMMA_SUPPORTED_LANG_CODES
     if _is_translation_only_model(normalized):
         return _HYMT_SUPPORTED_LANG_CODES
     return None
@@ -612,8 +634,9 @@ def ensure_ollama_models(
         status_callback=status_callback,
     )
     available_models = _list_ollama_models(root_url, proxies=proxies)
+    available_basenames = {name.split(":")[0] for name in available_models}
     for model_name in [_normalize_ollama_model_name(model, default=DEFAULT_OLLAMA_MODEL) for model in models]:
-        if model_name.lower() in available_models:
+        if model_name.lower().split(":")[0] in available_basenames:
             continue
         raise RuntimeError(
             f"Ollama model '{model_name}' is not downloaded. "
@@ -1015,7 +1038,16 @@ class OllamaSemanticTranslator:
             return text
 
         translation_only = _is_translation_only_model(self._model)
-        if translation_only:
+        is_translategemma = self._model.lower().startswith("translategemma")
+        if translation_only and is_translategemma:
+            user_prompt = self._build_translategemma_prompt(
+                text=text, source_lang=source_lang, target_lang=target_lang,
+            )
+            translated = _run_cancellable(
+                lambda: self._request_translategemma_translation(user_prompt),
+                cancel_event,
+            )
+        elif translation_only:
             user_prompt = self._build_hymt_prompt(text=text, source_lang=source_lang, target_lang=target_lang)
             translated = _run_cancellable(
                 lambda: self._request_hymt_translation(user_prompt),
@@ -1105,7 +1137,7 @@ class OllamaSemanticTranslator:
             "You are a translation engine for layout-constrained documents. "
             "Output ONLY the translated text, nothing else — no explanations, no notes, no commentary, no alternatives. "
             "Preserve meaning, tone, and document role. Preserve meaningful line breaks. "
-            "Chinese source texts are compact; their translations must be equally compact. "
+            "If translating Chinese source, the texts are compact; their translations must be equally compact. "
             "Do not add qualifiers, articles, connectives, or words not implied by the source. "
             "A short source phrase must yield a short target phrase, never a full sentence. "
             "For labels, headings, numbers, or wording-sensitive text, stay close to the source wording. "
@@ -1171,6 +1203,53 @@ class OllamaSemanticTranslator:
         content = re.sub(r"<think>.*?</think>", "", str(payload.get("message", {}).get("content", "")), flags=re.DOTALL).strip()
         if not content:
             logger.warning("HY-MT returned empty content for block; semantic fallback will be used")
+        return content
+
+    def _build_translategemma_prompt(self, *, text: str, source_lang: str, target_lang: str) -> str:
+        """Build the prompt expected by Google TranslateGemma models.
+
+        TranslateGemma requires:  You are a professional {SOURCE_LANG} ({SOURCE_CODE})
+        to {TARGET_LANG} ({TARGET_CODE}) translator. … followed by two blank lines
+        then the source text.
+        """
+        src_lower = (source_lang or "en").lower().strip()
+        tgt_lower = (target_lang or "en").lower().strip()
+        src_code = _TRANSLATEGEMMA_CODE_MAP.get(src_lower, src_lower)
+        tgt_code = _TRANSLATEGEMMA_CODE_MAP.get(tgt_lower, tgt_lower)
+        src_name = _LANG_CODE_TO_NAME.get(src_lower, src_lower)
+        tgt_name = _LANG_CODE_TO_NAME.get(tgt_lower, tgt_lower)
+        return (
+            f"You are a professional {src_name} ({src_code}) to {tgt_name} ({tgt_code}) translator. "
+            f"Your goal is to accurately convey the meaning and nuances of the original {src_name} text "
+            f"while adhering to {tgt_name} grammar, vocabulary, and cultural sensitivities.\n"
+            f"Produce only the {tgt_name} translation, without any additional explanations or commentary. "
+            f"Please translate the following {src_name} text into {tgt_name}:\n"
+            f"\n\n{text}"
+        )
+
+    def _request_translategemma_translation(self, user_prompt: str) -> str:
+        """Send a plain-text user message to a TranslateGemma model."""
+        response = self._session.post(
+            f"{self._base_url}/api/chat",
+            json={
+                "model": self._model,
+                "stream": False,
+                "think": False,
+                "options": {
+                    "temperature": 0.1,
+                    "top_p": 0.95,
+                    "top_k": 64,
+                },
+                "messages": [
+                    {"role": "user", "content": user_prompt},
+                ],
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        content = re.sub(r"<think>.*?</think>", "", str(payload.get("message", {}).get("content", "")), flags=re.DOTALL).strip()
+        if not content:
+            logger.warning("TranslateGemma returned empty content for block; semantic fallback will be used")
         return content
 
     def _request_translation(self, system_prompt: str, user_prompt: str) -> str:

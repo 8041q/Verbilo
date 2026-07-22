@@ -61,7 +61,7 @@
     "settings.section.network": "NETWORK",
     "settings.https_proxy": "HTTPS Proxy",
     "settings.proxy_hint": "e.g. http://127.0.0.1:7890  -  also reads HTTPS_PROXY env var",
-    "settings.section.ollama": "HY-MT / QWEN",
+    "settings.section.ollama": "LOCAL LLM",
     "settings.ollama_enabled": "Enable semantic translation",
     "settings.ollama_base_url": "Server Address",
     "settings.ollama_base_url_hint": "Models runs locally at this address. Only change this if you moved to a different port or machine.",

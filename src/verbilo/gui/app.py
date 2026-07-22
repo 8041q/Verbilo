@@ -1947,7 +1947,7 @@ class App:
         )
         _rrow += 1
 
-        _OLLAMA_MODEL_OPTIONS = ["qwen3.5:4b", "demonbyron/HY-MT1.5-1.8B"]
+        _OLLAMA_MODEL_OPTIONS = ["qwen3.5:4b", "demonbyron/HY-MT1.5-1.8B", "translategemma:4b", "mistral:7b"]
         _saved_ollama_model = self.cfg.get("ollama_model", "qwen3.5:4b")
         if _saved_ollama_model not in _OLLAMA_MODEL_OPTIONS:
             _saved_ollama_model = _OLLAMA_MODEL_OPTIONS[0]
@@ -1971,15 +1971,25 @@ class App:
             btn.pack(side=tk.LEFT, padx=(0, 6))
             return btn
 
-        _ollama_model_btn_qwen   = _make_ollama_model_btn(_ollama_model_frame, "Qwen3.5 4B",    "qwen3.5:4b")
-        _ollama_model_btn_hymt  = _make_ollama_model_btn(_ollama_model_frame, "HY-MT 1.5 1.8B", "demonbyron/HY-MT1.5-1.8B")
+        _ollama_row1 = ctk.CTkFrame(_ollama_model_frame, fg_color="transparent")
+        _ollama_row1.pack(fill="x", pady=(0, 4))
+
+        _ollama_row2 = ctk.CTkFrame(_ollama_model_frame, fg_color="transparent")
+        _ollama_row2.pack(fill="x")
+
+        _ollama_model_btn_qwen       = _make_ollama_model_btn(_ollama_row1, "Qwen3.5 4B",        "qwen3.5:4b")
+        _ollama_model_btn_hymt       = _make_ollama_model_btn(_ollama_row1, "HY-MT 1.5 1.8B",    "demonbyron/HY-MT1.5-1.8B")
+        _ollama_model_btn_tgemma     = _make_ollama_model_btn(_ollama_row2, "TranslateGemma 4B", "translategemma:4b")
+        _ollama_model_btn_mistral    = _make_ollama_model_btn(_ollama_row2, "Mistral 7B",        "mistral:7b")
 
         def _refresh_ollama_model_btns():
             p_now = theme.get()
             selected = ollama_model_var.get()
             for btn, val in (
-                (_ollama_model_btn_qwen,  "qwen3.5:4b"),
-                (_ollama_model_btn_hymt, "demonbyron/HY-MT1.5-1.8B"),
+                (_ollama_model_btn_qwen,     "qwen3.5:4b"),
+                (_ollama_model_btn_hymt,     "demonbyron/HY-MT1.5-1.8B"),
+                (_ollama_model_btn_tgemma,   "translategemma:4b"),
+                (_ollama_model_btn_mistral,  "mistral:7b"),
             ):
                 if val == selected:
                     btn.configure(

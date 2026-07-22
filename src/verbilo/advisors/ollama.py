@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Literal
 
 from .base import AdvisorBase, AdvisorDecision, ContentHint
 from ..translators.http_session import make_session
@@ -11,7 +10,7 @@ from ..translators.http_session import make_session
 class OllamaAdvisor(AdvisorBase):
     def __init__(
         self,
-        model: Literal["qwen3.5:4b"] = "qwen3.5:4b",
+        model: str = "qwen3.5:4b",
         base_url: str = "http://127.0.0.1:11434",
         timeout: float = 20.0,
         proxies: dict | None = None,

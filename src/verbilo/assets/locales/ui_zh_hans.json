@@ -61,7 +61,7 @@
     "settings.section.network": "网络",
     "settings.https_proxy": "HTTPS 代理",
     "settings.proxy_hint": "例如 http://127.0.0.1:7890  -  也会读取 HTTPS_PROXY 环境变量",
-    "settings.section.ollama": "HY-MT / QWEN",
+    "settings.section.ollama": "本地大模型",
     "settings.ollama_enabled": "开启语义翻译",
     "settings.ollama_base_url": "服务器地址",
     "settings.ollama_base_url_hint": "模型在此地址本地运行。仅当您更换了端口或机器时才需更改。",
