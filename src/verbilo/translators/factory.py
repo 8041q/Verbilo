@@ -6,6 +6,7 @@ import logging
 from typing import Optional
 
 from .base import Translator
+from ..utils import ConfigurationError
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,12 @@ class TranslatorFactory:
         local_model_dir: str = "",
     ) -> Translator:
         engine = (engine or "google").strip().lower()
+        supported_engines = {
+            "google", "google-cloud", "google_cloud", "google-cloud-v3",
+            "azure", "deepl", "deepl-free", "deepl-pro", "baidu", "local",
+        }
+        if engine not in supported_engines:
+            raise ConfigurationError(f"Unsupported translation engine: {engine}")
 
         # --- Local offline (OPUS-MT via CTranslate2) ---
         if engine == "local":
@@ -58,8 +65,7 @@ class TranslatorFactory:
         # --- Microsoft Azure Translator ---
         if engine == "azure":
             if not azure_key or not azure_region:
-                logger.error("Azure engine selected but api_key/region not provided")
-                return IdentityTranslator()
+                raise ConfigurationError("Azure requires both a subscription key and region.")
             from .azure import AzureTranslatorWrapper
             return AzureTranslatorWrapper(
                 api_key=azure_key, region=azure_region,
@@ -70,8 +76,7 @@ class TranslatorFactory:
         # --- DeepL Free / Pro ---
         if engine in ("deepl", "deepl-free", "deepl-pro"):
             if not deepl_api_key:
-                logger.error("DeepL engine selected but api_key not provided")
-                return IdentityTranslator()
+                raise ConfigurationError("DeepL requires an API key.")
             from .deepl import DeepLTranslatorWrapper
             return DeepLTranslatorWrapper(
                 api_key=deepl_api_key,
@@ -83,8 +88,7 @@ class TranslatorFactory:
         # --- Baidu Translate (Standard or Premium tier) ---
         if engine == "baidu":
             if not baidu_appid or not baidu_appkey:
-                logger.error("Baidu engine selected but appid/appkey not provided")
-                return IdentityTranslator()
+                raise ConfigurationError("Baidu requires an App ID and App Key.")
             from .baidu import BaiduTranslatorWrapper
             return BaiduTranslatorWrapper(
                 appid=baidu_appid, appkey=baidu_appkey,
@@ -96,8 +100,7 @@ class TranslatorFactory:
         # --- Google Cloud Translation API v3 (Advanced) ---
         if engine == "google-cloud-v3":
             if not google_project_id:
-                logger.error("Google Cloud v3 engine selected but project_id not provided")
-                return IdentityTranslator()
+                raise ConfigurationError("Google Cloud v3 requires a project ID.")
             return GoogleCloudV3TranslatorWrapper(
                 project_id=google_project_id,
                 sa_json=google_sa_json,
@@ -108,15 +111,13 @@ class TranslatorFactory:
         # --- Google Cloud Translation API v2 (Basic) ---
         if engine in ("google-cloud", "google_cloud"):
             if not google_api_key:
-                logger.warning("Google Cloud engine selected but no API key — falling back to free Google")
-                engine = "google"
-            else:
-                return GoogleCloudTranslatorWrapper(
-                    api_key=google_api_key,
-                    source_lang=source_lang,
-                    detector=detector,
-                    proxies=proxies,
-                )
+                raise ConfigurationError("Google Cloud v2 requires an API key.")
+            return GoogleCloudTranslatorWrapper(
+                api_key=google_api_key,
+                source_lang=source_lang,
+                detector=detector,
+                proxies=proxies,
+            )
 
         # --- Google Translate (free mobile scraper, default) ---
         if name and name.lower() == "identity":
@@ -127,9 +128,7 @@ class TranslatorFactory:
                 source_lang=source_lang, detector=detector,
                 proxies=proxies,
             )
-        except Exception:
-            logger.warning(
-                "deep_translator is not available — returning IdentityTranslator "
-                "(text will NOT be translated). Install it with: pip install deep-translator"
-            )
-            return IdentityTranslator()
+        except Exception as exc:
+            raise ConfigurationError(
+                "Google Translate support is unavailable. Install deep-translator."
+            ) from exc

@@ -60,13 +60,6 @@ cd src
 python -m launch
 ```
 
-3. If using GUI, and errors for UI helpers or icons appear:
-
-```bash
-pip install customtkinter
-pip install pytablericons Pillow
-```
-
 ***
 
 ### GUI translation engines & network settings
@@ -104,7 +97,7 @@ Verbilo can use local Ollama models as the translation engine for DOCX, XLSX, an
 
 **Qwen** is a general-purpose LLM. For PDF, it first classifies each block to decide which need layout-constrained translation and which can go to the primary engine - giving smarter results on complex layouts. For DOCX/XLSX it also acts as the primary translator.
 
-> Ollama is installed automatically on first use. Models are downloaded on first translation and stored in `%USERPROFILE%\.ollama\models\` (Windows), outside the app folder.
+> Install Ollama from [ollama.com/download](https://ollama.com/download) before enabling it. Verbilo can then download selected models into `%USERPROFILE%\.ollama\models\` (Windows), outside the app folder.
 
 
 
@@ -188,7 +181,6 @@ Troubleshooting:
 
 - **Python**: 3.12+  
 - **Install (has all)**: `pip install -r requirements.txt`  
-- GUI extras: `pip install customtkinter pytablericons Pillow`  
 - Detection engines:
   - Lingua: high accuracy for short strings (heavier).
   - FastText: very fast, good balance.

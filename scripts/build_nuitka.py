@@ -24,7 +24,7 @@ def write_version_from_pyproject():
         return
     build_date = (
         data.get("project", {}).get("build_date")
-        or poetry.get("build_date")
+        or data.get("tool", {}).get("verbilo", {}).get("build_date")
         or ""
     )
     target = root / "src" / "verbilo" / "_version.py"

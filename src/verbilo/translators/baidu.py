@@ -8,7 +8,7 @@ import types
 from typing import Optional, Dict, Any
 from .base import Translator
 from .http_session import make_session, resolve_proxies, is_transient_error
-from ..utils import CancelledError
+from ..utils import CancelledError, TranslationFailedError
 import logging
 
 logger = logging.getLogger(__name__)
@@ -199,13 +199,15 @@ class BaiduTranslatorWrapper:
             return result
         except Exception:
             logger.exception("Baidu segment translation failed for target '%s'", target_lang)
-            return text
+            raise TranslationFailedError("Baidu failed to translate a document segment")
 
     # ----- single-item convenience ----- #
 
     def translate_text(self, text: str, target_lang: str) -> str:
-        if not self._impl_cls or not text or not text.strip():
+        if not text or not text.strip():
             return text
+        if not self._impl_cls:
+            raise TranslationFailedError("Baidu Translate support is unavailable")
         if self._source_lang != "auto":
             if self._SEGMENT_RE.search(text):
                 return self._translate_segments(text, target_lang)
@@ -254,7 +256,7 @@ class BaiduTranslatorWrapper:
         cancel_event: Optional[threading.Event] = None,
     ) -> list[str]:
         if not self._impl_cls:
-            return list(texts)
+            raise TranslationFailedError("Baidu Translate support is unavailable")
 
         results: list[str] = list(texts)
         tgt_cache = self._cache.setdefault(target_lang, {})
@@ -363,6 +365,7 @@ class BaiduTranslatorWrapper:
                     if not is_transient_error(exc):
                         raise
                     logger.exception("Baidu per-item translation failed")
+                    raise TranslationFailedError("Baidu failed to translate a document segment") from exc
 
         return results
 
@@ -427,6 +430,7 @@ class BaiduTranslatorWrapper:
                         raise
                     except Exception:
                         logger.exception("Baidu per-item fallback failed")
+                        raise TranslationFailedError("Baidu failed to translate a document segment")
         except CancelledError:
             raise
         except Exception:
@@ -447,6 +451,7 @@ class BaiduTranslatorWrapper:
                     raise
                 except Exception:
                     logger.exception("Baidu per-item fallback also failed")
+                    raise TranslationFailedError("Baidu failed to translate a document segment")
 
     @staticmethod
     def _make_chunks(items: list[tuple[str, list[int]]]) -> list[list[tuple[str, list[int]]]]:

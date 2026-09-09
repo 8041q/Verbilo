@@ -14,7 +14,7 @@ from typing import Optional, Dict
 
 from .base import Translator, has_inline_tags, unicode_tags_to_html, html_tags_to_unicode
 from .http_session import make_session, is_transient_error
-from ..utils import CancelledError
+from ..utils import CancelledError, TranslationFailedError
 import logging
 
 logger = logging.getLogger(__name__)
@@ -226,7 +226,7 @@ class DeepLTranslatorWrapper:
             return result
         except Exception:
             logger.exception("DeepL single translation failed for target '%s'", target_lang)
-            return text
+            raise TranslationFailedError("DeepL failed to translate a document segment")
 
     # ── Public interface (Translator protocol) ────────────────────────────────
 
@@ -402,6 +402,7 @@ class DeepLTranslatorWrapper:
                     raise
                 except Exception:
                     logger.exception("DeepL per-item fallback also failed")
+                    raise TranslationFailedError("DeepL failed to translate a document segment")
             return
         mid = len(chunk) // 2
         for half in (chunk[:mid], chunk[mid:]):

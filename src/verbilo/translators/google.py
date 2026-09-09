@@ -8,7 +8,7 @@ import threading
 from typing import Optional, Dict, Any
 from .base import Translator
 from .http_session import make_session, resolve_proxies, is_transient_error
-from ..utils import CancelledError
+from ..utils import CancelledError, TranslationFailedError
 import logging
 
 logger = logging.getLogger(__name__)
@@ -191,13 +191,15 @@ class DeepTranslatorWrapper:
             return result
         except Exception:
             logger.exception("DeepTranslator segment failed for target '%s'", target_lang)
-            return text
+            raise TranslationFailedError("Google failed to translate a document segment")
 
     # ----- single-item convenience ----- #
 
     def translate_text(self, text: str, target_lang: str) -> str:
-        if not self._impl_cls or not text or not text.strip():
+        if not text or not text.strip():
             return text
+        if not self._impl_cls:
+            raise TranslationFailedError("Google Translate support is unavailable")
         # When a specific source language is set, handle mixed-language cells
         # by splitting on / and newlines and translating only matching segments.
         if self._source_lang != "auto":
@@ -244,7 +246,7 @@ class DeepTranslatorWrapper:
     ) -> list[str]:
         # batches requests; empty strings and already-target-lang text pass through
         if not self._impl_cls:
-            return list(texts)
+            raise TranslationFailedError("Google Translate support is unavailable")
 
         # copy originals so untouched indices keep their original text
         results: list[str] = list(texts)
@@ -384,6 +386,7 @@ class DeepTranslatorWrapper:
                     raise
                 except Exception:
                     logger.exception("Per-item fallback also failed")
+                    raise TranslationFailedError("Google failed to translate a document segment")
             return
         mid = len(chunk) // 2
         for half in (chunk[:mid], chunk[mid:]):
@@ -533,7 +536,7 @@ class GoogleCloudTranslatorWrapper:
             return result
         except Exception:
             logger.exception("Google Cloud single translation failed for target '%s'", target_lang)
-            return text
+            raise TranslationFailedError("Google Cloud failed to translate a document segment")
 
     # --- public interface (Translator protocol) ----------------------------
 
@@ -689,6 +692,7 @@ class GoogleCloudTranslatorWrapper:
                     raise
                 except Exception:
                     logger.exception("Cloud per-item fallback also failed")
+                    raise TranslationFailedError("Google Cloud failed to translate a document segment")
             return
         mid = len(chunk) // 2
         for half in (chunk[:mid], chunk[mid:]):
@@ -840,7 +844,7 @@ class GoogleCloudV3TranslatorWrapper:
             return result
         except Exception:
             logger.exception("Google Cloud v3 single translation failed for target '%s'", target_lang)
-            return text
+            raise TranslationFailedError("Google Cloud v3 failed to translate a document segment")
 
     # ── Public interface (Translator protocol) ───────────────────────────────────────
 
@@ -1004,6 +1008,7 @@ class GoogleCloudV3TranslatorWrapper:
                     raise
                 except Exception:
                     logger.exception("Google Cloud v3 per-item fallback also failed")
+                    raise TranslationFailedError("Google Cloud v3 failed to translate a document segment")
             return
         mid = len(chunk) // 2
         for half in (chunk[:mid], chunk[mid:]):

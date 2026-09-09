@@ -51,6 +51,7 @@ class OpusMTTranslator:
     # Offline OPUS-MT translator backed by CTranslate2 + SentencePiece.
 
     _engine_name = "local"
+    _CACHE_VERSION = "v2"
     _SEGMENT_RE = re.compile(r'(\n|\r\n|\r|/)')
 
     def __init__(
@@ -84,7 +85,11 @@ class OpusMTTranslator:
         pair_dir = self._model_dir / key
 
         # Decision 3: check sentinel before attempting to load.
-        if not (pair_dir / _SENTINEL).exists():
+        required_files = ("model.bin", "source.spm", "target.spm")
+        if not (pair_dir / _SENTINEL).exists() or any(
+            not (pair_dir / filename).is_file() or (pair_dir / filename).stat().st_size <= 0
+            for filename in required_files
+        ):
             raise FileNotFoundError(
                 f"OPUS-MT model '{key}' is missing or incomplete at {pair_dir}. "
                 f"Run: python scripts/download_models.py opus-mt {src} {tgt}"
@@ -218,13 +223,14 @@ class OpusMTTranslator:
     # Caching wrapper (L1 dict + L2 SQLite)
      
     def _cached_translate(self, text: str, src: str, tgt: str) -> str:
-        tgt_cache = self._cache.setdefault(tgt, {})
+        cache_scope = f"{src.lower()}:{tgt.lower()}"
+        tgt_cache = self._cache.setdefault(cache_scope, {})
         if text in tgt_cache:
             return tgt_cache[text]
         # L2 SQLite lookup
         try:
             from .cache import get_cache
-            cached = get_cache().get(self._engine_name, text, tgt)
+            cached = get_cache().get(self._cache_engine(src, tgt), text, tgt)
             if cached is not None:
                 tgt_cache[text] = cached
                 return cached
@@ -235,10 +241,86 @@ class OpusMTTranslator:
         # L2 write
         try:
             from .cache import get_cache
-            get_cache().put(self._engine_name, text, tgt, result)
+            get_cache().put(self._cache_engine(src, tgt), text, tgt, result)
         except Exception:
             pass
         return result
+
+    def _cache_engine(self, src: str, tgt: str) -> str:
+        # Keep model-pair results isolated from one another and old cache data
+        return f"{self._engine_name}:{src.lower()}-{tgt.lower()}:{self._CACHE_VERSION}"
+
+    def _translate_auto_batch(
+        self,
+        texts: list[str],
+        target_lang: str,
+        cancel_event: Optional[threading.Event],
+    ) -> list[str]:
+        # Detect every unit and translate homogeneous language buckets.
+
+        results = list(texts)
+        buckets: dict[str, dict[str, list[int]]] = {}
+        for index, text in enumerate(texts):
+            if cancel_event is not None and cancel_event.is_set():
+                raise CancelledError("Translation cancelled")
+            if not text or not text.strip():
+                continue
+            src = self._resolve_src(text)
+            buckets.setdefault(src, {}).setdefault(text, []).append(index)
+
+        for src, unique_texts in buckets.items():
+            cache_scope = f"{src.lower()}:{target_lang.lower()}"
+            l1 = self._cache.setdefault(cache_scope, {})
+            pending: dict[str, list[int]] = {}
+            for text, indices in unique_texts.items():
+                cached = l1.get(text)
+                if cached is not None:
+                    for index in indices:
+                        results[index] = cached
+                else:
+                    pending[text] = indices
+
+            if pending:
+                try:
+                    from .cache import get_cache
+                    l2_hits = get_cache().get_batch(
+                        self._cache_engine(src, target_lang), list(pending), target_lang,
+                    )
+                except Exception:
+                    l2_hits = {}
+                for text, translated in l2_hits.items():
+                    l1[text] = translated
+                    for index in pending.pop(text, []):
+                        results[index] = translated
+
+            if not pending:
+                continue
+
+            translator, sp_source, sp_target = self._load_model(src, target_lang)
+            saved: list[tuple[str, str]] = []
+            items = list(pending.items())
+            for start in range(0, len(items), _BATCH_SIZE):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CancelledError("Translation cancelled")
+                chunk = items[start:start + _BATCH_SIZE]
+                tokenized = [self._tokenize(sp_source, text) for text, _ in chunk]
+                outputs = self._translate_tokens(translator, tokenized, src=src, tgt=target_lang)
+                if len(outputs) != len(chunk):
+                    raise RuntimeError("Local translator returned an incomplete batch")
+                for (text, indices), tokens in zip(chunk, outputs):
+                    translated = self._detokenize(sp_target, tokens)
+                    if not translated:
+                        raise RuntimeError("Local translator returned an empty translation")
+                    l1[text] = translated
+                    saved.append((text, translated))
+                    for index in indices:
+                        results[index] = translated
+            try:
+                from .cache import get_cache
+                get_cache().put_batch(self._cache_engine(src, target_lang), saved, target_lang)
+            except Exception:
+                pass
+        return results
 
      
     # Public interface — Translator protocol
@@ -264,19 +346,22 @@ class OpusMTTranslator:
         *,
         cancel_event: Optional[threading.Event] = None,
     ) -> list[str]:
-        """Translate a list of strings, returning one result per input.
+        # Translate a list of strings, returning one result per input.
 
-        When ``source_lang`` is ``"auto"``, the source language is detected
-        **once** from the first non-empty text and used for the entire batch.
-        """
+        # When 'source_lang' is 'auto', each non-empty unit is detected and grouped with units
+        # that use the same installed source-to-target model.
         if not texts:
             return []
+
+        if self._source_lang == "auto":
+            return self._translate_auto_batch(texts, target_lang, cancel_event)
 
         results: list[str] = list(texts)
 
         # Decision 1: resolve source language once for the whole batch.
         src = self._resolve_batch_src(texts)
-        tgt_cache = self._cache.setdefault(target_lang, {})
+        cache_scope = f"{src.lower()}:{target_lang.lower()}"
+        tgt_cache = self._cache.setdefault(cache_scope, {})
 
         # Collect items that need translation.
         to_translate: list[tuple[int, str]] = []
@@ -303,7 +388,7 @@ class OpusMTTranslator:
         try:
             from .cache import get_cache
             l2_hits = get_cache().get_batch(
-                self._engine_name, [t for _, t in to_translate], target_lang,
+                self._cache_engine(src, target_lang), [t for _, t in to_translate], target_lang,
             )
             if l2_hits:
                 still: list[tuple[int, str]] = []
@@ -354,7 +439,7 @@ class OpusMTTranslator:
         if l2_pairs:
             try:
                 from .cache import get_cache
-                get_cache().put_batch(self._engine_name, l2_pairs, target_lang)
+                get_cache().put_batch(self._cache_engine(src, target_lang), l2_pairs, target_lang)
             except Exception:
                 pass
 

@@ -364,55 +364,10 @@ def _install_ollama_windows(
     *,
     cancel_event: Optional[threading.Event] = None,
 ) -> None:
-    if status_callback is not None:
-        status_callback("Installing Ollama runtime...")
-
-    command = [
-        "powershell.exe",
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        f"irm {_OLLAMA_INSTALL_URL} | iex",
-    ]
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if platform.system().lower() == "windows" else 0
-    try:
-        proc = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            creationflags=creationflags,
-        )
-    except OSError as exc:
-        raise RuntimeError(f"Could not start PowerShell to install Ollama: {exc}") from exc
-
-    # Watchdog thread: terminates the installer process immediately when the
-    # caller signals cancellation (e.g. the settings window was closed).
-    if cancel_event is not None:
-        def _watchdog() -> None:
-            cancel_event.wait()
-            proc.terminate()
-        threading.Thread(target=_watchdog, daemon=True).start()
-
-    output_lines: list[str] = []
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        stripped = line.rstrip("\r\n")
-        if stripped:
-            output_lines.append(stripped)
-            if status_callback is not None:
-                status_callback(f"Installing: {stripped}")
-    proc.wait()
-
-    if cancel_event is not None and cancel_event.is_set():
-        raise RuntimeError("Ollama installation was cancelled.")
-
-    if proc.returncode != 0:
-        detail = "\n".join(output_lines[-5:]) if output_lines else f"exit code {proc.returncode}"
-        if _is_ollama_installer_busy_error(detail):
-            raise _OllamaInstallerBusyError(detail)
-        raise RuntimeError(f"Ollama installation failed: {detail}")
+    raise OllamaNotInstalledError(
+        "Ollama is not installed. Install it from https://ollama.com/download, "
+        "then return here to download a model."
+    )
 
 
 def _build_ollama_child_env(base_url: str, proxies: dict | None) -> dict[str, str]:
@@ -474,32 +429,16 @@ def _ensure_ollama_server(
 
     if not _is_local_ollama_url(root_url):
         raise RuntimeError(
-            f"Cannot reach Ollama at {root_url}. Automatic install/start is only supported for local URLs."
+            f"Cannot reach Ollama at {root_url}. Automatic start is only supported for local URLs."
         )
 
     executable = _find_ollama_executable()
     if executable is None:
         if platform.system().lower() != "windows":
             raise RuntimeError(
-                f"Cannot reach Ollama at {root_url}, and automatic installation is only supported on Windows."
+                f"Cannot reach Ollama at {root_url}. Install Ollama manually, then try again."
             )
-        try:
-            _install_ollama_windows(status_callback=status_callback, cancel_event=cancel_event)
-        except _OllamaInstallerBusyError:
-            if status_callback is not None:
-                status_callback("Ollama installer already running; waiting for it to finish...")
-        executable = _wait_for_ollama_installation(
-            root_url,
-            timeout=_OLLAMA_INSTALL_WAIT_TIMEOUT,
-            proxies=proxies,
-            status_callback=status_callback,
-        )
-        if executable is None and not _is_ollama_server_reachable(root_url, timeout=2.0, proxies=proxies):
-            raise RuntimeError(
-                "Ollama installation is still in progress or did not finish in time. Please wait a moment and try again."
-            )
-        if _wait_for_ollama_server(root_url, timeout=5.0, proxies=proxies):
-            return root_url
+        _install_ollama_windows(status_callback=status_callback, cancel_event=cancel_event)
 
     if _wait_for_ollama_server(root_url, timeout=2.0, proxies=proxies):
         return root_url

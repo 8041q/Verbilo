@@ -154,7 +154,7 @@
     "file_dialog.select_folder": "Select folder containing files",
     "file_dialog.select_output_folder": "Select output folder",
     "message.unsupported_files_title": "Unsupported files",
-    "message.unsupported_files_body": "Some selected files were not supported and were ignored.\n\nSupported types: .docx, .pdf, .xlsx, .xls",
+    "message.unsupported_files_body": "Some selected files were not supported and were ignored.\n\nSupported types: .docx, .pdf, .xlsx",
     "message.no_files_title": "No files",
     "message.no_files_found_body": "No supported files found in {path}",
     "message.missing_language_title": "Missing language",

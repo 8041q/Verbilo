@@ -152,7 +152,7 @@
     "file_dialog.select_folder": "选择包含文件的文件夹",
     "file_dialog.select_output_folder": "选择输出文件夹",
     "message.unsupported_files_title": "不支持的文件",
-    "message.unsupported_files_body": "部分所选文件不受支持，已被忽略。\n\n支持的类型：.docx、.pdf、.xlsx、.xls",
+    "message.unsupported_files_body": "部分所选文件不受支持，已被忽略。\n\n支持的类型：.docx、.pdf、.xlsx",
     "message.no_files_title": "没有文件",
     "message.no_files_found_body": "在 {path} 中未找到受支持的文件",
     "message.missing_language_title": "缺少语言",

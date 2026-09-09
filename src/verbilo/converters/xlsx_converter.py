@@ -586,8 +586,11 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
     all_raw_texts = unit_raw_texts + rich_raw_texts
     all_glossary_maps = unit_glossary_maps + rich_glossary_maps
     total_units = len(all_units)
+    translation_errors = 0
     try:
         translated_all = translator.translate_batch(all_units, target_lang, cancel_event=cancel_event)
+        if len(translated_all) != total_units:
+            raise ValueError("translate_batch returned the wrong number of results")
     except CancelledError:
         raise
     except Exception:
@@ -600,6 +603,7 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
             except Exception:
                 logger.exception("Per-item fallback also failed")
                 translated_all.append(t)
+                translation_errors += 1
 
     if progress_callback is not None:
         progress_callback(total_units, total_units)
@@ -622,12 +626,13 @@ def translate_xlsx(input_path: str, output_path: str, translator: Any, target_la
         except Exception:
             logger.exception("Glossary-mismatch fallback translation failed")
             translated_all[i] = raw_text
+            translation_errors += 1
 
     plain_translated = translated_all[:plain_count]
     rich_translated = translated_all[plain_count:]
 
     # --- write results back (plain cells) ---
-    errors = 0
+    errors = translation_errors
     for cells_in_unit, tr_text in zip(unit_cells, plain_translated):
         if tr_text is None:
             # Translation returned None — keep originals

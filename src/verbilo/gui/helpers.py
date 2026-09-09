@@ -10,8 +10,9 @@ from urllib.parse import urlparse
 
 from ..main import translate_file
 from ..utils import CancelledError
+from .config import redact_sensitive_text
 
-SUPPORTED_EXTS = (".docx", ".pdf", ".xlsx", ".xls")
+SUPPORTED_EXTS = (".docx", ".pdf", ".xlsx")
 
 
 def _normalize_ollama_config(cfg: Optional[dict[str, Any]]) -> dict[str, Any]:
@@ -262,7 +263,7 @@ class Worker:
                 primary_translator = None
                 if suffix == ".pdf":
                     advisor, semantic_translator = _get_pdf_ollama_components()
-                elif suffix in {".docx", ".xlsx", ".xls"} and normalized_ollama_config["supports_non_pdf"]:
+                elif suffix in {".docx", ".xlsx"} and normalized_ollama_config["supports_non_pdf"]:
                     primary_translator = _get_ollama_translator()
                 out = translate_file(
                     f, target_lang, output_dir, translator_name,
@@ -314,7 +315,7 @@ class Worker:
                 elapsed = time.perf_counter() - t0
                 progress_cb(f, "error", elapsed)
                 tb = traceback.format_exc()
-                log_cb(f"Error translating {name}: {e}\n{tb}")
+                log_cb(redact_sensitive_text(f"Error translating {name}: {e}\n{tb}"))
 
         # Signal that the worker loop has exited
         log_cb("__worker_done__")
@@ -348,7 +349,7 @@ class GuiLoggingHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            orig_msg = record.getMessage()
+            orig_msg = redact_sensitive_text(record.getMessage())
 
             # Skip noisy informational messages about collected cells
             if record.levelno == logging.INFO and re.search(r"collected \d+ translatable string cells", orig_msg, re.IGNORECASE):

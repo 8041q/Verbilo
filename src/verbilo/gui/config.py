@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import logging
+import tempfile
 from pathlib import Path
 from typing import Dict, Any
 
@@ -16,6 +17,21 @@ except ImportError:
         return str(Path.home() / f".{appname.lower()}")
 
 CONFIG_FILENAME = ".verbilo_gui.json"
+SENSITIVE_CONFIG_KEYS = frozenset({
+    "google_api_key", "google_sa_json", "baidu_appkey", "azure_key", "deepl_api_key",
+})
+
+
+def redact_sensitive_text(text: str) -> str:
+    # Remove values for known credentials before text reaches the GUI log
+    import re
+    redacted = str(text)
+    for key in SENSITIVE_CONFIG_KEYS:
+        redacted = re.sub(
+            rf'(["\']?{re.escape(key)}["\']?\s*[:=]\s*)[^,\s\]\}}]+',
+            r'\1***', redacted, flags=re.IGNORECASE,
+        )
+    return re.sub(r'(DeepL-Auth-Key\s+)[^\s]+', r'\1***', redacted, flags=re.IGNORECASE)
 
 _DEFAULT_CONFIG: Dict[str, Any] = {
     "debug_mode": False,
@@ -58,14 +74,22 @@ def save_config(cfg: Dict[str, Any]) -> None:
         parent = p.parent
         if not parent.exists():
             parent.mkdir(parents=True, exist_ok=True)
-        # write to ensure the file appears on disk
-        with open(p, "w", encoding="utf-8") as fh:
-            fh.write(text)
-            fh.flush()
+        # A same-directory temporary file plus replace prevents a crash from
+        # leaving the user's credentials/settings as truncated JSON.
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{CONFIG_FILENAME}.", suffix=".tmp", dir=parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+            os.replace(tmp_name, p)
+        finally:
             try:
-                os.fsync(fh.fileno())
-            except Exception:
-                # fsync may not be available on some platforms or filesystems; ignore
+                Path(tmp_name).unlink(missing_ok=True)
+            except OSError:
                 pass
     except Exception:
         # best-effort, don't crash the GUI; log for visibility during development

@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -36,9 +37,9 @@ CREATE TABLE IF NOT EXISTS translations (
     target_lang     TEXT    NOT NULL,
     translated_text TEXT    NOT NULL,
     created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    last_accessed   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (engine, source_text, target_lang)
 );
-CREATE INDEX IF NOT EXISTS idx_tl_created ON translations (created_at);
 """
 
 
@@ -61,7 +62,15 @@ class TranslationCache:
         self._max_entries = max_entries
         self._local = threading.local()          # per-thread connection
         self._write_lock = threading.Lock()      # serialise writes / eviction
+        self._access_lock = threading.Lock()
+        self._last_access_stamp = 0
         self._init_db()
+
+    def _access_stamp(self) -> int:
+        # Return a strictly increasing timestamp, even on coarse system clocks
+        with self._access_lock:
+            self._last_access_stamp = max(time.time_ns(), self._last_access_stamp + 1)
+            return self._last_access_stamp
 
     # ── Connection management ─────────────────────────────────────────────────
 
@@ -84,6 +93,14 @@ class TranslationCache:
         try:
             db = self._get_conn()
             db.executescript(_DDL)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(translations)")}
+            if "last_accessed" not in columns:
+                db.execute("ALTER TABLE translations ADD COLUMN last_accessed INTEGER NOT NULL DEFAULT 0")
+                db.execute(
+                    "UPDATE translations SET last_accessed = created_at * 1000000000 "
+                    "WHERE last_accessed = 0"
+                )
+            db.execute("CREATE INDEX IF NOT EXISTS idx_tl_accessed ON translations (last_accessed)")
         except Exception:
             logger.warning("Could not initialise translation cache DB.", exc_info=True)
 
@@ -99,7 +116,14 @@ class TranslationCache:
                 "WHERE engine=? AND source_text=? AND target_lang=?",
                 (engine, text, target_lang),
             ).fetchone()
-            return row[0] if row else None
+            if row:
+                self._get_conn().execute(
+                    "UPDATE translations SET last_accessed=? "
+                    "WHERE engine=? AND source_text=? AND target_lang=?",
+                    (self._access_stamp(), engine, text, target_lang),
+                )
+                return row[0]
+            return None
         except Exception:
             logger.debug("Cache.get failed", exc_info=True)
             return None
@@ -111,13 +135,25 @@ class TranslationCache:
         if not texts:
             return {}
         try:
-            placeholders = ",".join("?" * len(texts))
-            rows = self._get_conn().execute(
-                f"SELECT source_text, translated_text FROM translations "
-                f"WHERE engine=? AND target_lang=? AND source_text IN ({placeholders})",
-                (engine, target_lang, *texts),
-            ).fetchall()
-            return {src: tgt for src, tgt in rows}
+            # SQLite's host-parameter limit varies by build. Chunking keeps
+            # cache lookup reliable for large local-language buckets.
+            found: dict[str, str] = {}
+            for start in range(0, len(texts), 900):
+                chunk = texts[start:start + 900]
+                placeholders = ",".join("?" * len(chunk))
+                rows = self._get_conn().execute(
+                    f"SELECT source_text, translated_text FROM translations "
+                    f"WHERE engine=? AND target_lang=? AND source_text IN ({placeholders})",
+                    (engine, target_lang, *chunk),
+                ).fetchall()
+                found.update({src: tgt for src, tgt in rows})
+            if found:
+                self._get_conn().executemany(
+                    "UPDATE translations SET last_accessed=? "
+                    "WHERE engine=? AND source_text=? AND target_lang=?",
+                    [(self._access_stamp(), engine, src, target_lang) for src in found],
+                )
+            return found
         except Exception:
             logger.debug("Cache.get_batch failed", exc_info=True)
             return {}
@@ -135,9 +171,9 @@ class TranslationCache:
                 db = self._get_conn()
                 db.execute(
                     "INSERT OR REPLACE INTO translations "
-                    "(engine, source_text, target_lang, translated_text, created_at) "
-                    "VALUES (?, ?, ?, ?, strftime('%s','now'))",
-                    (engine, text, target_lang, translated_text),
+                    "(engine, source_text, target_lang, translated_text, created_at, last_accessed) "
+                    "VALUES (?, ?, ?, ?, strftime('%s','now'), ?)",
+                    (engine, text, target_lang, translated_text, self._access_stamp()),
                 )
                 self._maybe_evict(db)
         except Exception:
@@ -158,9 +194,9 @@ class TranslationCache:
                 db = self._get_conn()
                 db.executemany(
                     "INSERT OR REPLACE INTO translations "
-                    "(engine, source_text, target_lang, translated_text, created_at) "
-                    "VALUES (?, ?, ?, ?, strftime('%s','now'))",
-                    [(engine, src, target_lang, tgt) for src, tgt in valid],
+                    "(engine, source_text, target_lang, translated_text, created_at, last_accessed) "
+                    "VALUES (?, ?, ?, ?, strftime('%s','now'), ?)",
+                    [(engine, src, target_lang, tgt, self._access_stamp()) for src, tgt in valid],
                 )
                 self._maybe_evict(db)
         except Exception:
@@ -176,7 +212,7 @@ class TranslationCache:
                 excess = count - self._max_entries
                 db.execute(
                     "DELETE FROM translations WHERE rowid IN "
-                    "(SELECT rowid FROM translations ORDER BY created_at ASC LIMIT ?)",
+                    "(SELECT rowid FROM translations ORDER BY last_accessed ASC LIMIT ?)",
                     (excess,),
                 )
         except Exception:

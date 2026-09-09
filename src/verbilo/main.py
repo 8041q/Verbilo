@@ -1,5 +1,7 @@
+import os
 from pathlib import Path
 import threading
+from uuid import uuid4
 from typing import Callable
 from .advisors import AdvisorBase, NullAdvisor
 from .translators.factory import TranslatorFactory
@@ -34,11 +36,35 @@ def translate_file(
     advisor: AdvisorBase | None = None,
     semantic_translator: Translator | None = None,
     translator_override: Translator | None = None,
+    *,
+    overwrite: bool = False,
 ):
-    # source_lang="auto" translates everything; cancel_event raises CancelledError before saving
+    # source_lang="auto" translates everything. Results are staged and committed
+    # atomically, so a cancellation or error never publishes a partial document.
     p = Path(input_path)
     if not p.exists():
         raise FileNotFoundError(input_path)
+
+    if not target_lang or not isinstance(target_lang, str) or not target_lang.strip():
+        raise ValueError("target_lang must be a non-empty language code (e.g. 'en', 'pt')")
+
+    suffix = p.suffix.lower()
+    if suffix not in (".docx", ".xlsx", ".pdf"):
+        if suffix == ".xls":
+            raise ValueError("Legacy .xls files are not supported; convert the workbook to .xlsx first.")
+        raise ValueError(f"Unsupported file type: {suffix}")
+
+    final_output = Path(resolve_output_path(p, output_path)).resolve()
+    if final_output == p.resolve():
+        raise ValueError("Output path must not overwrite the source document.")
+    if final_output.exists() and not overwrite:
+        raise FileExistsError(
+            f"Output already exists: {final_output}. Choose another output path or pass overwrite=True."
+        )
+    final_output.parent.mkdir(parents=True, exist_ok=True)
+    staged_output = final_output.with_name(
+        f".{final_output.stem}.{uuid4().hex}.staging{final_output.suffix}"
+    )
 
     translator = translator_override or TranslatorFactory.get(
         translator_name,
@@ -58,38 +84,47 @@ def translate_file(
         local_model_dir=local_model_dir,
     )
 
-    # Validate target language early to avoid silent no-ops downstream
-    if not target_lang or not isinstance(target_lang, str) or not target_lang.strip():
-        raise ValueError("target_lang must be a non-empty language code (e.g. 'en', 'pt')")
-
-    suffix = p.suffix.lower()
     if advisor is None:
         advisor = NullAdvisor()
 
-    # Resolve output path after any conversion so the suffix/filename is correct
-    output_path = resolve_output_path(p, output_path)
-
-    if suffix == ".docx":
-        docx_converter.translate_docx(str(p), str(output_path), translator, target_lang, cancel_event=cancel_event, source_lang=source_lang, progress_callback=progress_callback)
-    elif suffix in (".xls", ".xlsx"):
-        xlsx_converter.translate_xlsx(str(p), str(output_path), translator, target_lang, cancel_event=cancel_event, source_lang=source_lang, progress_callback=progress_callback)
-    elif suffix == ".pdf":
-        result = pdf_converter.translate_pdf(
-            str(p),
-            str(output_path),
-            translator,
-            target_lang,
-            cancel_event=cancel_event,
-            source_lang=source_lang,
-            progress_callback=progress_callback,
-            advisor=advisor,
-            semantic_translator=semantic_translator,
-        )
-        if result == "skipped-ocr":
-            return "skipped-ocr"
-    else:
-        raise ValueError(f"Unsupported file type: {suffix}")
-    return output_path
+    try:
+        if suffix == ".docx":
+            docx_converter.translate_docx(str(p), str(staged_output), translator, target_lang, cancel_event=cancel_event, source_lang=source_lang, progress_callback=progress_callback)
+        elif suffix == ".xlsx":
+            xlsx_converter.translate_xlsx(str(p), str(staged_output), translator, target_lang, cancel_event=cancel_event, source_lang=source_lang, progress_callback=progress_callback)
+        else:
+            result = pdf_converter.translate_pdf(
+                str(p), str(staged_output), translator, target_lang,
+                cancel_event=cancel_event, source_lang=source_lang,
+                progress_callback=progress_callback, advisor=advisor,
+                semantic_translator=semantic_translator,
+            )
+            if result == "skipped-ocr":
+                return "skipped-ocr"
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError("Translation cancelled before publishing output")
+        if overwrite:
+            os.replace(staged_output, final_output)
+        else:
+            # Linking is an atomic no-clobber publish when staging and final
+            # live in the same directory.  Unlike os.replace(), it cannot
+            # overwrite an output created after the earlier existence check.
+            try:
+                os.link(staged_output, final_output)
+            except FileExistsError as exc:
+                raise FileExistsError(
+                    f"Output was created while translating: {final_output}. "
+                    "Choose another output path and try again."
+                ) from exc
+            staged_output.unlink()
+        return str(final_output)
+    finally:
+        # A failed conversion, cancellation, or OCR skip must not leave an
+        # incomplete destination visible to the user.
+        try:
+            staged_output.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

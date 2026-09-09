@@ -1474,7 +1474,7 @@ class App:
         icon_color = p.text_muted
         self._file_icons: dict[str, object] = {}
         for ext, icon_name in ((".docx", "file-docx"), (".pdf", "file-pdf"),
-                                (".xlsx", "file-xls"), (".xls", "file-xls")):
+                                (".xlsx", "file-xls")):
             img = get_photo_image(icon_name, size=18, color=icon_color)
             if img:
                 self._file_icons[ext] = img
@@ -3295,8 +3295,8 @@ class App:
     def _add_files(self):
         init = self._initialdir_for_input()
         filetypes = [
-            (self.t("file_dialog.all_supported"), ("*.docx", "*.pdf", "*.xlsx", "*.xls")),
-            (self.t("file_dialog.excel_spreadsheets"), ("*.xlsx", "*.xls")),
+            (self.t("file_dialog.all_supported"), ("*.docx", "*.pdf", "*.xlsx")),
+            (self.t("file_dialog.excel_spreadsheets"), ("*.xlsx",)),
             (self.t("file_dialog.word_documents"), ("*.docx",)),
             (self.t("file_dialog.pdf_documents"), ("*.pdf",)),
             (self.t("file_dialog.all_files"), "*.*"),
@@ -3483,14 +3483,17 @@ class App:
                 src_codes_set.add(_opus_code_to_iso(s))
                 tgt_codes_set.add(_opus_code_to_iso(t))
 
-            # Source list — languages which appear as source in at least one pair
-            # No Auto-detect for local engine (each pair needs an explicit model)
+            # Source list — languages which appear as source in at least one pair.
+            # Auto-detect is valid too: the local backend groups units by the
+            # detected source language and selects the matching installed pair.
             src_filtered = [(c, n) for c, n in lang_opts if c in src_codes_set]
             src_display = [self._format_language_option(code, name) for code, name in src_filtered]
-            source_values = src_display
-            self._source_lang_map = {
+            auto_detect_label = self.t("sidebar.auto_detect")
+            source_values = [auto_detect_label] + src_display
+            self._source_lang_map = {auto_detect_label: "auto"}
+            self._source_lang_map.update({
                 self._format_language_option(code, name): code for code, name in src_filtered
-            }
+            })
             self.source_lang_box.update_values(source_values)
             self._source_lang_label.configure(
                 text=self.t("sidebar.source_language_count", count=len(src_display)),
@@ -3696,10 +3699,19 @@ class App:
                 return
             _pair_set = {(_opus_code_to_iso(s), _opus_code_to_iso(t))
                          for s, t in _local_pairs}
-            if (source_lang, lang) not in _pair_set:
+            # In auto mode the local backend detects and groups each document unit by language
+            # Requiring an impossible "auto → target" model here blocked that mode before translation began
+            has_target_pair = any(tgt == lang for _, tgt in _pair_set)
+            if (source_lang != "auto" and (source_lang, lang) not in _pair_set) or (
+                source_lang == "auto" and not has_target_pair
+            ):
                 if messagebox.askyesno(
                     self.t("message.missing_model_title"),
-                    self.t("message.missing_model_body", source=source_lang, target=lang),
+                    self.t(
+                        "message.missing_model_body",
+                        source=("detected source language" if source_lang == "auto" else source_lang),
+                        target=lang,
+                    ),
                 ):
                     self._open_settings()
                 return

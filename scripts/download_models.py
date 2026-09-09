@@ -8,7 +8,6 @@ import argparse
 import json
 import os
 import shutil
-import ssl
 import subprocess
 import sys
 import tempfile
@@ -33,10 +32,6 @@ _SENTINEL = "converted.ok"
 _UNDERSCORE_PREFIXES = ("tiny_",)
 _COPY_FILES = ["source.spm", "target.spm", "tokenizer_config.json"]
 
-_SSL_UNVERIFIED = ssl.create_default_context()
-_SSL_UNVERIFIED.check_hostname = False
-_SSL_UNVERIFIED.verify_mode = ssl.CERT_NONE
-
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
@@ -54,16 +49,9 @@ from src.verbilo.translators.ollama import (
 def _open_url(url: str, method: str = "GET"):
     req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
     req.method = method
-    try:
-        return urlopen(req)
-    except Exception as e:
-        is_ssl = isinstance(e, ssl.SSLCertVerificationError) or (
-            isinstance(e, OSError)
-            and any(k in str(e).upper() for k in ("SSL", "CERTIFICATE", "CERT_VERIFY"))
-        )
-        if is_ssl:
-            return urlopen(req, context=_SSL_UNVERIFIED)
-        raise
+    # Never bypass TLS certificate validation: these downloads become executable
+    # model/runtime inputs on the user's machine.
+    return urlopen(req)
 
 
 def _hf_head(repo: str) -> bool:
@@ -85,19 +73,27 @@ def _hf_file_exists(repo: str, filename: str) -> bool:
 
 
 def download(url: str, dest_path: str) -> None:
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    destination = Path(dest_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.part")
     print(f"Downloading {url} -> {dest_path}")
-    with _open_url(url) as r:
-        total = int(r.headers.get("Content-Length", 0))
-        received = 0
-        with open(dest_path, "wb") as f:
-            while True:
-                chunk = r.read(256 * 1024)  # 256 KB chunks
-                if not chunk:
-                    break
-                f.write(chunk)
-                received += len(chunk)
-                print(f"PROGRESS {received} {total}", flush=True)
+    try:
+        with _open_url(url) as r:
+            total = int(r.headers.get("Content-Length", 0))
+            received = 0
+            with open(temporary, "wb") as f:
+                while True:
+                    chunk = r.read(256 * 1024)  # 256 KB chunks
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    received += len(chunk)
+                    print(f"PROGRESS {received} {total}", flush=True)
+        if received <= 0 or (total and received != total):
+            raise IOError(f"incomplete download ({received} of {total or 'unknown'} bytes)")
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def download_ollama_model(
@@ -179,7 +175,7 @@ def _download_repo_files(model_name: str, local_dir: str) -> bool:
     base_url = _HF_BASE.format(repo=model_name)
     for filename in files:
         dest = Path(local_dir) / filename
-        if dest.exists():
+        if dest.exists() and dest.stat().st_size > 0:
             print(f"  [skip] {filename}")
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -295,6 +291,14 @@ _CT2_OPTIONAL_FILES = [
 ]
 
 
+def _validated_ct2_model(path: Path) -> bool:
+    # A model is activatable only when every required artifact is non-empty
+    return all(
+        (path / name).is_file() and (path / name).stat().st_size > 0
+        for name in _CT2_REQUIRED_FILES
+    )
+
+
 def _download_ct2_direct(ct2_repo: str, out_path: Path) -> bool:
     # Download a pre-converted CTranslate2 model directly from HuggingFace.
     files = _list_hf_repo_files(ct2_repo)
@@ -315,13 +319,16 @@ def _download_ct2_direct(ct2_repo: str, out_path: Path) -> bool:
     print(f"Downloading pre-converted CT2 model from {ct2_repo} -> {out_path}")
     for filename in wanted:
         dest = out_path / filename
-        if dest.exists():
+        if dest.exists() and dest.stat().st_size > 0:
             print(f"  [skip] {filename}")
             continue
         if not _try_download(f"{base_url}/{filename}", str(dest)):
             print(f"  Failed to download {filename} from {ct2_repo}", file=sys.stderr)
             return False
 
+    if not _validated_ct2_model(out_path):
+        print("CT2 model validation failed: one or more required files are incomplete.", file=sys.stderr)
+        return False
     print("CT2 direct download succeeded.")
     return True
 
@@ -349,7 +356,12 @@ def _convert_raw_zip(slug: str, out_path: Path) -> bool:
             return False
 
         with zipfile.ZipFile(zip_path) as zf:
-            zf.extractall(tmp)
+            root = Path(tmp).resolve()
+            for member in zf.infolist():
+                candidate = (root / member.filename).resolve()
+                if candidate != root and root not in candidate.parents:
+                    raise ValueError(f"Unsafe archive path: {member.filename}")
+            zf.extractall(root)
 
         decoder_yml = next(Path(tmp).rglob("decoder.yml"), None)
         if not decoder_yml:
@@ -417,9 +429,10 @@ def download_opus_mt(slug: str, dest_dir: Optional[str] = None,
     pair = _slug_to_pair(slug)
     out_path = Path(dest_dir) / pair
 
-    if (out_path / _SENTINEL).exists():
+    if (out_path / _SENTINEL).exists() and _validated_ct2_model(out_path):
         print(f"Model '{slug}' (folder: {pair}) already converted at {out_path}")
         return out_path
+    (out_path / _SENTINEL).unlink(missing_ok=True)
 
     # If no ct2_repo was explicitly passed, look it up from the catalogue.
     if ct2_repo is None:
@@ -531,6 +544,9 @@ def download_opus_mt(slug: str, dest_dir: Optional[str] = None,
                 except Exception as exc:
                     print(f"Warning: could not copy {sp_file}: {exc}", file=sys.stderr)
 
+    if not _validated_ct2_model(out_path):
+        print("ERROR: Converted model is missing required CTranslate2 artifacts.", file=sys.stderr)
+        sys.exit(1)
     (out_path / _SENTINEL).write_text("ok\n")
     print(f"\nModel '{slug}' ready at {out_path} (load as pair '{pair}')")
     return out_path

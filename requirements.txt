@@ -1,5 +1,4 @@
-# Generated from pyproject.toml via: poetry export -f requirements.txt --without dev --output requirements.txt
-# Do not edit manually.
+# Runtime dependencies; keep synchronized with pyproject.toml and poetry.lock.
 python-docx==0.8.11
 lxml==6.0.2
 openpyxl==3.1.2
@@ -15,5 +14,6 @@ tomli==2.4.0
 ctranslate2==4.7.1
 sentencepiece==0.2.1
 urllib3==2.6.2
+requests==2.32.5
 # Only used if V3 API is used
 google-cloud-translate==3.0.0

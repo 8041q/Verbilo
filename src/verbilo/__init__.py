@@ -13,7 +13,7 @@ if _pyproject.exists():
         _data = tomllib.load(f)
 
     __version__ = _data["tool"]["poetry"]["version"]
-    __build_date__ = _data["tool"]["poetry"]["build_date"]
+    __build_date__ = _data.get("tool", {}).get("verbilo", {}).get("build_date", "unknown")
 
 else:
     try:
