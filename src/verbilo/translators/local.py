@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -27,24 +28,137 @@ _MAX_MODELS = 3
 _BATCH_SIZE = 64
 
 _SENTINEL = "converted.ok"
+_REQUIRED_MODEL_FILES = ("model.bin", "source.spm", "target.spm")
+
+# OPUS catalogue/folder codes are not always the same codes used by the GUI.
+# Keep this normalization in the backend too, because the loader must be able
+# to open a legacy folder such as ``eng-fra`` when the GUI asks for ``en-fr``.
+_OPUS_CODE_MAP: dict[str, str] = {
+    "eng": "en", "fra": "fr", "deu": "de", "spa": "es", "por": "pt",
+    "ita": "it", "nld": "nl", "rus": "ru", "zho": "zh", "jpn": "ja",
+    "jap": "ja", "kor": "ko", "ara": "ar", "pol": "pl", "tur": "tr",
+    "swe": "sv", "dan": "da", "fin": "fi", "ukr": "uk", "ces": "cs",
+    "ron": "ro", "hun": "hu", "nor": "no", "bul": "bg", "hrv": "hr",
+    "ell": "el", "heb": "he", "hin": "hi", "tha": "th", "vie": "vi",
+    "cat": "ca", "ind": "id", "msa": "ms", "slk": "sk", "slv": "sl",
+    "est": "et", "lav": "lv", "lit": "lt", "srp": "sr",
+}
+
+
+def normalize_model_code(code: str) -> str:
+    """Normalize an OPUS/folder language code to the GUI's canonical code."""
+    normalized = (code or "").strip().lower().replace("_", "-")
+    return _OPUS_CODE_MAP.get(normalized, normalized)
+
+
+def _validated_pair_dir(path: Path) -> bool:
+    """True only when a model is both marked ready and actually loadable."""
+    if not (path / _SENTINEL).is_file():
+        return False
+    return all(
+        (path / filename).is_file() and (path / filename).stat().st_size > 0
+        for filename in _REQUIRED_MODEL_FILES
+    )
+
+
+def _pair_from_ready_dir(path: Path) -> tuple[str, str] | None:
+    """Read the declared pair from the sentinel, with legacy-name fallback.
+
+    New downloaders store JSON metadata in ``converted.ok``. Older releases
+    wrote only ``ok`` and therefore have to infer the pair from the folder name.
+    """
+    sentinel = path / _SENTINEL
+    try:
+        payload = json.loads(sentinel.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            src = str(payload.get("source") or "").strip()
+            tgt = str(payload.get("target") or "").strip()
+            if src and tgt:
+                return src, tgt
+            pair = str(payload.get("pair") or "").strip()
+            if pair and "-" in pair:
+                src, tgt = pair.split("-", 1)
+                if src and tgt:
+                    return src, tgt
+    except Exception:
+        # Legacy sentinel contains plain text (normally ``ok``).
+        pass
+
+    name = path.name
+    # Legacy downloader variants could accidentally retain a model-family
+    # prefix. Handle the known forms without guessing at arbitrary BCP-47 tags.
+    if "_" in name:
+        name = name.split("_", 1)[-1]
+    for prefix in ("tc-big-", "opus-mt-"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    parts = name.split("-", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return None
+    return parts[0], parts[1]
 
 
 def list_downloaded_pairs(model_dir: str) -> list[tuple[str, str]]:
-    # Return sorted ``(src, tgt)`` tuples for every ready model on disk.
+    """Return every *loadable* ``(src, tgt)`` model pair on disk.
+
+    This intentionally uses the same readiness rules as ``_load_model`` so the
+    GUI cannot advertise a model that the translator would reject.
+    """
     root = Path(model_dir)
     if not root.is_dir():
         return []
-    pairs: list[tuple[str, str]] = []
+    pairs: set[tuple[str, str]] = set()
     for child in root.iterdir():
-        if not child.is_dir():
+        if not child.is_dir() or not _validated_pair_dir(child):
             continue
-        parts = child.name.split("-", 1)
-        if len(parts) != 2 or not parts[0] or not parts[1]:
+        pair = _pair_from_ready_dir(child)
+        if pair is not None:
+            pairs.add(pair)
+    return sorted(pairs)
+
+
+def find_downloaded_pair_dir(model_dir: str | Path, src: str, tgt: str) -> Path | None:
+    """Resolve a requested GUI pair to its actual ready directory on disk.
+
+    Exact canonical folders win. Legacy OPUS-code folders (for example
+    ``eng-fra``) remain usable through normalized-code matching.
+    """
+    root = Path(model_dir)
+    exact = root / f"{src}-{tgt}"
+    if _validated_pair_dir(exact):
+        return exact
+    if not root.is_dir():
+        return None
+
+    want = (normalize_model_code(src), normalize_model_code(tgt))
+    for child in sorted(root.iterdir(), key=lambda item: item.name.lower()):
+        if not child.is_dir() or not _validated_pair_dir(child):
             continue
-        if (child / _SENTINEL).exists():
-            pairs.append((parts[0], parts[1]))
-    pairs.sort()
-    return pairs
+        pair = _pair_from_ready_dir(child)
+        if pair is None:
+            continue
+        have = (normalize_model_code(pair[0]), normalize_model_code(pair[1]))
+        if have == want:
+            return child
+    return None
+
+
+def _same_language_code(source: str, target: str) -> bool:
+    """Return True when translating would be a same-language round trip.
+
+    Regional variants are treated as the same language except Chinese, where
+    Simplified/Traditional conversion can be intentional.
+    """
+    src = (source or "").strip().lower().replace("_", "-")
+    tgt = (target or "").strip().lower().replace("_", "-")
+    if not src or not tgt:
+        return False
+    if src == tgt:
+        return True
+    src_base = src.split("-", 1)[0]
+    tgt_base = tgt.split("-", 1)[0]
+    return src_base == tgt_base and src_base != "zh"
 
 
 class OpusMTTranslator:
@@ -82,17 +196,15 @@ class OpusMTTranslator:
             self._models.move_to_end(key)
             return self._models[key]
 
-        pair_dir = self._model_dir / key
+        pair_dir = find_downloaded_pair_dir(self._model_dir, src, tgt)
 
-        # Decision 3: check sentinel before attempting to load.
-        required_files = ("model.bin", "source.spm", "target.spm")
-        if not (pair_dir / _SENTINEL).exists() or any(
-            not (pair_dir / filename).is_file() or (pair_dir / filename).stat().st_size <= 0
-            for filename in required_files
-        ):
+        # Use exactly the same readiness rules as model discovery.
+        if pair_dir is None:
+            expected = self._model_dir / key
             raise FileNotFoundError(
-                f"OPUS-MT model '{key}' is missing or incomplete at {pair_dir}. "
-                f"Run: python scripts/download_models.py opus-mt {src} {tgt}"
+                f"OPUS-MT model '{key}' is missing or incomplete under {self._model_dir}. "
+                f"Expected a ready model such as {expected}. "
+                f"Run: python scripts/download_models.py opus-mt {src}-{tgt}"
             )
 
         # Evict LRU if at capacity.
@@ -266,6 +378,11 @@ class OpusMTTranslator:
             if not text or not text.strip():
                 continue
             src = self._resolve_src(text)
+            # Bilingual spreadsheets/documents often contain cells that are
+            # already in the target language.  Do not try to load a non-existent
+            # en-en / fr-fr / etc. OPUS model for those cells.
+            if _same_language_code(src, target_lang):
+                continue
             buckets.setdefault(src, {}).setdefault(text, []).append(index)
 
         for src, unique_texts in buckets.items():
@@ -296,7 +413,17 @@ class OpusMTTranslator:
             if not pending:
                 continue
 
-            translator, sp_source, sp_target = self._load_model(src, target_lang)
+            try:
+                translator, sp_source, sp_target = self._load_model(src, target_lang)
+            except FileNotFoundError:
+                # Auto-detection can occasionally identify a short SKU/label as a
+                # language for which the user has no model installed.  Keep those
+                # units unchanged instead of failing the whole mixed document.
+                logger.warning(
+                    "No local OPUS-MT model for auto-detected %s->%s; keeping %d unique unit(s) unchanged",
+                    src, target_lang, len(pending),
+                )
+                continue
             saved: list[tuple[str, str]] = []
             items = list(pending.items())
             for start in range(0, len(items), _BATCH_SIZE):
@@ -330,6 +457,8 @@ class OpusMTTranslator:
             return text
 
         src = self._resolve_batch_src([text])
+        if _same_language_code(src, target_lang):
+            return text
 
         if self._source_lang != "auto":
             if self._SEGMENT_RE.search(text):
@@ -360,6 +489,8 @@ class OpusMTTranslator:
 
         # Decision 1: resolve source language once for the whole batch.
         src = self._resolve_batch_src(texts)
+        if _same_language_code(src, target_lang):
+            return list(texts)
         cache_scope = f"{src.lower()}:{target_lang.lower()}"
         tgt_cache = self._cache.setdefault(cache_scope, {})
 

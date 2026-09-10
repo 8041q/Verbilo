@@ -62,6 +62,9 @@ class _TranslationUnit:
     source_text: str
     is_heading: bool = False
     write_back: Callable[[str], None] = field(default=lambda t: None, repr=False)
+    # Store the actual translator result so layout heuristics compare like-for-like
+    # text instead of comparing translated nodes against every text node in a part.
+    translated_text: str | None = field(default=None, repr=False)
 
 
 # Grouping + batch translate
@@ -149,6 +152,7 @@ def _translate_and_writeback(
                 for idx, i in enumerate(group):
                     if translated_parts[idx] is not None:
                         units[i].write_back(translated_parts[idx])
+                        units[i].translated_text = str(translated_parts[idx])
                 if progress_callback is not None:
                     progress_callback(gi + 1, total_groups)
                 continue
@@ -171,6 +175,7 @@ def _translate_and_writeback(
                 result = translate_fn(units[i].source_text, target_lang)
                 if result is not None:
                     units[i].write_back(result)
+                    units[i].translated_text = str(result)
             except CancelledError:
                 raise
             except Exception:
@@ -1156,12 +1161,31 @@ def _normalize_anchor_reference_frames(root: etree._Element) -> None:
                 )
 
 
-def _apply_layout_fixes(root: etree._Element, expansion_ratio: float = 1.0) -> None:
-    # Run all layout-protection passes on *root* in one call.
-    _normalize_anchor_reference_frames(root)
+def _apply_layout_fixes(
+    root: etree._Element,
+    expansion_ratio: float = 1.0,
+    *,
+    aggressive: bool = False,
+) -> None:
+    # Layout edits are intentionally conservative by default.  The old behavior
+    # modified anchors, text-box sizes, paragraph spacing and list indentation for
+    # an entire XML part.  Those global edits can fix one overflow while changing
+    # pagination or diagram geometry elsewhere in an otherwise healthy document.
+    #
+    # In conservative mode only relax hard height constraints, and only when the
+    # translated units are measurably longer than their source.  The old behavior
+    # remains available with aggressive=True for documents known to need it.
+    if expansion_ratio < 1.08:
+        return
+
     _fix_table_row_heights(root)
-    _fix_textbox_autofit(root)
     _fix_frame_autosize(root)
+
+    if not aggressive:
+        return
+
+    _normalize_anchor_reference_frames(root)
+    _fix_textbox_autofit(root)
     _fix_vml_textbox_autosize(root)
     _expand_textbox_widths(root, expansion_ratio)
     _compress_spacer_spacing(root, expansion_ratio)
@@ -1169,144 +1193,397 @@ def _apply_layout_fixes(root: etree._Element, expansion_ratio: float = 1.0) -> N
     _ensure_list_indentation(root)
 
 
+def _set_wt_text(elem: etree._Element, text: str) -> None:
+    """Set ``w:t`` text while preserving whitespace semantics."""
+    elem.text = text
+    xml_space = '{http://www.w3.org/XML/1998/namespace}space'
+    if text[:1].isspace() or text[-1:].isspace():
+        elem.set(xml_space, 'preserve')
+    elif elem.get(xml_space) == 'preserve':
+        # Keeping xml:space=preserve on non-space text is harmless and avoids
+        # changing more OOXML than necessary.
+        pass
+
+
+def _nearest_ancestor(elem: etree._Element, tag: str) -> etree._Element | None:
+    node = elem.getparent()
+    while node is not None:
+        if node.tag == tag:
+            return node
+        node = node.getparent()
+    return None
+
+
+def _redistribute_text_across_nodes(
+    nodes: list[etree._Element],
+    original_parts: list[str],
+    translated: str,
+) -> None:
+    """Redistribute one logical translation across the original ``w:t`` nodes.
+
+    Word commonly splits a single sentence into many runs for reasons that are
+    unrelated to visible formatting (editing history, proofing, field boundaries,
+    font fallback, etc.). Translating those fragments independently produces
+    output such as ``JiangsuSakai`` or ``ElectricityMoveBed``. We instead translate
+    the logical text once and divide the result back across the existing nodes.
+
+    The concatenated visible text is *exactly* ``translated``. Boundaries are
+    snapped to nearby whitespace / punctuation where possible so genuinely
+    different run formatting is less likely to change in the middle of a word.
+    """
+    if not nodes:
+        return
+    if len(nodes) == 1:
+        _set_wt_text(nodes[0], translated)
+        return
+
+    source = ''.join(original_parts)
+    if source == translated:
+        # Preservation fast-path: do not rewrite a run tree when translation is
+        # effectively an identity operation.
+        return
+
+    weights = [max(1, len(part.strip()) or len(part)) for part in original_parts]
+    total_weight = sum(weights)
+    target_len = len(translated)
+    boundaries: list[int] = []
+    cumulative = 0
+    previous = 0
+
+    # Characters that are safe places for a run boundary. A split immediately
+    # before or after one of these is visually preferable to splitting a word.
+    safe_chars = set(' \t\r\n,.;:!?，。；：！？、/\\()[]{}<>-–—|')
+
+    for weight in weights[:-1]:
+        cumulative += weight
+        ideal = round(target_len * cumulative / total_weight)
+        ideal = max(previous, min(ideal, target_len))
+
+        best = ideal
+        best_distance = 10**9
+        radius = min(12, max(4, target_len // 20))
+        lo = max(previous, ideal - radius)
+        hi = min(target_len, ideal + radius)
+        for pos in range(lo, hi + 1):
+            if pos <= previous:
+                continue
+            left_safe = pos > 0 and translated[pos - 1] in safe_chars
+            right_safe = pos < target_len and translated[pos] in safe_chars
+            if left_safe or right_safe:
+                distance = abs(pos - ideal)
+                if distance < best_distance:
+                    best = pos
+                    best_distance = distance
+        boundaries.append(best)
+        previous = best
+
+    starts = [0] + boundaries
+    ends = boundaries + [target_len]
+    chunks = [translated[a:b] for a, b in zip(starts, ends)]
+    for node, chunk in zip(nodes, chunks):
+        _set_wt_text(node, chunk)
+
+
+def _fit_translated_textbox(
+    nodes: list[etree._Element],
+    source_text: str,
+    translated_text: str,
+) -> None:
+    """Apply *local* textbox fitting when translation expands substantially.
+
+    This deliberately avoids changing the shape dimensions / anchor position.
+    WPS shapes get ``a:normAutofit`` and the Word run sizes are reduced modestly
+    in both the modern WPS and VML fallback copies.  The original D8d8y test file
+    has a 89.7pt × 37.8pt ``使用说明书`` textbox; translating it at the original
+    14pt clips ``Instructions for Use`` below the shape.
+    """
+    if not nodes or not source_text.strip() or not translated_text.strip():
+        return
+
+    W_TXBX_CONTENT = qn('w:txbxContent')
+    txbx = _nearest_ancestor(nodes[0], W_TXBX_CONTENT)
+    if txbx is None:
+        return
+
+    def visual_units(text: str) -> float:
+        units = 0.0
+        for ch in text.strip():
+            cp = ord(ch)
+            if (0x3400 <= cp <= 0x4DBF or 0x4E00 <= cp <= 0x9FFF
+                    or 0xF900 <= cp <= 0xFAFF or 0x3040 <= cp <= 0x30FF
+                    or 0xAC00 <= cp <= 0xD7AF):
+                units += 1.0
+            elif ch.isspace():
+                units += 0.30
+            elif ch.isalnum():
+                units += 0.55
+            else:
+                units += 0.42
+        return max(units, 0.1)
+
+    expansion = visual_units(translated_text) / visual_units(source_text)
+    if expansion < 1.35:
+        return
+
+    # Enable shrink-to-fit on the modern Word Processing Shape representation.
+    # Office 2010 Word Processing Shape namespace.
+    WPS_NS = 'http://schemas.microsoft.com/office/word/2010/wordprocessingShape'
+    wsp = _nearest_ancestor(nodes[0], f'{{{WPS_NS}}}wsp')
+    if wsp is not None:
+        body_pr = wsp.find(f'{{{WPS_NS}}}bodyPr')
+        if body_pr is not None:
+            for child in list(body_pr):
+                if child.tag in {
+                    f'{{{_NS_A}}}noAutofit',
+                    f'{{{_NS_A}}}spAutoFit',
+                    f'{{{_NS_A}}}normAutofit',
+                }:
+                    body_pr.remove(child)
+            norm = etree.SubElement(body_pr, f'{{{_NS_A}}}normAutofit')
+            # A conservative lower bound: Word may shrink to 70% if needed.
+            norm.set('fontScale', '70000')
+            norm.set('lnSpcReduction', '15000')
+
+    # VML fallback renderers do not consistently honour normAutofit, so reduce
+    # only the translated runs in this textbox.  sqrt() keeps the intervention
+    # mild for normal expansion but enough for compact labels.
+    import math
+    factor = max(0.68, min(0.96, math.sqrt(1.20 / expansion)))
+    seen_runs: set[int] = set()
+    for node in nodes:
+        run = _nearest_ancestor(node, qn('w:r'))
+        if run is None or id(run) in seen_runs:
+            continue
+        seen_runs.add(id(run))
+        rpr = run.find(qn('w:rPr'))
+        if rpr is None:
+            rpr = etree.Element(qn('w:rPr'))
+            run.insert(0, rpr)
+        for size_tag in (qn('w:sz'), qn('w:szCs')):
+            size_elem = rpr.find(size_tag)
+            if size_elem is None:
+                # If the run inherits its size from paragraph properties, leave it
+                # to normAutofit rather than inventing a size from scratch.
+                continue
+            try:
+                old = int(size_elem.get(qn('w:val'), '0'))
+            except ValueError:
+                continue
+            if old <= 0:
+                continue
+            new = max(14, int(round(old * factor)))  # never below 7pt
+            size_elem.set(qn('w:val'), str(new))
+
+    # Remove paragraph before/after spacing inside the fixed textbox only.
+    paragraph = _nearest_ancestor(nodes[0], qn('w:p'))
+    if paragraph is not None:
+        ppr = paragraph.find(qn('w:pPr'))
+        if ppr is None:
+            ppr = etree.Element(qn('w:pPr'))
+            paragraph.insert(0, ppr)
+        spacing = ppr.find(qn('w:spacing'))
+        if spacing is None:
+            spacing = etree.SubElement(ppr, qn('w:spacing'))
+        spacing.set(qn('w:before'), '0')
+        spacing.set(qn('w:after'), '0')
+
+
+def _iter_local_paragraph_events(paragraph: etree._Element):
+    """Yield local text / break events for one Word paragraph.
+
+    Nested drawing text boxes have their own ``w:p`` elements and must not be
+    folded into the surrounding paragraph. Tabs, hard breaks, fields, hyperlinks,
+    content controls and deleted text are structural boundaries: text on opposite
+    sides should not be redistributed across them.
+    """
+    W_P = qn('w:p')
+    W_TAB = qn('w:tab')
+    W_BR = qn('w:br')
+    W_CR = qn('w:cr')
+    W_FLDCHAR = qn('w:fldChar')
+    W_INSTRTEXT = qn('w:instrText')
+    W_DRAWING = qn('w:drawing')
+    W_HYPERLINK = qn('w:hyperlink')
+
+    boundary_tags = {W_TAB, W_BR, W_CR, W_FLDCHAR, W_INSTRTEXT}
+    scoped_tags = {W_HYPERLINK, _SDT_TAG}
+
+    def walk(node: etree._Element):
+        for child in node:
+            if child.tag == W_P and child is not paragraph:
+                # Nested paragraph (normally inside a text box): handled by the
+                # outer root iteration as its own logical paragraph.
+                continue
+            if child.tag == _WDEL_TAG or child.tag == W_DRAWING:
+                yield ('break', None)
+                continue
+            if child.tag in boundary_tags:
+                yield ('break', None)
+                continue
+            if child.tag == _WT_TAG:
+                if _is_inside_del(child) or _is_inside_drawing_run(child):
+                    yield ('break', None)
+                else:
+                    yield ('text', child)
+                continue
+            if child.tag in scoped_tags:
+                yield ('break', None)
+                yield from walk(child)
+                yield ('break', None)
+                continue
+            yield from walk(child)
+
+    yield from walk(paragraph)
+
+
 def _collect_wt_units(root: etree._Element) -> list[_TranslationUnit]:
-    #  Collect TranslationUnits from all ``<w:t>`` elements under *root*.
-    #
-    #  Skips:
-    #    - empty / whitespace-only text nodes
-    #    - text inside ``<w:del>`` tracked-change blocks (deleted text must be
-    #      kept verbatim to preserve the revision history)
-    #
-    #  This is the primary collector for body text, headers, footers,
-    #  footnotes and endnotes.  It mutates elements in-place via write_back.
+    """Collect logical Word text islands instead of individual ``w:t`` nodes.
 
+    A logical island is contiguous visible paragraph text that is not separated by
+    a tab / field / hard break / hyperlink / content-control boundary. This keeps
+    the translator's sentence context intact while retaining the original runs and
+    their formatting for write-back.
+    """
     units: list[_TranslationUnit] = []
+    W_P = qn('w:p')
 
-    for wt in root.iter(_WT_TAG):
-        text = wt.text
-        if not text or not text.strip():
-            continue
+    for paragraph in root.iter(W_P):
+        current_nodes: list[etree._Element] = []
 
-        # Skip deleted text — translating it would corrupt tracked changes.
-        if _is_inside_del(wt):
-            continue
+        def flush() -> None:
+            nonlocal current_nodes
+            if not current_nodes:
+                return
+            nodes = current_nodes
+            current_nodes = []
+            original_parts = [node.text or '' for node in nodes]
+            original_text = ''.join(original_parts)
+            if not original_text or not original_text.strip():
+                return
 
-        # Skip <w:t> nodes that live inside a run which also contains a
-        # <w:drawing>.  Such runs hold a floating image; the <w:t> is an
-        # artefact that Word ignores visually but which we must not overwrite
-        # with translated text (doing so renders text on top of the image).
-        if _is_inside_drawing_run(wt):
-            continue
+            stripped = original_text.strip()
+            if _is_numeric_only(stripped) or _is_symbol_only(stripped):
+                return
 
-        # Skip pure numbers — translators convert "42" → "forty-two", etc.
-        if _is_numeric_only(text):
-            continue
+            sym_prefix, core_text, sym_suffix = _strip_symbol_frame(stripped)
+            if not core_text:
+                return
+            masked_text, placeholders = _strip_protected_tokens(core_text)
+            if _is_placeholder_only(masked_text):
+                return
 
-        # Skip symbol/punctuation-only segments — no lexical content to translate,
-        # and sending them to OPUS-MT causes hallucinations.
-        if _is_symbol_only(text):
-            continue
+            is_heading = _is_in_heading(nodes[0])
 
-        # Strip leading/trailing symbol chars (e.g. '●' in '●拔出电源描头') so
-        # the model only sees the translatable core.  The symbols are reattached
-        # verbatim in write_back.  If nothing translatable remains, skip.
-        sym_prefix, core_text, sym_suffix = _strip_symbol_frame(text.strip())
-        if not core_text:
-            continue
+            def _make_wb(
+                text_nodes: list[etree._Element],
+                orig_parts: list[str],
+                orig_text: str,
+                ph: dict[str, str],
+                src: str,
+                s_pre: str,
+                s_suf: str,
+            ):
+                def wb(translated: str) -> None:
+                    result = _restore_protected_tokens(translated, ph)
+                    if _is_hallucinated(result, src):
+                        logger.warning(
+                            'Hallucination detected; keeping original logical Word text: %r -> %r',
+                            orig_text, result,
+                        )
+                        result = _restore_protected_tokens(src, ph)
 
-        # For mixed text (e.g. "2023年"), mask numeric tokens so they survive
-        # translation unchanged, then restore them in write_back.
-        masked_text, placeholders = _strip_protected_tokens(core_text)
-        is_heading = _is_in_heading(wt)
+                    leading = orig_text[: len(orig_text) - len(orig_text.lstrip())]
+                    trailing = orig_text[len(orig_text.rstrip()):]
+                    final_text = leading + s_pre + result.strip() + s_suf + trailing
+                    _fit_translated_textbox(text_nodes, orig_text, final_text)
+                    _redistribute_text_across_nodes(text_nodes, orig_parts, final_text)
+                return wb
 
-        # If masking consumed everything, sending placeholder-only text to
-        # OPUS-MT causes hallucinations — skip the segment entirely.
-        if _is_placeholder_only(masked_text):
-            continue
+            units.append(_TranslationUnit(
+                source_text=masked_text,
+                is_heading=is_heading,
+                write_back=_make_wb(
+                    nodes, original_parts, original_text, placeholders,
+                    masked_text, sym_prefix, sym_suffix,
+                ),
+            ))
 
-        def _make_wb(elem: etree._Element, orig_text: str, ph: dict[str, str],
-                     src: str, s_pre: str, s_suf: str):
-            def wb(translated: str) -> None:
-                # Restore any numeric placeholders the translator may have mangled
-                result = _restore_protected_tokens(translated, ph)
-                # Reject hallucinated output — fall back to the original core
-                if _is_hallucinated(result, src):
-                    logger.warning(
-                        "Hallucination detected; keeping original: %r -> %r",
-                        orig_text, result,
-                    )
-                    result = _restore_protected_tokens(src, ph)
-                # Reattach symbol frame and preserve original whitespace
-                leading  = orig_text[: len(orig_text) - len(orig_text.lstrip())]
-                trailing = orig_text[len(orig_text.rstrip()):]
-                elem.text = leading + s_pre + result.strip() + s_suf + trailing
-                if leading or trailing or s_pre or s_suf:
-                    elem.set(
-                        '{http://www.w3.org/XML/1998/namespace}space', 'preserve'
-                    )
-            return wb
+        for kind, node in _iter_local_paragraph_events(paragraph):
+            if kind == 'break':
+                flush()
+                continue
+            assert node is not None
+            text_value = node.text or ''
+            if not text_value:
+                continue
+            if not text_value.strip():
+                # A single space can be a genuine inter-run word separator.
+                # Multiple spaces in these files are commonly used as a manual
+                # visual separator between sentence-like regions, so keep them
+                # untouched and split the translation context there.
+                normalized_ws = text_value.replace('\u00a0', ' ')
+                if len(normalized_ws) > 1:
+                    flush()
+                    continue
+                if current_nodes:
+                    current_nodes.append(node)
+                continue
+            current_nodes.append(node)
 
-        units.append(_TranslationUnit(
-            source_text=masked_text,
-            is_heading=is_heading,
-            write_back=_make_wb(wt, text, placeholders, masked_text,
-                                sym_prefix, sym_suffix),
-        ))
+        flush()
 
     return units
-
 
 def _collect_drawingml_units(root: etree._Element) -> list[_TranslationUnit]:
-    # Collect TranslationUnits from DrawingML ``<a:t>`` elements
+    """Collect logical DrawingML paragraphs rather than individual ``a:t`` runs."""
     units: list[_TranslationUnit] = []
+    A_P_TAG = f'{{{_NS_A}}}p'
     A_T_TAG = f'{{{_NS_A}}}t'
+    handled: set[int] = set()
 
-    for at_elem in root.iter(A_T_TAG):
-        text = at_elem.text
-        if not text or not text.strip():
-            continue
-
-        if _is_numeric_only(text):
-            continue
-
-        if _is_symbol_only(text):
-            continue
-
-        sym_prefix, core_text, sym_suffix = _strip_symbol_frame(text.strip())
+    def append_nodes(nodes: list[etree._Element]) -> None:
+        if not nodes:
+            return
+        handled.update(id(n) for n in nodes)
+        parts = [n.text or '' for n in nodes]
+        original_text = ''.join(parts)
+        if not original_text or not original_text.strip():
+            return
+        stripped = original_text.strip()
+        if _is_numeric_only(stripped) or _is_symbol_only(stripped):
+            return
+        sym_prefix, core_text, sym_suffix = _strip_symbol_frame(stripped)
         if not core_text:
-            continue
-
+            return
         masked_text, placeholders = _strip_protected_tokens(core_text)
-
-        # If masking consumed everything, skip to avoid OPUS-MT hallucinations.
         if _is_placeholder_only(masked_text):
-            continue
+            return
 
-        def _make_wb(e: etree._Element, orig_text: str, ph: dict[str, str],
-                     src: str, s_pre: str, s_suf: str):
-            def wb(translated: str) -> None:
-                result = _restore_protected_tokens(translated, ph)
-                if _is_hallucinated(result, src):
-                    logger.warning(
-                        "Hallucination detected; keeping original: %r -> %r",
-                        orig_text, result,
-                    )
-                    result = _restore_protected_tokens(src, ph)
-                leading  = orig_text[: len(orig_text) - len(orig_text.lstrip())]
-                trailing = orig_text[len(orig_text.rstrip()):]
-                e.text = leading + s_pre + result.strip() + s_suf + trailing
-                if leading or trailing or s_pre or s_suf:
-                    e.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-            return wb
+        def wb(translated: str) -> None:
+            result = _restore_protected_tokens(translated, placeholders)
+            if _is_hallucinated(result, masked_text):
+                logger.warning(
+                    'Hallucination detected; keeping original DrawingML text: %r -> %r',
+                    original_text, result,
+                )
+                result = _restore_protected_tokens(masked_text, placeholders)
+            leading = original_text[: len(original_text) - len(original_text.lstrip())]
+            trailing = original_text[len(original_text.rstrip()):]
+            final_text = leading + sym_prefix + result.strip() + sym_suffix + trailing
+            _redistribute_text_across_nodes(nodes, parts, final_text)
 
-        units.append(_TranslationUnit(
-            source_text=masked_text,
-            write_back=_make_wb(at_elem, text, placeholders, masked_text,
-                                sym_prefix, sym_suffix),
-        ))
+        units.append(_TranslationUnit(source_text=masked_text, write_back=wb))
+
+    for paragraph in root.iter(A_P_TAG):
+        nodes = [n for n in paragraph.iter(A_T_TAG) if n.text is not None]
+        append_nodes(nodes)
+
+    # Defensive fallback for unusual DrawingML where a:t is not inside a:p.
+    for text_node in root.iter(A_T_TAG):
+        if id(text_node) not in handled:
+            append_nodes([text_node])
 
     return units
-
 
 def _collect_vml_units(root: etree._Element) -> list[_TranslationUnit]:
     # Collect TranslationUnits from legacy VML ``<v:textpath>`` elements
@@ -1334,31 +1611,10 @@ def _collect_vml_units(root: etree._Element) -> list[_TranslationUnit]:
 def _collect_smartart_units_from_blob(
     blob: bytes,
 ) -> tuple[list[_TranslationUnit], etree._Element]:
-    # Parse a SmartArt diagramData blob and return (units, root_element)
+    # SmartArt diagramData uses DrawingML text runs too; translate logical
+    # paragraphs so run-level formatting does not fragment sentences.
     root = etree.fromstring(blob)
-    units: list[_TranslationUnit] = []
-    A_T_TAG = f'{{{_NS_A}}}t'
-
-    for at_elem in root.iter(A_T_TAG):
-        text = at_elem.text
-        if not text or not text.strip():
-            continue
-
-        def _make_wb(e: etree._Element, orig_text: str):
-            def wb(translated: str) -> None:
-                leading  = orig_text[: len(orig_text) - len(orig_text.lstrip())]
-                trailing = orig_text[len(orig_text.rstrip()):]
-                e.text = leading + translated.strip() + trailing
-                if leading or trailing:
-                    e.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-            return wb
-
-        units.append(_TranslationUnit(
-            source_text=text.strip(),
-            write_back=_make_wb(at_elem, text),
-        ))
-
-    return units, root
+    return _collect_drawingml_units(root), root
 
 
 # Zip-level patching — the key to preserving all formatting
@@ -1428,6 +1684,8 @@ def translate_docx(
     cancel_event: threading.Event | None = None,
     source_lang: str = "auto",
     progress_callback: Callable[[int, int], None] | None = None,
+    aggressive_layout_fixes: bool = False,
+    strict_errors: bool = False,
 ) -> None:
     auto_detect = source_lang == "auto"
     errors = 0
@@ -1541,16 +1799,18 @@ def translate_docx(
         )
         errors += part_errors
 
-        # Compute how much longer the translated text is compared to the source.
-        # We measure the live elem.text values via write_back, but the simplest
-        # proxy is to compare the unit texts before and after translation — the
-        # write_back closures already updated the XML, so we re-read the <w:t>
-        # nodes.  Instead, we use the translated strings that ended up in the
-        # units.  Since write_back mutates the XML in-place we can't read them
-        # back easily, so we estimate: collect current <w:t> text sum.
+        # Compare only the units that participated in translation.  The previous
+        # implementation compared those source units with *all* live <w:t> nodes
+        # in the part (including skipped numbers, symbols and unrelated text),
+        # which could greatly overestimate expansion and trigger destructive
+        # layout changes.
+        part_changed = any(
+            u.translated_text is not None and u.translated_text != u.source_text
+            for u in pool
+        )
         translated_chars = sum(
-            len(wt.text) for wt in root.iter(_WT_TAG)
-            if wt.text and wt.text.strip()
+            len(u.translated_text) if u.translated_text is not None else len(u.source_text)
+            for u in pool
         )
         expansion_ratio = (
             translated_chars / source_chars if source_chars > 0 else 1.0
@@ -1563,9 +1823,13 @@ def translate_docx(
         # Relax fixed-size containers and compress spacing so that translated
         # (often longer) text doesn't overflow table rows, text boxes, frames,
         # or push spacer-separated sections out of place.
-        _apply_layout_fixes(root, expansion_ratio)
-
-        patches[part_name] = _serialise_xml_part(root, raw)
+        if part_changed:
+            _apply_layout_fixes(
+                root, expansion_ratio, aggressive=aggressive_layout_fixes
+            )
+            patches[part_name] = _serialise_xml_part(root, raw)
+        else:
+            logger.debug("%s: no translated text changed; leaving XML part untouched", part_name)
 
     # --- SmartArt parts ---
     for part_name, root_sa, pool_sa, groups_sa in _parsed_smartart_parts:
@@ -1580,10 +1844,16 @@ def translate_docx(
             pool_sa, groups_sa, translator, target_lang, cancel_event,
             progress_callback=_offset_progress if progress_callback else None,
         )
-        patches[part_name] = _serialise_xml_part(root_sa, raw)
+        if any(
+            u.translated_text is not None and u.translated_text != u.source_text
+            for u in pool_sa
+        ):
+            patches[part_name] = _serialise_xml_part(root_sa, raw)
 
-    # --- settings.xml: suppress first-paragraph spacing at page tops ---
-    if settings_part:
+    # --- settings.xml: optional legacy aggressive layout compatibility ---
+    # This setting changes pagination globally, so do not inject it in the
+    # default preservation-first mode.
+    if settings_part and aggressive_layout_fixes:
         raw_settings = raw_parts.get(settings_part)
         if raw_settings:
             try:

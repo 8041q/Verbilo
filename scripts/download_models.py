@@ -405,28 +405,57 @@ def _lookup_ct2_repo(slug: str) -> Optional[str]:
 # Main entry point
 
 def _slug_to_pair(slug: str) -> str:
-    """Derive the canonical src-tgt folder name from a slug.
+    """Derive the language-pair folder name from a model slug.
 
-    local.py expects the model directory to be named exactly "{src}-{tgt}" so we extract
-    the last two dash-separated tokens that look like language codes
+    Prefer passing ``pair_name`` from the catalogue to ``download_opus_mt``.
+    This fallback exists for CLI/backwards compatibility and handles the model
+    family prefixes used by the bundled catalogue.
 
       tiny_eng-fra  → eng-fra
       tc-big-en-fr  → en-fr
-      en-fr         → en-fr  (already correct)
+      en-fr         → en-fr
     """
-    # Strip any leading variant prefix (tiny_, tc-big-, etc.) — keep only
-    # the part after the final underscore.
-    if "_" in slug:
-        return slug.split("_", 1)[-1]   # "tiny_eng-fra" → "eng-fra"
-    return slug                          # "en-fr" → "en-fr"
+    candidate = (slug or "").strip()
+    if "_" in candidate:
+        candidate = candidate.split("_", 1)[-1]
+    for prefix in ("tc-big-", "opus-mt-"):
+        if candidate.startswith(prefix):
+            candidate = candidate[len(prefix):]
+            break
+    return candidate
+
+
+def _validate_pair_name(pair: str) -> str:
+    pair = (pair or "").strip()
+    if not pair or pair in {".", ".."} or Path(pair).name != pair:
+        raise ValueError(f"Invalid model pair name: {pair!r}")
+    if "/" in pair or "\\" in pair:
+        raise ValueError(f"Invalid model pair name: {pair!r}")
+    return pair
+
+
+def _write_ready_sentinel(out_path: Path, *, slug: str, pair: str) -> None:
+    """Atomically mark a fully validated model as ready, including metadata."""
+    if not _validated_ct2_model(out_path):
+        raise RuntimeError(f"Refusing to mark incomplete model ready: {out_path}")
+    src, sep, tgt = pair.partition("-")
+    payload = {"version": 2, "slug": slug, "pair": pair}
+    if sep and src and tgt:
+        payload.update({"source": src, "target": tgt})
+    sentinel = out_path / _SENTINEL
+    temporary = sentinel.with_name(f".{sentinel.name}.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(temporary, sentinel)
 
 
 def download_opus_mt(slug: str, dest_dir: Optional[str] = None,
                      ct2_repo: Optional[str] = None,
-                     hf_repo: Optional[str] = None) -> Path:
+                     hf_repo: Optional[str] = None,
+                     pair_name: Optional[str] = None) -> Path:
     dest_dir = dest_dir or _DEFAULT_OPUS_DIR
-    # Output folder must be named "{src}-{tgt}" so local.py can find it.
-    pair = _slug_to_pair(slug)
+    # The GUI passes catalogue canonical_name explicitly. This avoids deriving a
+    # wrong folder from slugs such as ``tc-big-en-fr``.
+    pair = _validate_pair_name(pair_name or _slug_to_pair(slug))
     out_path = Path(dest_dir) / pair
 
     if (out_path / _SENTINEL).exists() and _validated_ct2_model(out_path):
@@ -445,7 +474,7 @@ def download_opus_mt(slug: str, dest_dir: Optional[str] = None,
         print(f"PHASE download", flush=True)
         print(f"Strategy: CT2 direct download from {ct2_repo}")
         if _download_ct2_direct(ct2_repo, out_path):
-            (out_path / _SENTINEL).write_text("ok\n")
+            _write_ready_sentinel(out_path, slug=slug, pair=pair)
             print(f"\nModel '{slug}' ready at {out_path} (load as pair '{pair}')")
             return out_path
         print("CT2 direct download failed, falling back to conversion.", file=sys.stderr)
@@ -547,7 +576,7 @@ def download_opus_mt(slug: str, dest_dir: Optional[str] = None,
     if not _validated_ct2_model(out_path):
         print("ERROR: Converted model is missing required CTranslate2 artifacts.", file=sys.stderr)
         sys.exit(1)
-    (out_path / _SENTINEL).write_text("ok\n")
+    _write_ready_sentinel(out_path, slug=slug, pair=pair)
     print(f"\nModel '{slug}' ready at {out_path} (load as pair '{pair}')")
     return out_path
 
@@ -574,6 +603,8 @@ def main():
                       help="HuggingFace repo with pre-converted CT2 model")
     opus.add_argument("--hf-repo", default=None,
                       help="HuggingFace repo name for the original model")
+    opus.add_argument("--pair-name", default=None,
+                      help="Canonical src-tgt folder name from the model catalogue")
 
     ollama = sub.add_parser("ollama", help="Pull an Ollama model for semantic PDF translation")
     ollama.add_argument("model", nargs="?", default=DEFAULT_OLLAMA_MODEL,
@@ -587,7 +618,7 @@ def main():
     if args.command == "opus-mt":
         try:
             download_opus_mt(args.slug, args.dest_dir, ct2_repo=args.ct2_repo,
-                             hf_repo=args.hf_repo)
+                             hf_repo=args.hf_repo, pair_name=args.pair_name)
         except Exception as e:
             print(f"OPUS-MT download failed: {e}", file=sys.stderr)
             sys.exit(1)

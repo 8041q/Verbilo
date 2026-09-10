@@ -117,6 +117,35 @@ def _css_color(color: int) -> str:
     return "#000000"
 
 
+def _css_font_family(font_name: str, flags: int) -> str:
+    # Embedded PDF font names are not automatically available to Story / HTML
+    # rendering. Preserve the closest generic family instead of forcing every
+    # translated line to sans-serif. PyMuPDF text flags: serif=4, mono=8.
+    name = (font_name or "").lower()
+    if (flags & 8) or any(k in name for k in ("mono", "courier", "console")):
+        return "monospace"
+    if (flags & 4) or any(k in name for k in ("serif", "times", "mincho", "song")):
+        return "serif"
+    return "sans-serif"
+
+
+def _rotation_from_dir(direction: object) -> int:
+    # Convert PyMuPDF line direction vectors to insert_htmlbox's 90-degree
+    # rotation values. Non-axis-aligned text is left unrotated rather than
+    # pretending we can faithfully reproduce arbitrary transforms.
+    try:
+        x, y = direction  # type: ignore[misc]
+        x = float(x)
+        y = float(y)
+    except Exception:
+        return 0
+    if abs(x) >= 0.92 and abs(y) <= 0.25:
+        return 0 if x >= 0 else 180
+    if abs(y) >= 0.92 and abs(x) <= 0.25:
+        return 90 if y < 0 else 270
+    return 0
+
+
 def _html_escape(text: str) -> str:
     return (
         text.replace("&", "&amp;")
@@ -162,82 +191,311 @@ def _preferred_scale_for_block(source_text: str, source_lang: str = "auto") -> f
 
 # ── block extraction ─────────────────────────────────────────────────────────
 
-def _extract_blocks(page: fitz.Page) -> list[dict]:
-    """Return block-info dicts for all text blocks on *page*.
+def _line_record(line: dict) -> dict[str, Any] | None:
+    spans = line.get("spans", [])
+    valid = [s for s in spans if s.get("text", "").strip()]
+    if not valid:
+        return None
 
-    Each dict:
-        rect        – fitz.Rect of the original block bounding box
-        text        – full plain text (lines joined by \\n) for translation
-        line_styles – list of style-dicts, one per original line, in order
-        line_rects  – list of fitz.Rect, one per original line (for per-line redaction)
-        page_width  – page width
-        page_height – page height
+    parts: list[str] = [valid[0]["text"]]
+    for k in range(1, len(valid)):
+        prev_bbox = fitz.Rect(valid[k - 1]["bbox"])
+        cur_bbox = fitz.Rect(valid[k]["bbox"])
+        gap = cur_bbox.x0 - prev_bbox.x1
+        avg_cw = prev_bbox.width / max(len(valid[k - 1]["text"]), 1)
+        if gap > avg_cw * 0.5:
+            parts.append(" ")
+        parts.append(valid[k]["text"])
+    line_text = "".join(parts).strip()
+    if not line_text:
+        return None
+
+    weight_chars: dict[int, int] = {}
+    for s in valid:
+        w = _css_weight(s["font"], s["flags"])
+        weight_chars[w] = weight_chars.get(w, 0) + len(s["text"])
+    final_weight = min(weight_chars, key=lambda w: (-weight_chars[w], w))
+    dominant = max(valid, key=lambda s: len(s["text"]))
+    rect = fitz.Rect(line["bbox"])
+    style = {
+        "size": dominant["size"],
+        "weight": final_weight,
+        "style": _css_style(dominant["flags"]),
+        "color": _css_color(dominant["color"]),
+        "font_family": _css_font_family(dominant["font"], dominant["flags"]),
+        "rotation": _rotation_from_dir(line.get("dir", (1, 0))),
+        "align": "left",
+    }
+    return {"text": line_text, "style": style, "rect": rect}
+
+
+def _rect_contains_center(container: fitz.Rect, item: fitz.Rect, tolerance: float = 1.5) -> bool:
+    cx = (item.x0 + item.x1) / 2
+    cy = (item.y0 + item.y1) / 2
+    return (
+        container.x0 - tolerance <= cx <= container.x1 + tolerance
+        and container.y0 - tolerance <= cy <= container.y1 + tolerance
+    )
+
+
+def _dominant_style(records: list[dict[str, Any]]) -> dict[str, Any]:
+    if not records:
+        return {
+            "size": 11.0, "weight": 400, "style": "normal", "color": "#000000",
+            "font_family": "sans-serif", "rotation": 0, "align": "left",
+        }
+    winner = max(records, key=lambda r: len(r["text"]))
+    return dict(winner["style"])
+
+
+def _infer_alignment_in_container(
+    records: list[dict[str, Any]],
+    container: fitz.Rect,
+) -> str:
+    if not records:
+        return "left"
+    votes = {"left": 0, "center": 0, "right": 0}
+    center_x = (container.x0 + container.x1) / 2
+    center_tol = max(container.width * 0.12, 5.0)
+    edge_tol = max(container.width * 0.08, 4.0)
+    for rec in records:
+        r = rec["rect"]
+        weight = max(len(rec["text"]), 1)
+        rcx = (r.x0 + r.x1) / 2
+        if abs(rcx - center_x) <= center_tol:
+            votes["center"] += weight
+        elif container.x1 - r.x1 <= edge_tol:
+            votes["right"] += weight
+        else:
+            votes["left"] += weight
+    return max(votes, key=votes.get)
+
+
+def _join_visual_lines(records: list[dict[str, Any]]) -> str:
+    """Join soft-wrapped visual lines into one translation unit.
+
+    PDF line breaks are layout artifacts, not necessarily sentence boundaries.
+    Table cells in particular often split a single value across several extracted
+    blocks. Preserve explicit bullet/list boundaries but otherwise let the target
+    language reflow inside the cell.
+    """
+    if not records:
+        return ""
+    ordered = sorted(records, key=lambda r: (r["rect"].y0, r["rect"].x0))
+    result = ordered[0]["text"].strip()
+    bullet_re = re.compile(r"^[\s]*[●•▪■◆◇▶►✓√×]|^[\s]*\d+[.)、]")
+    for rec in ordered[1:]:
+        nxt = rec["text"].strip()
+        if not nxt:
+            continue
+        if bullet_re.match(nxt):
+            sep = "\n"
+        elif result.endswith(("-", "–", "—", "/", "\\")):
+            sep = ""
+        else:
+            prev_last = result[-1:] if result else ""
+            next_first = nxt[:1]
+            # CJK wraps do not need an inserted Latin space.
+            if (prev_last and _is_cjk_char(prev_last)) or (next_first and _is_cjk_char(next_first)):
+                sep = ""
+            else:
+                sep = " "
+        result += sep + nxt
+    return result
+
+
+def _safe_inset_rect(rect: fitz.Rect, inset: float = 2.5) -> fitz.Rect:
+    if rect.width <= inset * 2 + 1 or rect.height <= inset * 2 + 1:
+        return fitz.Rect(rect)
+    return fitz.Rect(rect.x0 + inset, rect.y0 + inset, rect.x1 - inset, rect.y1 - inset)
+
+
+def _extract_table_blocks(
+    page: fitz.Page,
+    line_records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], set[int]]:
+    """Return table-cell blocks plus line indices consumed by those cells.
+
+    PyMuPDF's normal block extraction frequently merges all three cells of a table
+    row into one text block. Re-inserting that block destroys the column layout.
+    ``find_tables`` gives us the actual cell rectangles, so each cell becomes its
+    own translation / fitting container instead.
+    """
+    finder = getattr(page, "find_tables", None)
+    if not callable(finder):
+        return [], set()
+    try:
+        found = finder()
+        tables = list(getattr(found, "tables", []) or [])
+    except Exception:
+        logger.debug("PDF table detection failed", exc_info=True)
+        return [], set()
+
+    page_w = page.rect.width
+    page_h = page.rect.height
+    consumed: set[int] = set()
+    result: list[dict[str, Any]] = []
+    seen_cells: set[tuple[float, float, float, float]] = set()
+
+    for table_index, table in enumerate(tables):
+        rows = list(getattr(table, "rows", []) or [])
+        for row_index, row in enumerate(rows):
+            cells = list(getattr(row, "cells", []) or [])
+            for col_index, cell_bbox in enumerate(cells):
+                if not cell_bbox:
+                    continue
+                cell = fitz.Rect(cell_bbox)
+                key = tuple(round(v, 2) for v in (cell.x0, cell.y0, cell.x1, cell.y1))
+                if key in seen_cells:
+                    continue
+                seen_cells.add(key)
+
+                ids = [
+                    i for i, rec in enumerate(line_records)
+                    if i not in consumed and _rect_contains_center(cell, rec["rect"])
+                ]
+                if not ids:
+                    continue
+                records = [line_records[i] for i in ids]
+                for i in ids:
+                    consumed.add(i)
+
+                inner = _safe_inset_rect(cell, _CELL_BOUNDARY_PADDING)
+                style = _dominant_style(records)
+                style["align"] = _infer_alignment_in_container(records, inner)
+                content_y0 = min(r["rect"].y0 for r in records)
+                # Preserve the original vertical placement when there is room, but
+                # allow the layout planner to try a no-padding fallback if English
+                # expansion needs the extra height.
+                padding_top = max(0.0, min(content_y0 - inner.y0, inner.height * 0.38))
+                rotation_chars: dict[int, int] = {}
+                for rec in records:
+                    rot = int(rec["style"].get("rotation", 0))
+                    rotation_chars[rot] = rotation_chars.get(rot, 0) + len(rec["text"])
+                rotation = max(rotation_chars, key=rotation_chars.get) if rotation_chars else 0
+
+                text = _join_visual_lines(records)
+                if not text.strip():
+                    continue
+                result.append({
+                    "rect": inner,
+                    "text": text,
+                    "line_styles": [style],
+                    "line_rects": [fitz.Rect(r["rect"]) for r in records],
+                    "page_width": page_w,
+                    "page_height": page_h,
+                    "rotation": rotation,
+                    "is_table_cell": True,
+                    "fixed_container": True,
+                    "table_index": table_index,
+                    "table_row": row_index,
+                    "table_col": col_index,
+                    "padding_top_hint": padding_top,
+                    "strategy": "free",
+                    "advisor_reason": "table-cell",
+                    "content_hint": "table-cell",
+                })
+
+    return result, consumed
+
+
+def _has_parallel_lines(records: list[dict[str, Any]]) -> bool:
+    """True when one MuPDF block actually contains side-by-side regions."""
+    for i, left in enumerate(records):
+        a = left["rect"]
+        for right in records[i + 1:]:
+            b = right["rect"]
+            overlap = max(0.0, min(a.y1, b.y1) - max(a.y0, b.y0))
+            if overlap < min(a.height, b.height) * 0.45:
+                continue
+            gap = max(b.x0 - a.x1, a.x0 - b.x1)
+            if gap > max(10.0, min(a.width, b.width) * 0.12):
+                return True
+    return False
+
+
+def _make_single_line_block(
+    rec: dict[str, Any],
+    page_w: float,
+    page_h: float,
+) -> dict[str, Any]:
+    r = fitz.Rect(rec["rect"])
+    xpad = min(30.0, max(6.0, r.width * 0.12))
+    ypad = min(3.0, max(1.0, r.height * 0.12))
+    container = fitz.Rect(
+        max(0.0, r.x0 - xpad), max(0.0, r.y0 - ypad),
+        min(page_w, r.x1 + xpad), min(page_h, r.y1 + ypad),
+    )
+    style = dict(rec["style"])
+    if abs(((r.x0 + r.x1) / 2) - page_w / 2) <= page_w * 0.035:
+        style["align"] = "center"
+    else:
+        style["align"] = "left"
+    return {
+        "rect": container,
+        "text": rec["text"],
+        "line_styles": [style],
+        "line_rects": [r],
+        "page_width": page_w,
+        "page_height": page_h,
+        "rotation": int(style.get("rotation", 0)),
+        "parallel_region": True,
+    }
+
+
+def _extract_blocks(page: fitz.Page) -> list[dict]:
+    """Extract layout-aware translation regions from a PDF page.
+
+    Tables are cell-centric; ordinary content remains block-centric, except MuPDF
+    blocks containing side-by-side lines are split back into independent regions.
+    This prevents translated content from collapsing into the left-most column.
     """
     page_w = page.rect.width
     page_h = page.rect.height
     d = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
 
-    out: list[dict] = []
+    block_records: list[list[dict[str, Any]]] = []
+    all_records: list[dict[str, Any]] = []
+    record_ids_by_block: list[list[int]] = []
     for block in d.get("blocks", []):
         if block.get("type") != 0:
+            block_records.append([])
+            record_ids_by_block.append([])
             continue
-
-        lines_data: list[tuple[str, dict, fitz.Rect]] = []
-
+        records: list[dict[str, Any]] = []
+        ids: list[int] = []
         for line in block.get("lines", []):
-            spans = line.get("spans", [])
-            valid = [s for s in spans if s.get("text", "").strip()]
-            if not valid:
+            rec = _line_record(line)
+            if rec is None:
                 continue
+            ids.append(len(all_records))
+            all_records.append(rec)
+            records.append(rec)
+        block_records.append(records)
+        record_ids_by_block.append(ids)
 
-            # Join spans preserving inter-span spacing.  When the horizontal
-            # gap between consecutive spans exceeds half the average character
-            # width we insert a space so "100  50" does not become "10050".
-            parts: list[str] = [valid[0]["text"]]
-            for k in range(1, len(valid)):
-                prev_bbox = fitz.Rect(valid[k - 1]["bbox"])
-                cur_bbox  = fitz.Rect(valid[k]["bbox"])
-                gap = cur_bbox.x0 - prev_bbox.x1
-                avg_cw = prev_bbox.width / max(len(valid[k - 1]["text"]), 1)
-                if gap > avg_cw * 0.5:
-                    parts.append(" ")
-                parts.append(valid[k]["text"])
-            line_text = "".join(parts).strip()
-            if not line_text:
-                continue
+    table_blocks, consumed = _extract_table_blocks(page, all_records)
+    out: list[dict[str, Any]] = list(table_blocks)
 
-            # Majority-vote font weight: use the weight that covers the most
-            # characters.  Ties go to the lighter weight.
-            weight_chars: dict[int, int] = {}
-            for s in valid:
-                w = _css_weight(s["font"], s["flags"])
-                weight_chars[w] = weight_chars.get(w, 0) + len(s["text"])
-            final_weight = min(
-                weight_chars,
-                key=lambda w: (-weight_chars[w], w),  # most chars wins; lighter on tie
-            )
-
-            dominant = max(valid, key=lambda s: len(s["text"]))
-            lb = fitz.Rect(line["bbox"])
-
-            lines_data.append((line_text, {
-                "size":   dominant["size"],
-                "weight": final_weight,
-                "style":  _css_style(dominant["flags"]),
-                "color":  _css_color(dominant["color"]),
-                "align":  "left",  # placeholder — computed at block level below
-            }, lb))
-
-        if not lines_data:
+    for block, records, ids in zip(d.get("blocks", []), block_records, record_ids_by_block):
+        if block.get("type") != 0 or not records:
+            continue
+        residual = [rec for rec, rid in zip(records, ids) if rid not in consumed]
+        if not residual:
             continue
 
-        # ── Block-relative alignment inference ──
-        # For multi-line blocks (≥3 lines): check variance of x0 and line
-        # centres within the block.  For 1-2 line blocks: default to "left"
-        # unless the block is clearly centred on the page.
-        block_rect = fitz.Rect(block["bbox"])
-        n_lines = len(lines_data)
+        if _has_parallel_lines(residual):
+            out.extend(_make_single_line_block(rec, page_w, page_h) for rec in residual)
+            continue
 
+        lines_data = [(rec["text"], dict(rec["style"]), fitz.Rect(rec["rect"])) for rec in residual]
+        block_rect = fitz.Rect(
+            min(r.x0 for _, _, r in lines_data),
+            min(r.y0 for _, _, r in lines_data),
+            max(r.x1 for _, _, r in lines_data),
+            max(r.y1 for _, _, r in lines_data),
+        )
+        n_lines = len(lines_data)
         if n_lines >= 3:
             x0s = [lr.x0 for _, _, lr in lines_data]
             x1s = [lr.x1 for _, _, lr in lines_data]
@@ -247,7 +505,6 @@ def _extract_blocks(page: fitz.Page) -> list[dict]:
             cx_range = max(cxs) - min(cxs)
             avg_w = sum(lr.width for _, _, lr in lines_data) / n_lines
             tolerance = max(avg_w * 0.12, 4.0)
-
             if cx_range < tolerance and x0_range > tolerance:
                 block_align = "center"
             elif x1_range < tolerance and x0_range > tolerance:
@@ -255,25 +512,31 @@ def _extract_blocks(page: fitz.Page) -> list[dict]:
             else:
                 block_align = "left"
         else:
-            # 1-2 lines: default left, tight centering check
             bcx = (block_rect.x0 + block_rect.x1) / 2
             block_align = "left"
-            if (block_rect.width < page_w * 0.50
-                    and abs(bcx - page_w / 2) < page_w * 0.03):
+            if block_rect.width < page_w * 0.50 and abs(bcx - page_w / 2) < page_w * 0.03:
                 block_align = "center"
-
         for _, style, _ in lines_data:
             style["align"] = block_align
 
+        rotation_chars: dict[int, int] = {}
+        for line_text, style, _ in lines_data:
+            rot = int(style.get("rotation", 0))
+            rotation_chars[rot] = rotation_chars.get(rot, 0) + len(line_text)
+        block_rotation = max(rotation_chars, key=rotation_chars.get) if rotation_chars else 0
+
         out.append({
-            "rect":        block_rect,
-            "text":        "\n".join(t for t, _, _ in lines_data),
+            "rect": block_rect,
+            "text": "\n".join(t for t, _, _ in lines_data),
             "line_styles": [s for _, s, _ in lines_data],
-            "line_rects":  [lr for _, _, lr in lines_data],
-            "page_width":  page_w,
+            "line_rects": [lr for _, _, lr in lines_data],
+            "page_width": page_w,
             "page_height": page_h,
+            "rotation": block_rotation,
         })
 
+    # Keep deterministic visual order for translation / placement.
+    out.sort(key=lambda b: (round(fitz.Rect(b["rect"]).y0, 2), round(fitz.Rect(b["rect"]).x0, 2)))
     return out
 
 
@@ -308,6 +571,7 @@ def _build_block_html(
         # when consecutive spans have different font sizes or the renderer treats
         # the break as optional whitespace.
         inline = (
+            f"font-family:{s.get('font_family', 'sans-serif')};"
             f"font-size:{s['size']:.1f}px;"
             f"font-weight:{s['weight']};"
             f"font-style:{s['style']};"
@@ -605,6 +869,7 @@ def _fit_block(
     page_height: float,
     page_width: float = 0.0,
     preferred_scale: float = _SCALE_THRESHOLD,
+    rotate: int = 0,
 ) -> tuple[fitz.Rect, float, float]:
     # Return the best rect and probe metrics for this block's insert_htmlbox call
     if page_width <= 0:
@@ -619,7 +884,7 @@ def _fit_block(
         try:
             pg = probe[0]
             local = fitz.Rect(0, 0, r.width, r.height)
-            res = pg.insert_htmlbox(local, html, css=css, scale_low=0)
+            res = pg.insert_htmlbox(local, html, css=css, scale_low=0, rotate=rotate)
             pg.clean_contents()
             return res[0], res[1]  # (spare_height, scale)
         except Exception:
@@ -987,9 +1252,11 @@ def _insert_literal_block(
     translated_text: str,
     orig_rect: fitz.Rect,
     line_styles: list[dict[str, Any]],
+    *,
+    rotate: int = 0,
 ) -> tuple[float, float]:
     html, css = _build_block_html(translated_text, line_styles)
-    return page.insert_htmlbox(orig_rect, html, css=css, scale_low=0)
+    return page.insert_htmlbox(orig_rect, html, css=css, scale_low=0, rotate=rotate)
 
 
 # ── main entry point ─────────────────────────────────────────────────────────
@@ -1005,6 +1272,7 @@ def translate_pdf(
     progress_callback: Callable[[int, int], None] | None = None,
     advisor: Any | None = None,
     semantic_translator: Any | None = None,
+    strict_errors: bool = False,
 ) -> str | None:
     # Translate a PDF in-place while preserving the original layout
     src = fitz.open(input_path)
@@ -1053,6 +1321,14 @@ def translate_pdf(
         target_lang,
         cancel_event=cancel_event,
     )
+    # Table cells are fixed geometry containers. Advisors may classify short
+    # labels as literal/semantic, but placement must remain cell-aware.
+    for _, _blocks in page_blocks:
+        for _block in _blocks:
+            if _block.get("is_table_cell"):
+                _block["strategy"] = "free"
+                _block["advisor_reason"] = "table-cell"
+
     classify_elapsed = time.perf_counter() - classify_started
     logger.info("PDF semantic classification finished in %.2fs", classify_elapsed)
     _report(_n_pages + 1)
@@ -1147,9 +1423,27 @@ def translate_pdf(
         all_rects    = [fitz.Rect(b["rect"]) for b in blocks]
         placed_rects: list[fitz.Rect | None] = [None] * len(blocks)
 
-        # Process each block individually: redact then insert.  If insertion
-        # fails the original text is already gone so we attempt to re-insert
-        # the untranslated text as a fallback.
+        # Redact all source text in one pass *before* inserting any translations.
+        # Repeated apply_redactions calls can touch content inserted earlier.
+        # Explicit graphics=0 is important: PyMuPDF otherwise removes vector
+        # graphics fully contained by a redaction rectangle (table borders,
+        # underlines, small shapes). Images and graphics are preservation targets.
+        changed_blocks = [
+            block for block in blocks
+            if str(block.get("translated", block["text"])) != str(block["text"])
+        ]
+        for block in changed_blocks:
+            line_rects = block.get("line_rects", [])
+            if line_rects:
+                for lr in line_rects:
+                    page.add_redact_annot(lr, fill=None)  # type: ignore[arg-type]
+            else:
+                page.add_redact_annot(block["rect"], fill=None)  # type: ignore[arg-type]
+        if changed_blocks:
+            page.apply_redactions(images=0, graphics=0, text=0)  # type: ignore[arg-type]
+
+        # Process each block individually. If insertion fails, re-insert the
+        # untranslated text so the area is not left blank.
         for bi, block in enumerate(blocks):
             tr_text     = block.get("translated", block["text"])
             orig_rect   = block["rect"]
@@ -1163,16 +1457,14 @@ def translate_pdf(
             ]
             preferred_scale = _preferred_scale_for_block(block["text"], source_lang)
             strategy = _strategy_for_block(block)
+            rotation = int(block.get("rotation", 0))
 
-            # Redact per-line rects instead of the whole block rect so that
-            # vector drawings (table lines, shapes) within the block area
-            # but outside the actual text lines are preserved.
-            if line_rects:
-                for lr in line_rects:
-                    page.add_redact_annot(lr, fill=None)  # type: ignore[arg-type]
-            else:
-                page.add_redact_annot(orig_rect, fill=None)  # type: ignore[arg-type]
-            page.apply_redactions(images=0)  # type: ignore[arg-type]
+            # Pass-through / already-target-language blocks stay byte-for-byte in
+            # the original page content stream. Re-rendering unchanged text is a
+            # needless source of font, spacing and baseline drift.
+            if str(tr_text) == str(block["text"]):
+                placed_rects[bi] = orig_rect
+                continue
 
             try:
                 if strategy == "literal":
@@ -1181,6 +1473,7 @@ def translate_pdf(
                         tr_text,
                         orig_rect,
                         line_styles,
+                        rotate=rotation,
                     )
                     placed_rects[bi] = orig_rect
                     if result[0] < 0:
@@ -1196,35 +1489,46 @@ def translate_pdf(
                     logger.debug(
                         "placed page=%d bi=%d strategy=literal engine=%s src_len=%d tr_len=%d cap=%d rect=%s",
                         page_num + 1, bi,
-                        block.get("engine", "-"),
+                        block.get("translation_engine", "-"),
                         len(block["text"]), len(tr_text),
                         block.get("capacity_chars", 0),
                         orig_rect,
                     )
                 else:
                     plans: list[dict[str, Any]] = []
+                    base_padding = float(block.get("padding_top_hint", 0.0) or 0.0)
+                    padding_options = [(base_padding, 0)]
+                    if base_padding > 1.0:
+                        # If a translated table cell no longer fits at its original
+                        # vertical offset, sacrifice the offset before shrinking text
+                        # to an unreadable size.
+                        padding_options.append((0.0, 2))
                     for variant in _layout_variants_for_block(block["text"], source_lang):
-                        html, css = _build_block_html(
-                            tr_text,
-                            line_styles,
-                            line_height=variant["line_height"],
-                        )
-                        fit_rect, probe_scale, probe_spare = _fit_block(
-                            html, css, orig_rect,
-                            obstacles, siblings, page_height,
-                            page_width=page_width,
-                            preferred_scale=preferred_scale,
-                        )
-                        plans.append({
-                            "html": html,
-                            "css": css,
-                            "rect": fit_rect,
-                            "scale": probe_scale,
-                            "spare": probe_spare,
-                            "variant_name": variant["name"],
-                            "variant_priority": variant["priority"],
-                            "line_height": variant["line_height"],
-                        })
+                        for padding_top, padding_priority in padding_options:
+                            html, css = _build_block_html(
+                                tr_text,
+                                line_styles,
+                                line_height=variant["line_height"],
+                                padding_top=padding_top,
+                            )
+                            fit_rect, probe_scale, probe_spare = _fit_block(
+                                html, css, orig_rect,
+                                obstacles, siblings, page_height,
+                                page_width=page_width,
+                                preferred_scale=preferred_scale,
+                                rotate=rotation,
+                            )
+                            plans.append({
+                                "html": html,
+                                "css": css,
+                                "rect": fit_rect,
+                                "scale": probe_scale,
+                                "spare": probe_spare,
+                                "variant_name": variant["name"],
+                                "variant_priority": variant["priority"] + padding_priority,
+                                "line_height": variant["line_height"],
+                                "padding_top": padding_top,
+                            })
 
                     plan = _choose_block_plan(plans, orig_rect, preferred_scale)
                     placement = _placement_overrides_for_block(
@@ -1232,15 +1536,20 @@ def translate_pdf(
                         plan["rect"],
                         line_styles,
                     )
+                    final_padding = max(
+                        float(plan.get("padding_top", 0.0) or 0.0),
+                        float(placement.get("padding_top", 0.0) or 0.0),
+                    )
                     final_html, final_css = _build_block_html(
                         tr_text,
                         line_styles,
                         line_height=plan["line_height"],
                         align_override=placement.get("align"),
-                        padding_top=placement.get("padding_top", 0.0),
+                        padding_top=final_padding,
                     )
                     result = page.insert_htmlbox(
-                        plan["rect"], final_html, css=final_css, scale_low=0
+                        plan["rect"], final_html, css=final_css, scale_low=0,
+                        rotate=rotation,
                     )
                     placed_rects[bi] = plan["rect"]
                     if result[0] < 0:
@@ -1258,7 +1567,7 @@ def translate_pdf(
                     logger.debug(
                         "placed page=%d bi=%d strategy=%s engine=%s src_len=%d tr_len=%d cap=%d orig=%s placed=%s",
                         page_num + 1, bi, strategy,
-                        block.get("engine", "-"),
+                        block.get("translation_engine", "-"),
                         len(block["text"]), len(tr_text),
                         block.get("capacity_chars", 0),
                         orig_rect, plan["rect"],
@@ -1275,7 +1584,8 @@ def translate_pdf(
                         block["text"], line_styles
                     )
                     page.insert_htmlbox(
-                        orig_rect, fb_html, css=fb_css, scale_low=0
+                        orig_rect, fb_html, css=fb_css, scale_low=0,
+                        rotate=rotation,
                     )
                 except Exception:
                     logger.debug(
@@ -1295,5 +1605,11 @@ def translate_pdf(
     src.close()
 
     if errors:
-        raise RuntimeError(f"PDF translation completed with {errors} issue(s)")
+        message = (
+            f"PDF translation completed with {errors} issue(s); "
+            "affected blocks were restored from the original where possible"
+        )
+        if strict_errors:
+            raise RuntimeError(message)
+        logger.warning(message)
     return None

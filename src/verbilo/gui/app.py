@@ -288,8 +288,9 @@ _OPUS_CODE_MAP: dict[str, str] = {
 
 
 def _opus_code_to_iso(code: str) -> str:
-    # Convert an OPUS model code (e.g. ``eng``, ``fra``) to ISO 639-1
-    return _OPUS_CODE_MAP.get(code, code)
+    # Convert an OPUS model code (e.g. ``eng``, ``fra``) to the GUI code.
+    normalized = (code or "").strip().lower().replace("_", "-")
+    return _OPUS_CODE_MAP.get(normalized, normalized)
 
 
 def _get_default_model_dir() -> str:
@@ -309,6 +310,31 @@ def _load_models_catalogue() -> list[dict]:
 
 def _get_local_model_dir_from_cfg(cfg: dict) -> str:
     return cfg.get("local_model_dir", "").strip() or _get_default_model_dir()
+
+
+def _get_local_language_options(codes: set[str], locale: str | None = None) -> list[tuple[str, str]]:
+    """Build display options directly from installed local-model codes.
+
+    Local models must not disappear merely because ``deep_translator`` does not
+    list the same language. Use its names when available, then fall back to the
+    app localizer (and ultimately to the code itself).
+    """
+    normalized_codes = {_opus_code_to_iso(code) for code in codes if code}
+    known_names = dict(_get_language_options(locale))
+    localizer = load_ui_localizer(resolve_ui_locale(locale))
+    result: list[tuple[str, str]] = []
+    for code in normalized_codes:
+        name = known_names.get(code)
+        if not name:
+            try:
+                name = localizer.language_name(code)
+            except Exception:
+                name = code
+        if not name:
+            name = code
+        result.append((code, name))
+    result.sort(key=lambda item: (item[1].lower(), item[0]))
+    return result
 
 
 # --- searchable dropdown ---
@@ -2688,18 +2714,16 @@ class App:
             _cat_size_mb[_e["canonical_name"]] = _e.get("size_mb", 0)
 
         def _is_downloaded(canonical_name: str) -> bool:
-            # Check if a model pair is downloaded (by canonical name or ISO equivalent)
-            pair_dir = Path(model_dir) / canonical_name
-            if (pair_dir / "converted.ok").exists():
-                return True
-            # Also match via ISO-normalised codes (e.g. catalogue "en-fr" vs disk "eng-fra")
+            # Use the backend's readiness scan so "downloaded" means the model
+            # has the sentinel *and* all files required by the translator.
             parts = canonical_name.split("-", 1)
-            if len(parts) == 2:
-                iso_src = _opus_code_to_iso(parts[0])
-                iso_tgt = _opus_code_to_iso(parts[1])
-                for s, t in list_downloaded_pairs(model_dir):
-                    if _opus_code_to_iso(s) == iso_src and _opus_code_to_iso(t) == iso_tgt:
-                        return True
+            if len(parts) != 2:
+                return False
+            iso_src = _opus_code_to_iso(parts[0])
+            iso_tgt = _opus_code_to_iso(parts[1])
+            for s, t in list_downloaded_pairs(model_dir):
+                if _opus_code_to_iso(s) == iso_src and _opus_code_to_iso(t) == iso_tgt:
+                    return True
             return False
 
         # --- outer card ---
@@ -2887,6 +2911,7 @@ class App:
             dl_state[cname] = "downloading"
             dl_cumulative[cname] = {
                 "last_received": 0, "last_total": 0, "completed_bytes": 0,
+                "had_error": False,
             }
             _update_row_status(cname)
 
@@ -2917,6 +2942,9 @@ class App:
                     line = line.strip()
                     if line.startswith("ERROR:"):
                         error_received = True
+                        cum = dl_cumulative.get(cname)
+                        if cum is not None:
+                            cum["had_error"] = True
                     elif line.startswith("PHASE converting"):
                         rw = row_widgets.get(cname)
                         if rw and "progress_label" in rw:
@@ -2951,13 +2979,21 @@ class App:
                 if p_obj is None:
                     # Frozen/in-process path: wait for the sentinel from the download thread
                     if sentinel_received:
+                        cum = dl_cumulative.get(cname) or {}
+                        had_error = error_received or bool(cum.get("had_error"))
+                        verified = _is_downloaded(cname)
                         dl_procs.pop(cname, None)
                         dl_queues.pop(cname, None)
                         dl_cumulative.pop(cname, None)
-                        dl_state[cname] = "error" if error_received else "done"
+                        dl_state[cname] = "done" if (not had_error and verified) else "error"
                         _update_row_status(cname)
-                        if not error_received:
+                        if not had_error and verified:
                             self._refresh_language_dropdowns()
+                        elif not had_error:
+                            self._log(
+                                f"Model download finished, but {cname!r} is not discoverable "
+                                f"as a ready model under {model_dir!r}."
+                            )
                     else:
                         win.after(100, _poll)  # keep polling until the thread finishes
                     return
@@ -2965,13 +3001,21 @@ class App:
                 if rc is None:
                     win.after(100, _poll)
                 else:
+                    cum = dl_cumulative.get(cname) or {}
+                    had_error = bool(cum.get("had_error"))
+                    verified = rc == 0 and _is_downloaded(cname)
                     dl_procs.pop(cname, None)
                     dl_queues.pop(cname, None)
                     dl_cumulative.pop(cname, None)
-                    dl_state[cname] = "done" if rc == 0 else "error"
+                    dl_state[cname] = "done" if (verified and not had_error) else "error"
                     _update_row_status(cname)
-                    if rc == 0:
+                    if verified and not had_error:
                         self._refresh_language_dropdowns()
+                    elif rc == 0 and not had_error:
+                        self._log(
+                            f"Model download exited successfully, but {cname!r} is not "
+                            f"discoverable as a ready model under {model_dir!r}."
+                        )
 
             is_frozen = getattr(sys, "frozen", False) or "__compiled__" in globals()
             if is_frozen:
@@ -2992,7 +3036,7 @@ class App:
                     sys.stderr = writer
                     try:
                         download_opus_mt(slug, model_dir, ct2_repo=ct2_repo,
-                                         hf_repo=hf_repo)
+                                         hf_repo=hf_repo, pair_name=cname)
                     except SystemExit as e:
                         if e.code != 0:
                             q.put(f"ERROR: download failed (exit code {e.code})")
@@ -3013,6 +3057,7 @@ class App:
                 sys.executable,
                 os.path.join(scripts_dir, "download_models.py"),
                 "opus-mt", slug, "--dest-dir", model_dir,
+                "--pair-name", cname,
             ]
             if ct2_repo:
                 cmd.extend(["--ct2-repo", ct2_repo])
@@ -3419,7 +3464,7 @@ class App:
 
         source_code = self._source_lang_map.get(self.source_lang_var.get())
 
-        if not source_code:
+        if not source_code or source_code == "auto":
             tgt_codes = {_opus_code_to_iso(t) for _, t in pairs}
         else:
             tgt_codes = set()
@@ -3427,7 +3472,7 @@ class App:
                 if _opus_code_to_iso(s) == source_code:
                     tgt_codes.add(_opus_code_to_iso(t))
 
-        tgt_filtered = [(c, n) for c, n in lang_opts if c in tgt_codes]
+        tgt_filtered = _get_local_language_options(tgt_codes, self.ui.locale)
         tgt_display = [self._format_language_option(code, name) for code, name in tgt_filtered]
         self._lang_map = {self._format_language_option(code, name): code for code, name in tgt_filtered}
         self.target_lang_box.update_values(tgt_display)
@@ -3486,7 +3531,7 @@ class App:
             # Source list — languages which appear as source in at least one pair.
             # Auto-detect is valid too: the local backend groups units by the
             # detected source language and selects the matching installed pair.
-            src_filtered = [(c, n) for c, n in lang_opts if c in src_codes_set]
+            src_filtered = _get_local_language_options(src_codes_set, self.ui.locale)
             src_display = [self._format_language_option(code, name) for code, name in src_filtered]
             auto_detect_label = self.t("sidebar.auto_detect")
             source_values = [auto_detect_label] + src_display
@@ -3500,7 +3545,7 @@ class App:
             )
 
             # Target list — all targets reachable from any source
-            tgt_filtered = [(c, n) for c, n in lang_opts if c in tgt_codes_set]
+            tgt_filtered = _get_local_language_options(tgt_codes_set, self.ui.locale)
             tgt_display = [self._format_language_option(code, name) for code, name in tgt_filtered]
             self._lang_map = {self._format_language_option(code, name): code for code, name in tgt_filtered}
             self.target_lang_box.update_values(tgt_display)

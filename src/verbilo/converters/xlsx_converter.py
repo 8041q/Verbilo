@@ -6,13 +6,16 @@ from typing import Any, Callable
 import logging
 import os
 import os.path
+import shutil
 import threading
+import tempfile
 import unicodedata
 import re
 import posixpath
 from zipfile import ZipFile, ZIP_DEFLATED
 from io import BytesIO
 from ..utils import CancelledError
+from lxml import etree
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +268,60 @@ def _split_grouped_row_translation(text: str) -> list[str]:
     return _CELL_SEP_SPLIT_RE.split(text)
 
 
+def _snapshot_formula_values(input_path: str) -> list[dict[str, object]]:
+    # Snapshot the *cached results* stored in the original worksheet XML.
+    # openpyxl exposes the formula expression as cell.value for data_type='f',
+    # so using cell.value here would incorrectly write '=SUM(...)' into <v>.
+    import xml.etree.ElementTree as _ET
+
+    _SML_URI = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+    _DOC_REL_URI = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+    _PKG_REL_URI = 'http://schemas.openxmlformats.org/package/2006/relationships'
+    ns = {'s': _SML_URI, 'r': _DOC_REL_URI, 'pr': _PKG_REL_URI}
+
+    caches: list[dict[str, object]] = []
+    with ZipFile(input_path, 'r') as zin:
+        try:
+            wb_root = _ET.fromstring(zin.read('xl/workbook.xml'))
+            rel_root = _ET.fromstring(zin.read('xl/_rels/workbook.xml.rels'))
+        except Exception:
+            logger.warning('Could not snapshot XLSX formula caches', exc_info=True)
+            return caches
+
+        rel_targets = {
+            rel.get('Id'): rel.get('Target')
+            for rel in rel_root
+            if rel.get('Id') and rel.get('Target')
+        }
+
+        for sheet in wb_root.findall('.//s:sheets/s:sheet', ns):
+            rid = sheet.get(f'{{{_DOC_REL_URI}}}id')
+            target = rel_targets.get(rid)
+            cache: dict[str, object] = {}
+            if target:
+                target_path = target.lstrip('/')
+                sheet_path = (
+                    posixpath.normpath(target_path)
+                    if target_path.startswith('xl/')
+                    else posixpath.normpath(posixpath.join('xl', target_path))
+                ).replace('\\', '/')
+                try:
+                    root = _ET.fromstring(zin.read(sheet_path))
+                    sml = '{' + _SML_URI + '}'
+                    for cell in root.findall(f'.//{sml}c'):
+                        if cell.find(f'{sml}f') is None:
+                            continue
+                        v = cell.find(f'{sml}v')
+                        ref = cell.get('r')
+                        if ref and v is not None and v.text is not None:
+                            cache[ref] = v.text
+                except Exception:
+                    logger.debug('Could not read cached formula values from %s', sheet_path, exc_info=True)
+            caches.append(cache)
+
+    return caches
+
+
 def _patch_formula_values(zip_bytes: bytes, formula_cache: list[dict[str, object]]) -> bytes | None:
     # openpyxl strips the <v> element of formula cells during save.  This patches the serialised zip in memory, restoring cached values from the snapshot taken at load time.
     import xml.etree.ElementTree as _ET
@@ -329,12 +386,9 @@ def _save_preserving_orphan_rels(wb, output_path: str, input_path: str, _formula
             buf = BytesIO()
             buf.write(_patched)
 
-    original_archive = getattr(wb, 'vba_archive', None)
-    if original_archive is None:
-        with open(output_path, 'wb') as f:
-            f.write(buf.getvalue())
-        return
-
+    # Always compare against the original package.  Relying on wb.vba_archive
+    # makes preservation dependent on openpyxl internals / keep_vba behavior and
+    # can silently skip restoration for ordinary .xlsx files.
     # ── 1. Read both archives into memory ─────────────────────────────
     saved_bytes = buf.getvalue()
     saved_files: dict[str, bytes] = {}
@@ -343,8 +397,9 @@ def _save_preserving_orphan_rels(wb, output_path: str, input_path: str, _formula
             saved_files[name] = z.read(name)
 
     original_files: dict[str, bytes] = {}
-    for name in original_archive.namelist():
-        original_files[name] = original_archive.read(name)
+    with ZipFile(input_path, 'r') as original_archive:
+        for name in original_archive.namelist():
+            original_files[name] = original_archive.read(name)
 
     # ── 2. Find orphan parts ──────────────────────────────────────────
     # Parts under xl/ that exist in the original but not in the saved
@@ -461,241 +516,416 @@ def _save_preserving_orphan_rels(wb, output_path: str, input_path: str, _formula
         f.write(out_buf.getvalue())
 
 
-def translate_xlsx(input_path: str, output_path: str, translator: Any, target_lang: str, *, cancel_event: threading.Event | None = None, source_lang: str = "auto", progress_callback: 'Callable[[int, int], None] | None' = None, protected_terms: list[str] | None = None):
-    # batch-translate XLSX with row-level contextual grouping.
-    # When source_lang=="auto" row grouping is skipped so each cell is its own translation
-    # unit, letting the API auto-detect the language per cell.
-    extra_glossary_terms = frozenset(t.strip() for t in protected_terms if t and t.strip()) if protected_terms else None
 
-    wb = load_workbook(filename=input_path, rich_text=True, keep_vba=True)
+def _redistribute_text_parts(original_parts: list[str], translated: str) -> list[str]:
+    """Split one logical translation back across the original rich-text runs.
 
-    _formula_cache: list[dict[str, object]] = []
-    for _sheet in wb.worksheets:
-        _cache: dict[str, object] = {}
-        for _row in _sheet.iter_rows():
-            for _cell in _row:
-                if _cell.data_type == 'f' and _cell.value is not None:
-                    _cache[_cell.coordinate] = _cell.value
-        _formula_cache.append(_cache)
+    The concatenation of the returned parts is exactly ``translated``.  Empty
+    source runs stay empty, and boundaries are nudged toward whitespace or
+    punctuation so a font/style change is less likely to land inside a word.
+    """
+    if not original_parts:
+        return []
+    if len(original_parts) == 1:
+        return [translated]
+    if ''.join(original_parts) == translated:
+        return list(original_parts)
 
-    # --- collect every string cell that is writable, grouped by row ---
-    # Each row group: list of (cell, core_text, symbol_prefix, symbol_suffix)
-    # rich_segs: list of (cell, original_CellRichText, segment_index, sanitized_text)
-    RowGroup = list[tuple[Any, str, list[tuple[str, str]]]]
-    row_groups: list[RowGroup] = []
-    current_row: RowGroup = []
-    current_row_key: tuple | None = None  # (sheet_title, row_number)
-    rich_segs: list[tuple[Any, CellRichText, int, str, list[tuple[str, str]]]] = []
+    visible = [i for i, part in enumerate(original_parts) if part]
+    if not visible:
+        return ['' for _ in original_parts]
+    if len(visible) == 1:
+        out = ['' for _ in original_parts]
+        out[visible[0]] = translated
+        return out
 
-    for sheet in wb.worksheets:
-        for row in sheet.iter_rows(values_only=False):
-            row_cells: RowGroup = []
-            for cell in row:
-                if isinstance(cell, MergedCell):
-                    continue
-                val = cell.value
-                if isinstance(val, str) and not val.startswith("="):
-                    sanitized = _sanitize_text(val)
-                    if not sanitized.strip():
-                        continue
-                    # Skip cells that are entirely symbols (no translatable content)
-                    if _is_symbol_only(sanitized):
-                        continue
-                    sym_core, frames = _strip_symbol_frame_multiline(sanitized)
-                    if not sym_core.strip():
-                        continue
-                    row_cells.append((cell, sym_core, frames))
-                elif isinstance(val, CellRichText):
-                    for seg_idx, seg in enumerate(val):
-                        if isinstance(seg, TextBlock):
-                            text = seg.text
-                        elif isinstance(seg, str):
-                            text = seg
-                        else:
-                            continue
-                        if not (text and text.strip()):
-                            continue
-                        sanitized = _sanitize_text(text)
-                        if not sanitized.strip():
-                            continue
-                        if _is_symbol_only(sanitized):
-                            continue
-                        sym_core, frames = _strip_symbol_frame_multiline(sanitized)
-                        if not sym_core.strip():
-                            continue
-                        rich_segs.append((cell, val, seg_idx, sym_core, frames))
-            if row_cells:
-                row_groups.append(row_cells)
+    weights = [max(1, len(original_parts[i].strip()) or len(original_parts[i])) for i in visible]
+    total_weight = sum(weights)
+    target_len = len(translated)
+    safe_chars = set(' \t\r\n,.;:!?，。；：！？、/\\()[]{}<>-–—|')
+    boundaries: list[int] = []
+    cumulative = 0
+    previous = 0
 
-    total_cells = sum(len(rg) for rg in row_groups)
-    logger.info(
-        "XLSX '%s': collected %d plain-text cells in %d rows, %d rich-text segments",
-        input_path, total_cells, len(row_groups), len(rich_segs),
-    )
+    for weight in weights[:-1]:
+        cumulative += weight
+        ideal = round(target_len * cumulative / total_weight)
+        ideal = max(previous, min(ideal, target_len))
+        best = ideal
+        best_distance = 10**9
+        radius = min(14, max(4, target_len // 20))
+        lo = max(previous, ideal - radius)
+        hi = min(target_len, ideal + radius)
+        for pos in range(lo, hi + 1):
+            if pos <= previous:
+                continue
+            left_safe = pos > 0 and translated[pos - 1] in safe_chars
+            right_safe = pos < target_len and translated[pos] in safe_chars
+            if left_safe or right_safe:
+                distance = abs(pos - ideal)
+                if distance < best_distance:
+                    best = pos
+                    best_distance = distance
+        boundaries.append(best)
+        previous = best
 
-    if not row_groups and not rich_segs:
-        logger.warning("No translatable text found in XLSX file '%s'", input_path)
-        _save_preserving_orphan_rels(wb, output_path, input_path, _formula_cache)
-        return
+    starts = [0] + boundaries
+    ends = boundaries + [target_len]
+    chunks = [translated[a:b] for a, b in zip(starts, ends)]
+    out = ['' for _ in original_parts]
+    for idx, chunk in zip(visible, chunks):
+        out[idx] = chunk
+    return out
 
-    # --- build translation units: group rows or send individually ---
-    # A "unit" is either a joined row (multiple cells with separator) or a single cell.
-    # After translation we split on separator to recover per-cell results.
-    units: list[str] = []
-    # Map: unit_index -> list of (cell, original_text) to write back
-    unit_cells: list[list[tuple[Any, str]]] = []
-    # Parallel to `units`: the raw (unprotected) unit text and its glossary
-    # token map, so we can restore terms after translation and — if a
-    # placeholder got mangled in transit — fall back to translating the
-    # original unprotected text instead of leaking a raw "⟦G0⟧" token.
-    unit_raw_texts: list[str] = []
-    unit_glossary_maps: list[dict[str, str]] = []
 
-    # In auto-detect mode do NOT group cells — every cell is its own unit so the
-    # translation API sees a single-language segment and can auto-detect correctly.
-    group_rows = source_lang != "auto"
+def _translate_many_with_fallback(
+    translator: Any,
+    texts: list[str],
+    target_lang: str,
+    cancel_event: threading.Event | None,
+) -> tuple[list[str | None], int]:
+    """Translate a list while isolating failures to individual cells.
 
-    for rg in row_groups:
-        row_texts = [t for _, t, _ in rg]
-        total_chars = sum(len(t) for t in row_texts)
+    Some engines return a partially successful batch (``None`` entries) while
+    others raise for the whole request.  A spreadsheet should not be discarded
+    because a handful of cells failed, so retry only missing items and leave the
+    original cell untouched if the retry also fails.
+    """
+    if not texts:
+        return [], 0
 
-        if group_rows and len(rg) > 1 and total_chars <= _GROUP_MAX_CHARS:
-            # Group the row into a single unit with separators
-            raw_unit = _CELL_SEP.join(row_texts)
-            protected, gmap = _protect_glossary_terms(raw_unit, extra_glossary_terms)
-            units.append(protected)
-            unit_raw_texts.append(raw_unit)
-            unit_glossary_maps.append(gmap)
-            unit_cells.append(rg)
-        else:
-            for cell, core, frames in rg:
-                protected, gmap = _protect_glossary_terms(core, extra_glossary_terms)
-                units.append(protected)
-                unit_raw_texts.append(core)
-                unit_glossary_maps.append(gmap)
-                unit_cells.append([(cell, core, frames)])
-
-    rich_raw_texts = [t for _, _, _, t, _ in rich_segs]
-    rich_protected_pairs = [_protect_glossary_terms(t, extra_glossary_terms) for t in rich_raw_texts]
-    rich_units = [p for p, _ in rich_protected_pairs]
-    rich_glossary_maps = [g for _, g in rich_protected_pairs]
-
-    # --- batch-translate (plain cells + rich-text segments in one call) ---
-    plain_count = len(units)
-    all_units = units + rich_units
-    all_raw_texts = unit_raw_texts + rich_raw_texts
-    all_glossary_maps = unit_glossary_maps + rich_glossary_maps
-    total_units = len(all_units)
-    translation_errors = 0
+    translated: list[str | None] = [None] * len(texts)
     try:
-        translated_all = translator.translate_batch(all_units, target_lang, cancel_event=cancel_event)
-        if len(translated_all) != total_units:
-            raise ValueError("translate_batch returned the wrong number of results")
+        batch = translator.translate_batch(texts, target_lang, cancel_event=cancel_event)
+        if isinstance(batch, (list, tuple)):
+            for i in range(min(len(batch), len(texts))):
+                if batch[i] is not None:
+                    translated[i] = str(batch[i])
+        if len(batch) != len(texts):
+            logger.warning(
+                "XLSX translate_batch returned %d results for %d inputs; retrying missing items",
+                len(batch), len(texts),
+            )
     except CancelledError:
         raise
     except Exception:
-        logger.exception("Batch translation failed for XLSX; falling back to per-item")
-        translated_all = []
-        for t in all_units:
+        logger.exception("Batch translation failed for XLSX; retrying cells individually")
+
+    failures = 0
+    translate_text = getattr(translator, 'translate_text', None)
+    for i, item in enumerate(translated):
+        if item is not None:
+            continue
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError("Translation cancelled")
+        try:
+            if callable(translate_text):
+                result = translate_text(texts[i], target_lang)
+            else:
+                singleton = translator.translate_batch([texts[i]], target_lang, cancel_event=cancel_event)
+                result = singleton[0] if singleton else None
+        except CancelledError:
+            raise
+        except Exception:
+            logger.debug("XLSX translation failed for one cell; keeping original", exc_info=True)
+            failures += 1
+            continue
+        if result is None:
+            failures += 1
+        else:
+            translated[i] = str(result)
+
+    return translated, failures
+
+
+def _xlsx_set_text_node(node: etree._Element, text: str) -> None:
+    node.text = text
+    xml_space = '{http://www.w3.org/XML/1998/namespace}space'
+    if text[:1].isspace() or text[-1:].isspace():
+        node.set(xml_space, 'preserve')
+
+
+def _xlsx_collect_text_nodes(container: etree._Element, text_tag: str) -> list[etree._Element]:
+    """Collect visible text nodes while excluding phonetic/ruby helpers."""
+    nodes: list[etree._Element] = []
+    for node in container.iter(text_tag):
+        parent = node.getparent()
+        skip = False
+        while parent is not None and parent is not container:
+            if etree.QName(parent).localname in {'rPh', 'phoneticPr'}:
+                skip = True
+                break
+            parent = parent.getparent()
+        if not skip:
+            nodes.append(node)
+    return nodes
+
+
+def _xlsx_prepare_unit(
+    nodes: list[etree._Element],
+    extra_glossary_terms: frozenset | None,
+) -> dict[str, Any] | None:
+    if not nodes:
+        return None
+    original_parts = [node.text or '' for node in nodes]
+    original_text = ''.join(original_parts)
+    if not original_text or not original_text.strip():
+        return None
+
+    sanitized = _sanitize_text(original_text)
+    if not sanitized.strip() or _is_symbol_only(sanitized):
+        return None
+    core_text, frames = _strip_symbol_frame_multiline(sanitized)
+    if not core_text.strip():
+        return None
+    protected, glossary_map = _protect_glossary_terms(core_text, extra_glossary_terms)
+    return {
+        'nodes': nodes,
+        'original_parts': original_parts,
+        'original_text': original_text,
+        'raw_text': core_text,
+        'source_text': protected,
+        'frames': frames,
+        'glossary_map': glossary_map,
+    }
+
+
+def _xlsx_parse_xml(data: bytes) -> etree._Element:
+    parser = etree.XMLParser(resolve_entities=False, remove_blank_text=False, recover=False)
+    return etree.fromstring(data, parser=parser)
+
+
+def _xlsx_serialize_xml(root: etree._Element, original: bytes) -> bytes:
+    encoding = 'UTF-8'
+    if original.startswith(b'<?xml'):
+        try:
+            decl = original[: original.index(b'?>') + 2].decode('ascii', errors='ignore')
+            m = re.search(r'encoding=["\\\']([^"\\\']+)', decl, re.I)
+            if m:
+                encoding = m.group(1)
+        except Exception:
+            pass
+    standalone = b'standalone="yes"' in original[:200] or b"standalone='yes'" in original[:200]
+    return etree.tostring(
+        root,
+        xml_declaration=True,
+        encoding=encoding,
+        standalone=True if standalone else None,
+    )
+
+
+def _xlsx_rebuild_package(
+    input_path: str,
+    output_path: str,
+    patches: dict[str, bytes],
+) -> None:
+    """Rebuild the OOXML zip, changing only explicitly patched XML parts."""
+    if not patches:
+        if os.path.abspath(input_path) != os.path.abspath(output_path):
+            shutil.copy2(input_path, output_path)
+        return
+    out_dir = os.path.dirname(os.path.abspath(output_path)) or '.'
+    os.makedirs(out_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix='.verbilo-xlsx-', suffix='.tmp', dir=out_dir)
+    os.close(fd)
+    try:
+        with ZipFile(input_path, 'r') as zin, ZipFile(tmp_path, 'w') as zout:
+            zout.comment = zin.comment
+            for info in zin.infolist():
+                data = patches.get(info.filename)
+                if data is None:
+                    data = zin.read(info.filename)
+                # Passing the original ZipInfo preserves timestamps, attributes,
+                # compression method, comments and extra metadata.
+                zout.writestr(info, data)
+        os.replace(tmp_path, output_path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def translate_xlsx(
+    input_path: str,
+    output_path: str,
+    translator: Any,
+    target_lang: str,
+    *,
+    cancel_event: threading.Event | None = None,
+    source_lang: str = "auto",
+    progress_callback: 'Callable[[int, int], None] | None' = None,
+    protected_terms: list[str] | None = None,
+    group_rows: bool = False,
+    strict_errors: bool = False,
+):
+    """Translate spreadsheet text by patching OOXML text parts directly.
+
+    Phase 2 deliberately does *not* save the workbook through openpyxl.  Re-saving
+    a complex 43 MB catalog can rewrite/drop unsupported drawing/media/package
+    features even when only a few cell strings changed.  Instead we modify only
+    ``sharedStrings.xml`` (plus true inline strings and DrawingML shape text when
+    present) and copy every other zip member untouched at the XML-content level.
+
+    Rich shared strings are one logical translation unit; their translated text is
+    redistributed across the original ``<r>`` runs so fonts/colours/bold styling
+    remain attached.  Failed units retain their original text.  ``strict_errors``
+    restores fail-the-whole-file behaviour for callers that explicitly want it.
+    """
+    if group_rows:
+        logger.info(
+            'XLSX phase-2 OOXML mode ignores group_rows: shared/inline strings are translated as logical cells'
+        )
+
+    extra_glossary_terms = (
+        frozenset(t.strip() for t in protected_terms if t and t.strip())
+        if protected_terms else None
+    )
+    SML_NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+    A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+    SML_T = f'{{{SML_NS}}}t'
+    SML_SI = f'{{{SML_NS}}}si'
+    SML_IS = f'{{{SML_NS}}}is'
+    A_T = f'{{{A_NS}}}t'
+    A_P = f'{{{A_NS}}}p'
+
+    roots: dict[str, tuple[etree._Element, bytes]] = {}
+    units: list[dict[str, Any]] = []
+
+    with ZipFile(input_path, 'r') as zin:
+        names = set(zin.namelist())
+
+        # Shared strings cover the normal cell text path, including rich text.
+        shared_name = 'xl/sharedStrings.xml'
+        if shared_name in names:
+            raw = zin.read(shared_name)
+            root = _xlsx_parse_xml(raw)
+            roots[shared_name] = (root, raw)
+            for si in root.iter(SML_SI):
+                unit = _xlsx_prepare_unit(
+                    _xlsx_collect_text_nodes(si, SML_T), extra_glossary_terms,
+                )
+                if unit is not None:
+                    unit['part_name'] = shared_name
+                    units.append(unit)
+
+        # Some producers use inlineStr instead of sharedStrings.  Parse a sheet
+        # only when that marker is present, avoiding needless sheet reserialization.
+        for name in sorted(n for n in names if n.startswith('xl/worksheets/') and n.endswith('.xml')):
+            raw = zin.read(name)
+            if b'inlineStr' not in raw:
+                continue
+            root = _xlsx_parse_xml(raw)
+            found_unit = False
+            for inline in root.iter(SML_IS):
+                unit = _xlsx_prepare_unit(
+                    _xlsx_collect_text_nodes(inline, SML_T), extra_glossary_terms,
+                )
+                if unit is not None:
+                    unit['part_name'] = name
+                    units.append(unit)
+                    found_unit = True
+            if found_unit:
+                roots[name] = (root, raw)
+
+        # Text boxes/shapes in worksheet drawings use DrawingML <a:p>/<a:t>.
+        # Pictures and anchors contain no <a:t>, so they remain byte-identical.
+        drawing_parts = sorted(
+            n for n in names
+            if (n.startswith('xl/drawings/') or n.startswith('xl/diagrams/'))
+            and n.endswith('.xml')
+        )
+        for name in drawing_parts:
+            raw = zin.read(name)
+            if b'<a:t' not in raw and b':t>' not in raw:
+                continue
             try:
-                r = translator.translate_text(t, target_lang)
-                translated_all.append(r if r is not None else t)
+                root = _xlsx_parse_xml(raw)
             except Exception:
-                logger.exception("Per-item fallback also failed")
-                translated_all.append(t)
-                translation_errors += 1
+                logger.debug('Skipping unparseable drawing text part %s', name, exc_info=True)
+                continue
+            found_unit = False
+            for paragraph in root.iter(A_P):
+                text_nodes = list(paragraph.iter(A_T))
+                unit = _xlsx_prepare_unit(text_nodes, extra_glossary_terms)
+                if unit is not None:
+                    unit['part_name'] = name
+                    units.append(unit)
+                    found_unit = True
+            if found_unit:
+                roots[name] = (root, raw)
+
+    logger.info("XLSX '%s': collected %d logical OOXML text units", input_path, len(units))
+    if not units:
+        _xlsx_rebuild_package(input_path, output_path, {})
+        return
+
+    source_texts = [str(unit['source_text']) for unit in units]
+    translated, errors = _translate_many_with_fallback(
+        translator, source_texts, target_lang, cancel_event,
+    )
+
+    changed_parts: set[str] = set()
+    for index, (unit, tr_text) in enumerate(zip(units, translated)):
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError('Translation cancelled')
+
+        raw_text = str(unit['raw_text'])
+        if tr_text is None:
+            # Per-item fallback already logged/counts this failure.
+            continue
+
+        gmap = unit['glossary_map']
+        if gmap:
+            restored = _restore_glossary_terms(tr_text, gmap)
+            if _glossary_tokens_intact(restored):
+                tr_text = restored
+            else:
+                logger.debug('XLSX glossary token mismatch; retrying one unprotected unit')
+                try:
+                    retry = translator.translate_text(raw_text, target_lang)
+                except CancelledError:
+                    raise
+                except Exception:
+                    logger.debug('XLSX glossary retry failed', exc_info=True)
+                    errors += 1
+                    continue
+                if retry is None:
+                    errors += 1
+                    continue
+                tr_text = str(retry)
+
+        final_text = _reattach_symbol_frame_multiline(tr_text, unit['frames'])
+        original_text = str(unit['original_text'])
+        if final_text == original_text:
+            continue
+
+        chunks = _redistribute_text_parts(unit['original_parts'], final_text)
+        for node, chunk in zip(unit['nodes'], chunks):
+            _xlsx_set_text_node(node, chunk)
+        changed_parts.add(str(unit['part_name']))
+
+        if progress_callback is not None and (index + 1 == len(units) or (index + 1) % 10 == 0):
+            progress_callback(index + 1, len(units))
 
     if progress_callback is not None:
-        progress_callback(total_units, total_units)
+        progress_callback(len(units), len(units))
 
-    # --- restore protected glossary terms ---
-    for i, (tr_text, gmap, raw_text) in enumerate(zip(translated_all, all_glossary_maps, all_raw_texts)):
-        if tr_text is None or not gmap:
-            continue
-        restored = _restore_glossary_terms(tr_text, gmap)
-        if _glossary_tokens_intact(restored):
-            translated_all[i] = restored
-            continue
-        # A placeholder token survived mangled (rare, but possible with some
-        # engines) — re-translate the original unprotected text for just
-        # this unit rather than leaving a raw "⟦G0⟧" token in the output.
-        logger.debug("XLSX glossary token mismatch for unit; re-translating without protection")
-        try:
-            r = translator.translate_text(raw_text, target_lang)
-            translated_all[i] = r if r is not None else raw_text
-        except Exception:
-            logger.exception("Glossary-mismatch fallback translation failed")
-            translated_all[i] = raw_text
-            translation_errors += 1
+    patches: dict[str, bytes] = {}
+    for name in changed_parts:
+        root, original = roots[name]
+        patches[name] = _xlsx_serialize_xml(root, original)
 
-    plain_translated = translated_all[:plain_count]
-    rich_translated = translated_all[plain_count:]
-
-    # --- write results back (plain cells) ---
-    errors = translation_errors
-    for cells_in_unit, tr_text in zip(unit_cells, plain_translated):
-        if tr_text is None:
-            # Translation returned None — keep originals
-            errors += 1
-            continue
-
-        if len(cells_in_unit) == 1:
-            cell, orig, frames = cells_in_unit[0]
-            cell.value = _reattach_symbol_frame_multiline(tr_text, frames)
-        else:
-            # Grouped row — split on separator
-            parts = _split_grouped_row_translation(tr_text)
-            if len(parts) == len(cells_in_unit):
-                for (cell, orig, frames), part in zip(cells_in_unit, parts):
-                  translated_part = part.strip() if part else orig
-                  cell.value = _reattach_symbol_frame_multiline(translated_part, frames)
-            else:
-                # Separator was consumed/mangled by the model — fall back to
-                # per-cell translation for this row
-                logger.debug(
-                    "XLSX row separator mismatch: expected %d, got %d; per-cell fallback",
-                    len(cells_in_unit), len(parts),
-                )
-                for cell, orig, frames in cells_in_unit:
-                    try:
-                        r = translator.translate_text(orig, target_lang)
-                        cell.value = _reattach_symbol_frame_multiline(r if r is not None else orig, frames)
-                    except Exception:
-                        logger.exception("Per-cell fallback failed")
-                        cell.value = _reattach_symbol_frame_multiline(orig, frames)
-                        errors += 1
-
-    # --- write results back (rich-text cells) ---
-    # Group translated segments by cell so each cell is written exactly once.
-    # cell_rich_updates: id(cell) -> (cell, original_CellRichText, {seg_idx: translated_text})
-    cell_rich_updates: dict[int, tuple[Any, CellRichText, dict[int, str]]] = {}
-    for (cell, rt, seg_idx, _, frames), tr_text in zip(rich_segs, rich_translated):
-        cid = id(cell)
-        if cid not in cell_rich_updates:
-            cell_rich_updates[cid] = (cell, rt, {})
-        if tr_text is not None:
-            cell_rich_updates[cid][2][seg_idx] = _reattach_symbol_frame_multiline(tr_text, frames)
-
-    for cid, (cell, rt, updates) in cell_rich_updates.items():
-        if not updates:
-            # Every segment translation failed for this cell
-            errors += 1
-            continue
-        new_segs: list[TextBlock | str] = []
-        for i, seg in enumerate(rt):
-            if i in updates:
-                if isinstance(seg, TextBlock):
-                    new_segs.append(TextBlock(seg.font, updates[i]))
-                else:
-                    new_segs.append(updates[i])
-            else:
-                new_segs.append(seg)
-        cell.value = CellRichText(*new_segs)
-
-    # Check for cancellation before saving
     if cancel_event is not None and cancel_event.is_set():
-        raise CancelledError("Translation cancelled before saving XLSX")
+        raise CancelledError('Translation cancelled before saving XLSX')
+    _xlsx_rebuild_package(input_path, output_path, patches)
 
-    _save_preserving_orphan_rels(wb, output_path, input_path, _formula_cache)
     if errors:
-        raise RuntimeError(f"Translation completed with {errors} failed cells")
+        message = (
+            f'Translation completed with {errors} failed cells/text units; '
+            'their original text was preserved'
+        )
+        if strict_errors:
+            raise RuntimeError(message)
+        logger.warning(message)
