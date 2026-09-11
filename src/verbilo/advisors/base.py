@@ -11,7 +11,7 @@ from ..utils import CancelledError
 logger = logging.getLogger(__name__)
 
 BlockStrategy = Literal["literal", "semantic", "free"]
-ContentHint = Literal["heading", "body"]
+ContentHint = Literal["heading", "body", "table-cell"]
 PageBlocks = list[tuple[int, list[dict[str, Any]]]]
 
 
@@ -44,7 +44,12 @@ class AdvisorBase(ABC):
                     raise CancelledError("Translation cancelled")
 
                 capacity_chars = self.estimate_capacity_chars(block)
-                content_hint = self.infer_content_hint(block, page_font_baseline)
+                preset_content_hint = str(block.get("content_hint", "")).strip().lower()
+                content_hint: ContentHint
+                if preset_content_hint in {"heading", "body", "table-cell"}:
+                    content_hint = preset_content_hint  # type: ignore[assignment]
+                else:
+                    content_hint = self.infer_content_hint(block, page_font_baseline)
                 preset_reason = str(block.get("advisor_reason", "")).strip()
                 preset_strategy = str(block.get("strategy", "")).strip().lower()
                 if preset_reason and preset_strategy in {"literal", "semantic", "free"}:

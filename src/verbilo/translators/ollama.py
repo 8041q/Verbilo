@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 from .cache import get_cache
 from .http_session import make_session
 from ..utils import CancelledError
+from ..semantic import ProtectedText, TranslationUnit
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ _SEMANTIC_L1_CACHE: dict[str, dict[str, dict[str, str]]] = {}
 _SEMANTIC_L1_CACHE_LOCK = threading.Lock()
 _SEMANTIC_BATCH_MAX_ITEMS = 8
 _SEMANTIC_BATCH_MAX_CHARS = 4000
-_OLLAMA_SEMANTIC_CACHE_VERSION = "v3"
+_OLLAMA_SEMANTIC_CACHE_VERSION = "v5"
 _HAN_CHAR_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 
 # Models that only do translation (plain-text prompt, no system message, no JSON).
@@ -745,6 +746,20 @@ class OllamaSemanticTranslator:
             cancel_event=None,
         )
 
+    def translate_units(
+        self,
+        units: list[TranslationUnit],
+        target_lang: str,
+        *,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> list[str | None]:
+        """Translate format-neutral semantic units without discarding metadata."""
+        return self.translate_blocks(
+            [unit.to_backend_block() for unit in units],
+            target_lang,
+            cancel_event=cancel_event,
+        )
+
     def translate_batch(
         self,
         texts: list[str],
@@ -752,16 +767,16 @@ class OllamaSemanticTranslator:
         *,
         cancel_event: Optional[threading.Event] = None,
     ) -> list[str | None]:
-        blocks = [
-            {
-                "text": text,
-                "content_hint": "body",
-                "strategy": "semantic",
-            }
-            for text in texts
-        ]
-        return self.translate_blocks(
-            blocks,
+        return self.translate_units(
+            [
+                TranslationUnit(
+                    text=text,
+                    source_lang=self._source_lang,
+                    role="body",
+                    mode="natural",
+                )
+                for text in texts
+            ],
             target_lang,
             cancel_event=cancel_event,
         )
@@ -800,16 +815,29 @@ class OllamaSemanticTranslator:
                 continue
 
             source_lang = str(block.get("source_lang", self._source_lang) or self._source_lang)
-            content_hint = str(block.get("content_hint", "body") or "body")
+            content_hint = str(block.get("content_hint", block.get("role", "body")) or "body")
+            role = str(block.get("role", content_hint) or content_hint)
             strategy = str(block.get("strategy", "semantic") or "semantic")
+            translation_mode = str(block.get("translation_mode", "natural") or "natural")
+            context = block.get("context") if isinstance(block.get("context"), dict) else {}
             capacity_chars = max(int(block.get("capacity_chars") or 0), 0)
-            source_visible_chars = len(" ".join(text.split()))
-            line_count = max(1, len(text.split("\n")))
+            max_lines = max(int(block.get("max_lines") or 0), 0)
+            source_visible_chars = max(
+                int(block.get("source_visible_chars") or len(" ".join(text.split()))), 0
+            )
+            line_count = max(
+                int(block.get("line_count") or len(text.split("\n"))), 1
+            )
             cache_source = self._cache_source_key(
                 text=text,
                 source_lang=source_lang,
                 content_hint=content_hint,
                 strategy=strategy,
+                translation_mode=translation_mode,
+                role=role,
+                context=context,
+                capacity_chars=capacity_chars,
+                max_lines=max_lines,
             )
 
             cached = target_cache.get(cache_source)
@@ -832,8 +860,12 @@ class OllamaSemanticTranslator:
                     "text": text,
                     "source_lang": source_lang,
                     "content_hint": content_hint,
+                    "role": role,
                     "strategy": strategy,
+                    "translation_mode": translation_mode,
+                    "context": context,
                     "capacity_chars": capacity_chars,
+                    "max_lines": max_lines,
                     "source_visible_chars": source_visible_chars,
                     "line_count": line_count,
                 },
@@ -867,10 +899,19 @@ class OllamaSemanticTranslator:
                 results[idx] = translated
 
         cache_pairs: list[tuple[str, str]] = []
-        for cache_source, item in pending.items():
+
+        def store_result(cache_source: str, item: dict[str, Any], translated: str | None) -> None:
+            if translated is None:
+                metrics["fallback_items"] += len(item["indices"])
+                return
+            target_cache[cache_source] = translated
+            for result_idx in item["indices"]:
+                results[result_idx] = translated
+            cache_pairs.append((cache_source, translated))
+
+        def translate_one_pending(cache_source: str, item: dict[str, Any]) -> None:
             if cancel_event is not None and cancel_event.is_set():
                 raise CancelledError("Translation cancelled")
-
             metrics["llm_calls"] += 1
             translated = self._translate_one(
                 text=item["text"],
@@ -878,20 +919,60 @@ class OllamaSemanticTranslator:
                 source_lang=item["source_lang"],
                 content_hint=item["content_hint"],
                 strategy=item["strategy"],
+                translation_mode=item.get("translation_mode", "natural"),
+                role=item.get("role", item.get("content_hint", "body")),
+                context=item.get("context") if isinstance(item.get("context"), dict) else {},
                 capacity_chars=item.get("capacity_chars", 0),
+                max_lines=item.get("max_lines", 0),
                 source_visible_chars=item.get("source_visible_chars", 0),
                 line_count=item.get("line_count", 1),
                 cancel_event=cancel_event,
             )
+            store_result(cache_source, item, translated)
 
-            if translated is None:
-                metrics["fallback_items"] += len(item["indices"])
-                continue
+        pending_items = list(pending.items())
+        if _is_translation_only_model(self._model):
+            # HY-MT / TranslateGemma use model-specific plain-text chat templates
+            # and do not support the instruction-model JSON batching protocol.
+            for cache_source, item in pending_items:
+                translate_one_pending(cache_source, item)
+        else:
+            for batch in self._iter_semantic_batches(pending_items):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CancelledError("Translation cancelled")
 
-            target_cache[cache_source] = translated
-            for idx in item["indices"]:
-                results[idx] = translated
-            cache_pairs.append((cache_source, translated))
+                # A one-item tail gets no efficiency benefit from the JSON envelope
+                # and is more robust through the existing single-item request path.
+                if len(batch) == 1:
+                    cache_source, item = batch[0]
+                    translate_one_pending(cache_source, item)
+                    continue
+
+                batch_items = [item for _, item in batch]
+                metrics["llm_calls"] += 1
+                metrics["batch_requests"] += 1
+                try:
+                    batch_results = self._translate_many(
+                        items=batch_items,
+                        target_lang=target_lang,
+                        cancel_event=cancel_event,
+                    )
+                except CancelledError:
+                    raise
+                except Exception:
+                    logger.warning(
+                        "Semantic batch request failed for %d items; retrying individually",
+                        len(batch),
+                        exc_info=True,
+                    )
+                    batch_results = {}
+
+                for local_idx, (cache_source, item) in enumerate(batch):
+                    translated = batch_results.get(local_idx)
+                    if translated is not None:
+                        store_result(cache_source, item, translated)
+                    else:
+                        translate_one_pending(cache_source, item)
 
         if cache_pairs:
             get_cache().put_batch(self._engine_cache_key(), cache_pairs, target_lang)
@@ -950,13 +1031,30 @@ class OllamaSemanticTranslator:
 
         translations: dict[int, str] = {}
         for idx, item in enumerate(items):
-            translated_text = parsed.get(idx)
-            if translated_text is None:
+            raw_translated = parsed.get(idx)
+            if raw_translated is None:
                 continue
-            translations[idx] = self._post_process_semantic_translation(
-                str(item.get("text", "")),
-                translated_text,
+
+            source_text = str(item.get("text", ""))
+            source_lang = str(item.get("source_lang", self._source_lang) or self._source_lang)
+            normalized = self._post_process_semantic_translation(source_text, raw_translated)
+            failure_reason = self._semantic_failure_reason(
+                source_text=source_text,
+                translated_text=normalized,
+                raw_translated_text=raw_translated,
+                source_lang=source_lang,
+                target_lang=target_lang,
             )
+            if failure_reason is not None:
+                logger.debug(
+                    "Semantic batch item rejected id=%d reason=%s source=%r output=%r",
+                    idx,
+                    failure_reason,
+                    source_text[:80],
+                    normalized[:80],
+                )
+                continue
+            translations[idx] = normalized
         return translations
 
     def _translate_one(
@@ -967,7 +1065,11 @@ class OllamaSemanticTranslator:
         source_lang: str,
         content_hint: str,
         strategy: str,
+        translation_mode: str = "natural",
+        role: str = "body",
+        context: dict[str, Any] | None = None,
         capacity_chars: int = 0,
+        max_lines: int = 0,
         source_visible_chars: int = 0,
         line_count: int = 1,
         cancel_event: Optional[threading.Event],
@@ -995,7 +1097,13 @@ class OllamaSemanticTranslator:
         else:
             if _retry:
                 system_prompt, user_prompt = self._build_retry_prompt(
-                    text=text, target_lang=target_lang,
+                    text=text,
+                    target_lang=target_lang,
+                    translation_mode=translation_mode,
+                    role=role,
+                    context=context,
+                    capacity_chars=capacity_chars,
+                    max_lines=max_lines,
                 )
             else:
                 system_prompt, user_prompt = self._build_prompt(
@@ -1004,7 +1112,11 @@ class OllamaSemanticTranslator:
                     target_lang=target_lang,
                     content_hint=content_hint,
                     strategy=strategy,
+                    translation_mode=translation_mode,
+                    role=role,
+                    context=context,
                     capacity_chars=capacity_chars,
+                    max_lines=max_lines,
                     source_visible_chars=source_visible_chars,
                     line_count=line_count,
                 )
@@ -1015,55 +1127,39 @@ class OllamaSemanticTranslator:
 
         raw_translated = str(translated or "")
         normalized = self._post_process_semantic_translation(text, raw_translated)
-
-        # Guard 1: empty output (Qwen returned only a think block or nothing)
-        if not normalized.strip():
-            logger.debug(
-                "Semantic translator returned empty output for source_len=%d; treating as failure",
-                len(text),
-            )
-            return None
-
-        # Guard 2: echo-back detection for non-HY-MT (Qwen) models.
-        # If the source is predominantly Chinese and the output is also predominantly
-        # Chinese but the target language is not Chinese, Qwen echoed the source.
-        if not _is_translation_only_model(self._model) and not target_lang.lower().startswith("zh"):
-            src_chars = len(text)
-            src_cjk = len(_HAN_CHAR_RE.findall(text))
-            out_cjk = len(_HAN_CHAR_RE.findall(normalized))
-            if src_chars > 0 and src_cjk / src_chars > 0.25 and out_cjk / max(len(normalized), 1) > 0.25:
-                if not _retry:
-                    logger.debug(
-                        "Qwen echo-back on first attempt, retrying with simplified prompt: %r",
-                        text[:60],
-                    )
-                    return self._translate_one(
-                        text=text,
-                        target_lang=target_lang,
-                        source_lang=source_lang,
-                        content_hint=content_hint,
-                        strategy=strategy,
-                        capacity_chars=capacity_chars,
-                        source_visible_chars=source_visible_chars,
-                        line_count=line_count,
-                        cancel_event=cancel_event,
-                        _retry=True,
-                    )
-                logger.warning(
-                    "Qwen returned source-language text (likely untranslated) on retry; keeping original: %r",
-                    text[:60],
-                )
-                return None
-
-        failure_reason = self._translation_only_failure_reason(
+        failure_reason = self._semantic_failure_reason(
             source_text=text,
             translated_text=normalized,
             raw_translated_text=raw_translated,
             source_lang=source_lang,
+            target_lang=target_lang,
         )
+
+        if failure_reason == "source-echo" and not _retry:
+            logger.debug(
+                "Qwen echo-back on first attempt, retrying with simplified prompt: %r",
+                text[:60],
+            )
+            return self._translate_one(
+                text=text,
+                target_lang=target_lang,
+                source_lang=source_lang,
+                content_hint=content_hint,
+                strategy=strategy,
+                translation_mode=translation_mode,
+                role=role,
+                context=context,
+                capacity_chars=capacity_chars,
+                max_lines=max_lines,
+                source_visible_chars=source_visible_chars,
+                line_count=line_count,
+                cancel_event=cancel_event,
+                _retry=True,
+            )
+
         if failure_reason is not None:
             logger.debug(
-                "HY-MT semantic block rejected reason=%s source_lang=%s source_len=%d",
+                "Semantic block rejected reason=%s source_lang=%s source_len=%d",
                 failure_reason,
                 source_lang,
                 len(text),
@@ -1071,29 +1167,62 @@ class OllamaSemanticTranslator:
             return None
         return normalized
 
+    @staticmethod
+    def _mode_instruction(
+        translation_mode: str,
+        *,
+        capacity_chars: int = 0,
+        max_lines: int = 0,
+    ) -> str:
+        mode = str(translation_mode or "natural").lower()
+        if mode == "faithful":
+            instruction = (
+                "Stay close to the source wording, terminology, tone, and document role. "
+                "Do not paraphrase, summarize, embellish, or omit information unless target-language grammar requires it."
+            )
+        elif mode == "concise":
+            instruction = (
+                "Preserve all required meaning while using the shortest natural wording that fits the document role. "
+                "Do not drop required facts merely to make the result shorter."
+            )
+            if capacity_chars > 0:
+                instruction += (
+                    f" Treat {capacity_chars} characters as the character budget and fit within it when a faithful natural translation can do so."
+                )
+            if max_lines > 0:
+                instruction += f" Prefer wording that fits within {max_lines} line(s)."
+        else:
+            instruction = (
+                "Translate fluently and completely, preserving meaning, nuance, tone, and document role. "
+                "Do not shorten merely to reduce length, and do not expand beyond what the source implies."
+            )
+            if capacity_chars > 0:
+                instruction += (
+                    f" A {capacity_chars}-character layout budget is available; respect it when possible without sacrificing completeness."
+                )
+            if max_lines > 0:
+                instruction += f" Prefer wording that fits within {max_lines} line(s) without omitting meaning."
+        return instruction
+
     def _semantic_system_prompt(self) -> str:
         prompt = (
-            "You are a translation engine for layout-constrained documents. "
-            "Output ONLY the translated text, nothing else — no explanations, no notes, no commentary, no alternatives. "
-            "Preserve meaning, tone, and document role. Preserve meaningful line breaks. "
-            "If translating Chinese source, the texts are compact; their translations must be equally compact. "
-            "Do not add qualifiers, articles, connectives, or words not implied by the source. "
-            "A short source phrase must yield a short target phrase, never a full sentence. "
-            "For labels, headings, numbers, or wording-sensitive text, stay close to the source wording. "
-            "If several translations are valid, always choose the shortest natural wording that preserves the source meaning. "
-            "If the source contains the literal marker ⟪SEP⟫, copy every ⟪SEP⟫ marker to the output unchanged and in the same order. "
-            "Numeric placeholder tokens in the form [[N0]], [[N1]], … and unit tokens in the form [[U0]], [[U1]], … must be copied "
-            "verbatim into the output in the same position relative to the surrounding translated words. Never translate, remove, or expand them. "
-            "Glossary placeholder tokens in the form ⟦G0⟧, ⟦G1⟧, … mark currency codes, Incoterms, or trade abbreviations that "
-            "have already been protected; copy each one verbatim, in its original position, and never translate, split, or alter it. "
-            "When the payload includes capacity_chars and source_visible_chars, treat capacity_chars as the available character budget "
-            "for the translation. If source_visible_chars is near or above capacity_chars, use the tightest natural wording possible "
-            "without dropping required meaning."
+            "You are a translation engine for structured documents. "
+            "Output ONLY the translated text, nothing else — no explanations, notes, commentary, or alternatives. "
+            "Preserve meaningful line breaks and the source's document role. "
+            "Each item declares a translation_mode: Natural mode means fluent, complete translation and must not be shortened merely for brevity. "
+            "Concise mode means preserve all required meaning using compact natural wording, applying any supplied layout budget only to that item. "
+            "Faithful mode means stay close to source wording and terminology without unnecessary paraphrase. "
+            "Context is reference-only: use section, neighboring text, metadata, and terminology only to disambiguate the source; "
+            "never translate the context itself or add facts from context that are absent from source_text. "
+            "When context contains a terminology mapping, use those target terms consistently when the corresponding source term occurs. "
+            "If the source contains the literal marker ⟪SEP⟫, copy every ⟪SEP⟫ marker unchanged and in the same order. "
+            "Numeric placeholder tokens [[N0]], [[N1]], … and unit tokens [[U0]], [[U1]], … must be copied verbatim. "
+            "Glossary placeholder tokens ⟦G0⟧, ⟦G1⟧, … must also be copied verbatim and in the original relative position."
         )
-        if self._domain_hint:
+        domain_hint = getattr(self, "_domain_hint", None)
+        if domain_hint:
             prompt += (
-                f" Domain context: {self._domain_hint}. Translate labels and descriptions using the "
-                "standard terminology of that domain rather than a literal word-for-word rendering."
+                f" Domain context: {domain_hint}. Use standard terminology for that domain when the source is ambiguous."
             )
         return prompt
 
@@ -1252,35 +1381,79 @@ class OllamaSemanticTranslator:
     ) -> tuple[str, str]:
         system_prompt = (
             self._semantic_system_prompt()
-            + " Translate every item in the provided array. Return JSON only using the shape "
+            + " For this batch request, the JSON envelope is the only exception to the bare-text output rule. "
+            + "Translate every item independently. Return JSON only using the shape "
             + '{"translations":[{"id":0,"translation":"..."}]}. '
-            + "Return exactly one entry for every input id, keep ids unchanged, and preserve meaningful line breaks inside each translation string."
+            + "Return exactly one entry for every input id, keep ids unchanged, and preserve meaningful line breaks inside each translation string. "
+            + "Apply each item's content_hint, role, translation_mode, strategy, context, and layout constraint only to that item; "
+            + "never let one item's metadata or constraints affect another."
         )
+
+        prompt_items: list[dict[str, Any]] = []
+        for idx, item in enumerate(items):
+            translation_mode = str(item.get("translation_mode", "natural") or "natural")
+            capacity_chars = max(int(item.get("capacity_chars") or 0), 0)
+            max_lines = max(int(item.get("max_lines") or 0), 0)
+            default_source_lang = getattr(self, "_source_lang", "auto") or "auto"
+            prompt_item: dict[str, Any] = {
+                "id": idx,
+                "source_lang": str(item.get("source_lang", default_source_lang) or default_source_lang),
+                "content_hint": str(item.get("content_hint", item.get("role", "body")) or "body"),
+                "role": str(item.get("role", item.get("content_hint", "body")) or "body"),
+                "strategy": str(item.get("strategy", "semantic") or "semantic"),
+                "translation_mode": translation_mode,
+                "mode_instruction": self._mode_instruction(
+                    translation_mode,
+                    capacity_chars=capacity_chars,
+                    max_lines=max_lines,
+                ),
+                "source_text": str(item.get("text", "")),
+            }
+            if capacity_chars > 0:
+                prompt_item["capacity_chars"] = capacity_chars
+                prompt_item["source_visible_chars"] = max(int(item.get("source_visible_chars") or 0), 0)
+                prompt_item["line_count"] = max(int(item.get("line_count") or 1), 1)
+            if max_lines > 0:
+                prompt_item["max_lines"] = max_lines
+            context = item.get("context")
+            if isinstance(context, dict) and context:
+                prompt_item["context"] = context
+            prompt_items.append(prompt_item)
+
         user_prompt = json.dumps(
             {
                 "target_lang": target_lang,
-                "items": [
-                    {
-                        "id": idx,
-                        "source_lang": str(item.get("source_lang", self._source_lang) or self._source_lang),
-                        "content_hint": str(item.get("content_hint", "body") or "body"),
-                        "strategy": str(item.get("strategy", "semantic") or "semantic"),
-                        "source_text": str(item.get("text", "")),
-                    }
-                    for idx, item in enumerate(items)
-                ],
+                "items": prompt_items,
             },
             ensure_ascii=False,
         )
         return system_prompt, user_prompt
 
-    def _build_retry_prompt(self, *, text: str, target_lang: str) -> tuple[str, str]:
+    def _build_retry_prompt(
+        self,
+        *,
+        text: str,
+        target_lang: str,
+        translation_mode: str = "natural",
+        role: str = "body",
+        context: dict[str, Any] | None = None,
+        capacity_chars: int = 0,
+        max_lines: int = 0,
+    ) -> tuple[str, str]:
         lang_name = _LANG_CODE_TO_NAME.get(target_lang.lower(), target_lang)
         system_prompt = (
-            f"You are a translator. Translate the text given by the user into {lang_name}. "
-            "Output ONLY the translation. Do not repeat the source text. "
-            "For proper nouns and company names, output a transliteration or descriptive English translation."
+            f"Translate the user's source text into {lang_name}. Output ONLY the translation. "
+            "Do not repeat the source text. Preserve [[N#]], [[U#]], ⟦G#⟧, and ⟪SEP⟫ placeholders verbatim. "
+            f"Document role: {role}. "
+            + self._mode_instruction(
+                translation_mode, capacity_chars=capacity_chars, max_lines=max_lines
+            )
         )
+        if context:
+            system_prompt += (
+                " Context is reference-only and must not be translated or copied into the output unless source_text itself requires it: "
+                + json.dumps(context, ensure_ascii=False, sort_keys=True)
+            )
         return system_prompt, text
 
     def _build_prompt(
@@ -1291,7 +1464,11 @@ class OllamaSemanticTranslator:
         target_lang: str,
         content_hint: str,
         strategy: str,
+        translation_mode: str = "natural",
+        role: str = "body",
+        context: dict[str, Any] | None = None,
         capacity_chars: int = 0,
+        max_lines: int = 0,
         source_visible_chars: int = 0,
         line_count: int = 1,
     ) -> tuple[str, str]:
@@ -1300,13 +1477,24 @@ class OllamaSemanticTranslator:
             "source_lang": source_lang,
             "target_lang": target_lang,
             "content_hint": content_hint,
+            "role": role or content_hint,
             "strategy": strategy,
+            "translation_mode": translation_mode,
+            "mode_instruction": self._mode_instruction(
+                translation_mode,
+                capacity_chars=capacity_chars,
+                max_lines=max_lines,
+            ),
             "source_text": text,
         }
         if capacity_chars > 0:
             payload["capacity_chars"] = capacity_chars
             payload["source_visible_chars"] = source_visible_chars
             payload["line_count"] = line_count
+        if max_lines > 0:
+            payload["max_lines"] = max_lines
+        if context:
+            payload["context"] = context
         user_prompt = json.dumps(payload, ensure_ascii=False)
         return system_prompt, user_prompt
 
@@ -1328,8 +1516,41 @@ class OllamaSemanticTranslator:
             inner = inner[1:-1].strip()
 
         if not inner:
-            return source_text
+            return ""
         return leading + inner + trailing
+
+    def _semantic_failure_reason(
+        self,
+        *,
+        source_text: str,
+        translated_text: str,
+        raw_translated_text: str,
+        source_lang: str,
+        target_lang: str,
+    ) -> str | None:
+        if not str(translated_text or "").strip():
+            return "empty"
+
+        if not self._protected_tokens_match(source_text, translated_text):
+            return "protected-token-mismatch"
+
+        if not _is_translation_only_model(self._model) and not target_lang.lower().startswith("zh"):
+            src_chars = len(source_text)
+            src_cjk = len(_HAN_CHAR_RE.findall(source_text))
+            out_cjk = len(_HAN_CHAR_RE.findall(translated_text))
+            if (
+                src_chars > 0
+                and src_cjk / src_chars > 0.25
+                and out_cjk / max(len(translated_text), 1) > 0.25
+            ):
+                return "source-echo"
+
+        return self._translation_only_failure_reason(
+            source_text=source_text,
+            translated_text=translated_text,
+            raw_translated_text=raw_translated_text,
+            source_lang=source_lang,
+        )
 
     def _translation_only_failure_reason(
         self,
@@ -1364,6 +1585,7 @@ class OllamaSemanticTranslator:
             raise ValueError("Semantic batch payload did not contain a translations list")
 
         parsed: dict[int, str] = {}
+        duplicate_ids: set[int] = set()
         for raw_item in raw_items:
             if not isinstance(raw_item, dict):
                 continue
@@ -1372,6 +1594,11 @@ class OllamaSemanticTranslator:
             try:
                 item_id = int(raw_id)
             except (TypeError, ValueError):
+                continue
+
+            if item_id in parsed or item_id in duplicate_ids:
+                parsed.pop(item_id, None)
+                duplicate_ids.add(item_id)
                 continue
 
             translated_text = raw_item.get("translation", raw_item.get("translated_text"))
@@ -1385,6 +1612,13 @@ class OllamaSemanticTranslator:
 
         return parsed
 
+    @staticmethod
+    def _protected_tokens_match(source_text: str, translated_text: str) -> bool:
+        """Use the shared format-neutral protected-token parity validator."""
+        return ProtectedText(str(source_text or "")).tokens_match(
+            str(translated_text or "")
+        )
+
     def _cache_source_key(
         self,
         *,
@@ -1392,6 +1626,11 @@ class OllamaSemanticTranslator:
         source_lang: str,
         content_hint: str,
         strategy: str,
+        capacity_chars: int = 0,
+        max_lines: int = 0,
+        translation_mode: str = "natural",
+        role: str = "body",
+        context: dict[str, Any] | None = None,
     ) -> str:
         return json.dumps(
             {
@@ -1399,6 +1638,12 @@ class OllamaSemanticTranslator:
                 "source_lang": source_lang,
                 "content_hint": content_hint,
                 "strategy": strategy,
+                "translation_mode": translation_mode,
+                "role": role,
+                "context": context or {},
+                "capacity_chars": max(int(capacity_chars or 0), 0),
+                "max_lines": max(int(max_lines or 0), 0),
+                "domain_hint": self._domain_hint or "",
             },
             ensure_ascii=False,
             sort_keys=True,

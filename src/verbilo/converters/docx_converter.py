@@ -7,12 +7,18 @@ import threading
 import zipfile
 import io
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from lxml import etree
 from docx.oxml.ns import qn
 
 from ..utils import CancelledError
+from ..semantic import (
+    ProtectedText,
+    TranslationContext,
+    TranslationService,
+    TranslationUnit as SemanticTranslationUnit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +71,74 @@ class _TranslationUnit:
     # Store the actual translator result so layout heuristics compare like-for-like
     # text instead of comparing translated nodes against every text node in a part.
     translated_text: str | None = field(default=None, repr=False)
+    raw_text: str | None = field(default=None, repr=False)
+    protected_tokens: dict[str, str] = field(default_factory=dict, repr=False)
+    role: str = "body"
+
+
+
+
+def _docx_part_role(part_name: str | None) -> str:
+    lower = str(part_name or "").lower()
+    if lower.startswith("word/header"):
+        return "header"
+    if lower.startswith("word/footer"):
+        return "footer"
+    if lower in {"word/footnotes.xml", "word/endnotes.xml"}:
+        return "footnote"
+    if "diagrams/data" in lower or "diagramdata" in lower:
+        return "shape"
+    return "body"
+
+
+def _docx_context_text(unit: _TranslationUnit, limit: int = 240) -> str:
+    text = str(unit.raw_text or unit.source_text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _docx_mode_for_role(role: str) -> str:
+    if role == "heading":
+        return "faithful"
+    if role in {"shape", "label", "caption", "table-cell", "header", "footer"}:
+        return "concise"
+    return "natural"
+
+
+def _docx_context_for_index(
+    units: list[_TranslationUnit],
+    index: int,
+    *,
+    part_role: str,
+    part_name: str | None,
+) -> TranslationContext:
+    section = None
+    for previous in reversed(units[:index]):
+        if previous.is_heading:
+            section = _docx_context_text(previous) or None
+            break
+
+    before: list[str] = []
+    for previous in reversed(units[:index]):
+        text = _docx_context_text(previous)
+        if text:
+            before.append(text)
+            break
+
+    after: list[str] = []
+    for following in units[index + 1 :]:
+        text = _docx_context_text(following)
+        if text:
+            after.append(text)
+            break
+
+    metadata = {"part_role": part_role}
+    if part_name:
+        metadata["xml_part"] = part_name
+    return TranslationContext.from_values(
+        section=section, before=before, after=after, metadata=metadata
+    )
 
 
 # Grouping + batch translate
@@ -121,66 +195,61 @@ def _translate_and_writeback(
     target_lang: str,
     cancel_event: threading.Event | None,
     progress_callback: Callable[[int, int], None] | None = None,
+    *,
+    source_lang: str = "auto",
+    translation_service: TranslationService | None = None,
+    part_name: str | None = None,
+    part_role: str = "body",
 ) -> int:
-    #  Translate each group and call write_back on each unit. Returns error count. Uses ``translate_batch`` when available, falling back to ``translate_text`` for single-item groups
-    
-    has_batch = callable(getattr(translator, 'translate_batch', None))
-    has_text  = callable(getattr(translator, 'translate_text', None))
-
-    if not has_batch and not has_text:
-        raise AttributeError(
-            f"{type(translator).__name__} exposes neither translate_batch nor "
-            "translate_text — cannot translate."
-        )
-
+    """Translate grouped DOCX units through the shared format-neutral service."""
+    service = translation_service or TranslationService(translator)
     total_groups = len(groups)
     errors = 0
+
     for gi, group in enumerate(groups):
         if cancel_event is not None and cancel_event.is_set():
             raise CancelledError("Translation cancelled")
 
-        texts = [units[i].source_text for i in group]
-
-        # ── Batch path (preferred) ────────────────────────────────────────────
-        if has_batch and len(group) > 1:
-            try:
-                translated_parts = translator.translate_batch(
-                    texts, target_lang, cancel_event=cancel_event
-                )
-                if len(translated_parts) != len(texts):
-                    raise ValueError("translate_batch returned wrong number of results")
-                for idx, i in enumerate(group):
-                    if translated_parts[idx] is not None:
-                        units[i].write_back(translated_parts[idx])
-                        units[i].translated_text = str(translated_parts[idx])
-                if progress_callback is not None:
-                    progress_callback(gi + 1, total_groups)
-                continue
-            except CancelledError:
-                raise
-            except Exception:
-                logger.warning(
-                    "translate_batch failed for group %s; falling back to translate_text",
-                    group, exc_info=True,
-                )
-                # fall through to per-item path below
-
-        # ── Per-item path (single items, or batch fallback) ───────────────────
-        translate_fn = (
-            translator.translate_text if has_text
-            else lambda t, tl: translator.translate_batch([t], tl)[0]
-        )
+        semantic_units: list[SemanticTranslationUnit] = []
         for i in group:
-            try:
-                result = translate_fn(units[i].source_text, target_lang)
-                if result is not None:
-                    units[i].write_back(result)
-                    units[i].translated_text = str(result)
-            except CancelledError:
-                raise
-            except Exception:
-                logger.warning("Failed to translate unit %d", i, exc_info=True)
+            unit = units[i]
+            protected = None
+            if unit.protected_tokens:
+                protected = ProtectedText(unit.source_text, unit.protected_tokens)
+            role = (
+                "heading"
+                if unit.is_heading
+                else (unit.role if unit.role and unit.role != "body" else part_role)
+            )
+            semantic_units.append(
+                SemanticTranslationUnit(
+                    text=unit.raw_text or unit.source_text,
+                    source_lang=source_lang,
+                    role=role,
+                    mode=_docx_mode_for_role(role),
+                    context=_docx_context_for_index(
+                        units, i, part_role=part_role, part_name=part_name
+                    ),
+                    protected=protected,
+                    metadata={
+                        "content_hint": role,
+                        "strategy": "semantic",
+                    },
+                )
+            )
+
+        batch = service.translate_units(
+            semantic_units,
+            target_lang,
+            cancel_event=cancel_event,
+        )
+        for local_idx, i in enumerate(group):
+            result = batch.texts[local_idx]
+            if result is None:
                 errors += 1
+                continue
+            units[i].write_back(result)
+            units[i].translated_text = str(result)
 
         if progress_callback is not None:
             progress_callback(gi + 1, total_groups)
@@ -204,6 +273,16 @@ def _is_in_heading(elem: etree._Element) -> bool:
                     if val.lower().startswith('heading'):
                         return True
             return False
+        node = node.getparent()
+    return False
+
+
+def _is_in_table_cell(elem: etree._Element) -> bool:
+    node = elem
+    table_cell = qn("w:tc")
+    while node is not None:
+        if node.tag == table_cell:
+            return True
         node = node.getparent()
     return False
 
@@ -1502,10 +1581,13 @@ def _collect_wt_units(root: etree._Element) -> list[_TranslationUnit]:
             units.append(_TranslationUnit(
                 source_text=masked_text,
                 is_heading=is_heading,
+                role="table-cell" if _is_in_table_cell(nodes[0]) else "body",
                 write_back=_make_wb(
                     nodes, original_parts, original_text, placeholders,
                     masked_text, sym_prefix, sym_suffix,
                 ),
+                raw_text=core_text,
+                protected_tokens=placeholders,
             ))
 
         for kind, node in _iter_local_paragraph_events(paragraph):
@@ -1572,7 +1654,13 @@ def _collect_drawingml_units(root: etree._Element) -> list[_TranslationUnit]:
             final_text = leading + sym_prefix + result.strip() + sym_suffix + trailing
             _redistribute_text_across_nodes(nodes, parts, final_text)
 
-        units.append(_TranslationUnit(source_text=masked_text, write_back=wb))
+        units.append(_TranslationUnit(
+            source_text=masked_text,
+            write_back=wb,
+            raw_text=core_text,
+            protected_tokens=placeholders,
+            role="shape",
+        ))
 
     for paragraph in root.iter(A_P_TAG):
         nodes = [n for n in paragraph.iter(A_T_TAG) if n.text is not None]
@@ -1603,6 +1691,8 @@ def _collect_vml_units(root: etree._Element) -> list[_TranslationUnit]:
         units.append(_TranslationUnit(
             source_text=text,
             write_back=_make_wb(tp_elem),
+            raw_text=text,
+            role="shape",
         ))
 
     return units
@@ -1686,9 +1776,11 @@ def translate_docx(
     progress_callback: Callable[[int, int], None] | None = None,
     aggressive_layout_fixes: bool = False,
     strict_errors: bool = False,
+    terminology: Mapping[str, str] | None = None,
 ) -> None:
     auto_detect = source_lang == "auto"
     errors = 0
+    translation_service = TranslationService(translator, terminology=terminology)
 
     if cancel_event is not None and cancel_event.is_set():
         raise CancelledError("Translation cancelled before starting")
@@ -1796,6 +1888,10 @@ def translate_docx(
         part_errors = _translate_and_writeback(
             pool, groups, translator, target_lang, cancel_event,
             progress_callback=_offset_progress if progress_callback else None,
+            source_lang=source_lang,
+            translation_service=translation_service,
+            part_name=part_name,
+            part_role=_docx_part_role(part_name),
         )
         errors += part_errors
 
@@ -1843,6 +1939,10 @@ def translate_docx(
         errors += _translate_and_writeback(
             pool_sa, groups_sa, translator, target_lang, cancel_event,
             progress_callback=_offset_progress if progress_callback else None,
+            source_lang=source_lang,
+            translation_service=translation_service,
+            part_name=part_name,
+            part_role="shape",
         )
         if any(
             u.translated_text is not None and u.translated_text != u.source_text
@@ -1879,4 +1979,10 @@ def translate_docx(
         _patch_docx_in_place(output_path, patches)
 
     if errors:
-        raise RuntimeError(f"Translation completed with {errors} failed units")
+        message = (
+            f"Translation completed with {errors} failed units; "
+            "their original text was preserved"
+        )
+        if strict_errors:
+            raise RuntimeError(message)
+        logger.warning(message)

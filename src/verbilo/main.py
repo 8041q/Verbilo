@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 import threading
 from uuid import uuid4
-from typing import Callable
+from typing import Callable, Mapping
 from .advisors import AdvisorBase, NullAdvisor
 from .translators.factory import TranslatorFactory
 from .translators.base import Translator
@@ -38,6 +38,7 @@ def translate_file(
     translator_override: Translator | None = None,
     *,
     overwrite: bool = False,
+    terminology: Mapping[str, str] | None = None,
 ):
     # source_lang="auto" translates everything. Results are staged and committed
     # atomically, so a cancellation or error never publishes a partial document.
@@ -89,15 +90,23 @@ def translate_file(
 
     try:
         if suffix == ".docx":
-            docx_converter.translate_docx(str(p), str(staged_output), translator, target_lang, cancel_event=cancel_event, source_lang=source_lang, progress_callback=progress_callback)
+            docx_converter.translate_docx(
+                str(p), str(staged_output), translator, target_lang,
+                cancel_event=cancel_event, source_lang=source_lang,
+                progress_callback=progress_callback, terminology=terminology,
+            )
         elif suffix == ".xlsx":
-            xlsx_converter.translate_xlsx(str(p), str(staged_output), translator, target_lang, cancel_event=cancel_event, source_lang=source_lang, progress_callback=progress_callback)
+            xlsx_converter.translate_xlsx(
+                str(p), str(staged_output), translator, target_lang,
+                cancel_event=cancel_event, source_lang=source_lang,
+                progress_callback=progress_callback, terminology=terminology,
+            )
         else:
             result = pdf_converter.translate_pdf(
                 str(p), str(staged_output), translator, target_lang,
                 cancel_event=cancel_event, source_lang=source_lang,
                 progress_callback=progress_callback, advisor=advisor,
-                semantic_translator=semantic_translator,
+                semantic_translator=semantic_translator, terminology=terminology,
             )
             if result == "skipped-ocr":
                 return "skipped-ocr"

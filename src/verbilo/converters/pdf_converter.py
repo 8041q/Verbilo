@@ -26,11 +26,12 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import fitz  # PyMuPDF >= 1.24
 from ..advisors import NullAdvisor
 from ..utils import CancelledError
+from ..semantic import TranslationConstraints, TranslationService, TranslationUnit as SemanticTranslationUnit
 
 logger = logging.getLogger(__name__)
 
@@ -391,7 +392,7 @@ def _extract_table_blocks(
                     "table_row": row_index,
                     "table_col": col_index,
                     "padding_top_hint": padding_top,
-                    "strategy": "free",
+                    "strategy": "semantic",
                     "advisor_reason": "table-cell",
                     "content_hint": "table-cell",
                 })
@@ -1129,44 +1130,39 @@ def _translate_units_with_fallback(
     if not texts:
         return [], []
 
-    failed_indices: list[int]
-    try:
-        batch_results = translator.translate_batch(
-            texts,
-            target_lang,
-            cancel_event=cancel_event,
-        )
-    except CancelledError:
-        raise
-    except Exception:
-        logger.exception("%s failed; falling back to per-item", log_prefix)
-        batch_results = None
+    service = TranslationService(translator)
+    batch = service.translate_units(
+        [SemanticTranslationUnit(text=text, mode="natural") for text in texts],
+        target_lang,
+        cancel_event=cancel_event,
+    )
+    failed = batch.failed_indices
+    results = [
+        source if translated is None else str(translated)
+        for source, translated in zip(texts, batch.texts)
+    ]
+    if failed:
+        logger.warning("%s left %d item(s) untranslated", log_prefix, len(failed))
+    return results, failed
 
-    results, failed_indices = _normalize_translation_results(texts, batch_results)
-    if not failed_indices:
-        return results, []
 
-    remaining_failures: list[int] = []
-    for idx in failed_indices:
-        if cancel_event is not None and cancel_event.is_set():
-            raise CancelledError("Translation cancelled")
-        try:
-            item = translator.translate_text(texts[idx], target_lang)
-        except CancelledError:
-            raise
-        except Exception:
-            logger.exception("%s per-item fallback failed", log_prefix)
-            remaining_failures.append(idx)
-            results[idx] = texts[idx]
-            continue
-
-        if item is None:
-            remaining_failures.append(idx)
-            results[idx] = texts[idx]
-        else:
-            results[idx] = item
-
-    return results, remaining_failures
+def _translation_unit_from_pdf_block(block: dict[str, Any]) -> SemanticTranslationUnit:
+    text = str(block.get("text", ""))
+    capacity_chars = max(int(block.get("capacity_chars") or 0), 0)
+    content_hint = str(block.get("content_hint", "body") or "body")
+    strategy = _strategy_for_block(block)
+    return SemanticTranslationUnit(
+        text=text,
+        source_lang=str(block.get("source_lang", "auto") or "auto"),
+        role=content_hint,
+        mode="concise" if strategy == "semantic" else "natural",
+        constraints=TranslationConstraints(
+            max_chars=capacity_chars or None,
+            source_visible_chars=len(" ".join(text.split())),
+            source_line_count=max(1, len(text.split("\n"))),
+        ),
+        metadata={"content_hint": content_hint, "strategy": strategy},
+    )
 
 
 def _translate_blocks_with_fallback(
@@ -1180,54 +1176,17 @@ def _translate_blocks_with_fallback(
     if not blocks:
         return [], []
 
-    translate_blocks = getattr(translator, "translate_blocks", None)
-    texts = [str(block.get("text", "")) for block in blocks]
-
-    if callable(translate_blocks):
-        try:
-            batch_results = translate_blocks(
-                blocks,
-                target_lang,
-                cancel_event=cancel_event,
-            )
-        except CancelledError:
-            raise
-        except Exception:
-            logger.exception("%s failed; falling back to per-item", log_prefix)
-        else:
-            results, failed_indices = _normalize_translation_results(texts, batch_results)
-            if not failed_indices:
-                return results, []
-
-            remaining_failures: list[int] = []
-            for idx in failed_indices:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise CancelledError("Translation cancelled")
-                try:
-                    item = translator.translate_text(texts[idx], target_lang)
-                except CancelledError:
-                    raise
-                except Exception:
-                    logger.exception("%s per-item fallback failed", log_prefix)
-                    remaining_failures.append(idx)
-                    results[idx] = texts[idx]
-                    continue
-
-                if item is None:
-                    remaining_failures.append(idx)
-                    results[idx] = texts[idx]
-                else:
-                    results[idx] = item
-
-            return results, remaining_failures
-
-    return _translate_units_with_fallback(
-        translator,
-        texts,
-        target_lang,
-        cancel_event=cancel_event,
-        log_prefix=log_prefix,
-    )
+    units = [_translation_unit_from_pdf_block(block) for block in blocks]
+    service = TranslationService(translator)
+    batch = service.translate_units(units, target_lang, cancel_event=cancel_event)
+    failed = batch.failed_indices
+    results = [
+        unit.text if translated is None else str(translated)
+        for unit, translated in zip(units, batch.texts)
+    ]
+    if failed:
+        logger.warning("%s left %d item(s) untranslated", log_prefix, len(failed))
+    return results, failed
 
 
 def _classify_blocks(
@@ -1273,6 +1232,7 @@ def translate_pdf(
     advisor: Any | None = None,
     semantic_translator: Any | None = None,
     strict_errors: bool = False,
+    terminology: Mapping[str, str] | None = None,
 ) -> str | None:
     # Translate a PDF in-place while preserving the original layout
     src = fitz.open(input_path)
@@ -1321,14 +1281,6 @@ def translate_pdf(
         target_lang,
         cancel_event=cancel_event,
     )
-    # Table cells are fixed geometry containers. Advisors may classify short
-    # labels as literal/semantic, but placement must remain cell-aware.
-    for _, _blocks in page_blocks:
-        for _block in _blocks:
-            if _block.get("is_table_cell"):
-                _block["strategy"] = "free"
-                _block["advisor_reason"] = "table-cell"
-
     classify_elapsed = time.perf_counter() - classify_started
     logger.info("PDF semantic classification finished in %.2fs", classify_elapsed)
     _report(_n_pages + 1)
@@ -1367,34 +1319,26 @@ def translate_pdf(
 
     semantic_started = time.perf_counter()
     if semantic_entries:
-        semantic_results, semantic_failures = _translate_blocks_with_fallback(
+        semantic_units = [_translation_unit_from_pdf_block(block) for block in semantic_blocks]
+        semantic_service = TranslationService(
             semantic_translator,
-            semantic_blocks,
-            target_lang,
-            cancel_event=cancel_event,
-            log_prefix="Semantic PDF translation",
+            fallback_translator=translator,
+            terminology=terminology,
         )
-        semantic_engine = _engine_name_for_translator(semantic_translator)
-        semantic_engines = [semantic_engine] * len(semantic_entries)
-
-        if semantic_failures:
-            fallback_units = [semantic_blocks[idx]["text"] for idx in semantic_failures]
-            fallback_results, fallback_failures = _translate_units_with_fallback(
-                translator,
-                fallback_units,
-                target_lang,
-                cancel_event=cancel_event,
-                log_prefix="Semantic fallback translation",
-            )
-            for local_idx, fallback_text in zip(semantic_failures, fallback_results):
-                semantic_results[local_idx] = fallback_text
-                semantic_engines[local_idx] = primary_engine
-            errors += len(fallback_failures)
+        semantic_batch = semantic_service.translate_units(
+            semantic_units, target_lang, cancel_event=cancel_event,
+        )
+        errors += len(semantic_batch.failed_indices)
 
         for idx, (pdi, bi) in enumerate(semantic_entries):
             blocks = page_blocks[pdi][1]
-            blocks[bi]["translated"] = semantic_results[idx]
-            blocks[bi]["translation_engine"] = semantic_engines[idx]
+            translated = semantic_batch.texts[idx]
+            if translated is None:
+                translated = semantic_blocks[idx]["text"]
+            blocks[bi]["translated"] = translated
+            blocks[bi]["translation_engine"] = (
+                semantic_batch.engines[idx] or primary_engine
+            )
     semantic_elapsed = time.perf_counter() - semantic_started
     logger.info(
         "PDF semantic translation finished in %.2fs for %s blocks",

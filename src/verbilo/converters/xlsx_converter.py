@@ -1,8 +1,9 @@
+from collections import Counter
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
 from openpyxl.cell.rich_text import CellRichText, TextBlock
 import openpyxl.packaging.manifest as _opxl_manifest
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 import logging
 import os
 import os.path
@@ -15,6 +16,12 @@ import posixpath
 from zipfile import ZipFile, ZIP_DEFLATED
 from io import BytesIO
 from ..utils import CancelledError
+from ..semantic import (
+    ProtectedText,
+    TranslationContext,
+    TranslationService,
+    TranslationUnit as SemanticTranslationUnit,
+)
 from lxml import etree
 
 logger = logging.getLogger(__name__)
@@ -142,9 +149,17 @@ def _restore_glossary_terms(text: str, token_map: dict[str, str]) -> str:
     return text
 
 
-def _glossary_tokens_intact(text: str) -> bool:
-    # True if every placeholder was successfully replaced (none left over
-    return _GLOSSARY_TOKEN_RE.search(text) is None
+def _glossary_tokens_match(text: str, token_map: dict[str, str]) -> bool:
+    """Return True only when every protected glossary token appears exactly once.
+
+    Checking only for leftover tokens after restoration misses dropped placeholders.
+    Exact multiplicity also catches model-generated duplicates.
+    """
+    if not token_map:
+        return True
+    expected = Counter(token_map.keys())
+    found = Counter(_GLOSSARY_TOKEN_RE.findall(str(text or "")))
+    return found == expected
 
 # Symbol-only pattern: matches strings entirely composed of punctuation,
 # symbols, geometric shapes (including "►" U+25B6)
@@ -584,58 +599,24 @@ def _translate_many_with_fallback(
     target_lang: str,
     cancel_event: threading.Event | None,
 ) -> tuple[list[str | None], int]:
-    """Translate a list while isolating failures to individual cells.
-
-    Some engines return a partially successful batch (``None`` entries) while
-    others raise for the whole request.  A spreadsheet should not be discarded
-    because a handful of cells failed, so retry only missing items and leave the
-    original cell untouched if the retry also fails.
-    """
+    """Compatibility wrapper around the shared format-neutral translation service."""
     if not texts:
         return [], 0
-
-    translated: list[str | None] = [None] * len(texts)
-    try:
-        batch = translator.translate_batch(texts, target_lang, cancel_event=cancel_event)
-        if isinstance(batch, (list, tuple)):
-            for i in range(min(len(batch), len(texts))):
-                if batch[i] is not None:
-                    translated[i] = str(batch[i])
-        if len(batch) != len(texts):
-            logger.warning(
-                "XLSX translate_batch returned %d results for %d inputs; retrying missing items",
-                len(batch), len(texts),
+    service = TranslationService(translator)
+    result = service.translate_units(
+        [
+            SemanticTranslationUnit(
+                text=text,
+                role="table-cell",
+                mode="natural",
+                metadata={"content_hint": "table-cell", "strategy": "semantic"},
             )
-    except CancelledError:
-        raise
-    except Exception:
-        logger.exception("Batch translation failed for XLSX; retrying cells individually")
-
-    failures = 0
-    translate_text = getattr(translator, 'translate_text', None)
-    for i, item in enumerate(translated):
-        if item is not None:
-            continue
-        if cancel_event is not None and cancel_event.is_set():
-            raise CancelledError("Translation cancelled")
-        try:
-            if callable(translate_text):
-                result = translate_text(texts[i], target_lang)
-            else:
-                singleton = translator.translate_batch([texts[i]], target_lang, cancel_event=cancel_event)
-                result = singleton[0] if singleton else None
-        except CancelledError:
-            raise
-        except Exception:
-            logger.debug("XLSX translation failed for one cell; keeping original", exc_info=True)
-            failures += 1
-            continue
-        if result is None:
-            failures += 1
-        else:
-            translated[i] = str(result)
-
-    return translated, failures
+            for text in texts
+        ],
+        target_lang,
+        cancel_event=cancel_event,
+    )
+    return result.texts, len(result.failed_indices)
 
 
 def _xlsx_set_text_node(node: etree._Element, text: str) -> None:
@@ -747,6 +728,174 @@ def _xlsx_rebuild_package(
         raise
 
 
+_CELL_REF_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
+
+
+def _xlsx_column_number(cell_ref: str) -> int:
+    match = _CELL_REF_RE.match(str(cell_ref or ""))
+    if match is None:
+        return 0
+    value = 0
+    for char in match.group(1).upper():
+        value = value * 26 + (ord(char) - ord("A") + 1)
+    return value
+
+
+def _xlsx_sheet_names_by_part(zin: ZipFile, names: set[str]) -> dict[str, str]:
+    workbook_name = "xl/workbook.xml"
+    rels_name = "xl/_rels/workbook.xml.rels"
+    if workbook_name not in names or rels_name not in names:
+        return {}
+
+    try:
+        workbook = _xlsx_parse_xml(zin.read(workbook_name))
+        rels = _xlsx_parse_xml(zin.read(rels_name))
+    except Exception:
+        logger.debug("Could not parse XLSX workbook relationships for semantic context", exc_info=True)
+        return {}
+
+    rel_by_id = {
+        rel.get("Id"): rel.get("Target")
+        for rel in rels
+        if rel.get("Id") and rel.get("Target")
+    }
+    rel_attr = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+    mapping: dict[str, str] = {}
+    for sheet in workbook.iter():
+        if etree.QName(sheet).localname != "sheet":
+            continue
+        rid = sheet.get(rel_attr)
+        target = rel_by_id.get(rid)
+        name = sheet.get("name")
+        if not target or not name:
+            continue
+        normalized = target.lstrip("/")
+        if not normalized.startswith("xl/"):
+            normalized = posixpath.normpath(posixpath.join("xl", normalized))
+        normalized = normalized.replace("\\", "/")
+        mapping[normalized] = name
+    return mapping
+
+
+def _xlsx_collect_shared_string_contexts(
+    zin: ZipFile,
+    names: set[str],
+    shared_texts: list[str],
+) -> tuple[dict[int, TranslationContext], dict[str, str]]:
+    """Map shared-string ids to lightweight sheet/header context.
+
+    Shared strings can be referenced from many cells. We only retain context that
+    is common or unambiguous enough to help translation: sheet, cell coordinate,
+    and nearest string-valued row/column headers. Context is advisory only and is
+    never written back into the workbook.
+    """
+    sheet_names = _xlsx_sheet_names_by_part(zin, names)
+    usages: dict[int, list[dict[str, str]]] = {}
+    sml = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+
+    for sheet_part, sheet_name in sheet_names.items():
+        if sheet_part not in names:
+            continue
+        try:
+            root = _xlsx_parse_xml(zin.read(sheet_part))
+        except Exception:
+            logger.debug("Could not parse %s for XLSX semantic context", sheet_part, exc_info=True)
+            continue
+
+        cells: list[tuple[str, int, int, int]] = []
+        for cell in root.iter(f"{sml}c"):
+            if cell.get("t") != "s":
+                continue
+            ref = cell.get("r") or ""
+            match = _CELL_REF_RE.match(ref)
+            value = cell.find(f"{sml}v")
+            if match is None or value is None or value.text is None:
+                continue
+            try:
+                shared_idx = int(value.text)
+            except ValueError:
+                continue
+            if not (0 <= shared_idx < len(shared_texts)):
+                continue
+            row = int(match.group(2))
+            col = _xlsx_column_number(ref)
+            cells.append((ref, row, col, shared_idx))
+
+        by_row: dict[int, list[tuple[str, int, int, int]]] = {}
+        by_col: dict[int, list[tuple[str, int, int, int]]] = {}
+        for entry in cells:
+            by_row.setdefault(entry[1], []).append(entry)
+            by_col.setdefault(entry[2], []).append(entry)
+        for entries in by_row.values():
+            entries.sort(key=lambda item: item[2])
+        for entries in by_col.values():
+            entries.sort(key=lambda item: item[1])
+
+        for ref, row, col, shared_idx in cells:
+            metadata: dict[str, str] = {"sheet": sheet_name, "cell": ref}
+            left = [entry for entry in by_row[row] if entry[2] < col]
+            above = [entry for entry in by_col[col] if entry[1] < row]
+            if left:
+                # Prefer the left-most string in the row as a stable row label
+                # rather than the immediately previous data cell.
+                header_idx = left[0][3]
+                header = str(shared_texts[header_idx]).strip()
+                if header:
+                    metadata["row_header"] = header[:160]
+            if above:
+                # Prefer the top-most string in the column as a stable column
+                # heading rather than the previous row's data value.
+                header_idx = above[0][3]
+                header = str(shared_texts[header_idx]).strip()
+                if header:
+                    metadata["column_header"] = header[:160]
+            usages.setdefault(shared_idx, []).append(metadata)
+
+    contexts: dict[int, TranslationContext] = {}
+    for shared_idx, entries in usages.items():
+        sheets = {entry.get("sheet", "") for entry in entries if entry.get("sheet")}
+        section = next(iter(sheets)) if len(sheets) == 1 else None
+        metadata: dict[str, str] = {}
+        if len(entries) == 1:
+            metadata.update(entries[0])
+        else:
+            if section:
+                metadata["sheet"] = section
+            cells = [f"{entry.get('sheet', '')}!{entry.get('cell', '')}".strip("!") for entry in entries[:6]]
+            if cells:
+                metadata["cells"] = "; ".join(cells)
+            for key in ("row_header", "column_header"):
+                values = {entry.get(key, "") for entry in entries if entry.get(key)}
+                if len(values) == 1:
+                    metadata[key] = next(iter(values))
+        contexts[shared_idx] = TranslationContext.from_values(
+            section=section,
+            metadata=metadata,
+        )
+    return contexts, sheet_names
+
+
+def _xlsx_inline_context(
+    inline: etree._Element,
+    *,
+    sheet_name: str | None,
+    part_name: str,
+) -> TranslationContext:
+    node = inline
+    cell_ref = None
+    while node is not None:
+        if etree.QName(node).localname == "c":
+            cell_ref = node.get("r")
+            break
+        node = node.getparent()
+    metadata = {"xml_part": part_name}
+    if sheet_name:
+        metadata["sheet"] = sheet_name
+    if cell_ref:
+        metadata["cell"] = cell_ref
+    return TranslationContext.from_values(section=sheet_name, metadata=metadata)
+
+
 def translate_xlsx(
     input_path: str,
     output_path: str,
@@ -759,6 +908,7 @@ def translate_xlsx(
     protected_terms: list[str] | None = None,
     group_rows: bool = False,
     strict_errors: bool = False,
+    terminology: Mapping[str, str] | None = None,
 ):
     """Translate spreadsheet text by patching OOXML text parts directly.
 
@@ -798,16 +948,29 @@ def translate_xlsx(
 
         # Shared strings cover the normal cell text path, including rich text.
         shared_name = 'xl/sharedStrings.xml'
+        shared_contexts: dict[int, TranslationContext] = {}
+        sheet_names: dict[str, str] = _xlsx_sheet_names_by_part(zin, names)
         if shared_name in names:
             raw = zin.read(shared_name)
             root = _xlsx_parse_xml(raw)
             roots[shared_name] = (root, raw)
-            for si in root.iter(SML_SI):
+            shared_entries = list(root.iter(SML_SI))
+            shared_texts = [
+                ''.join(node.text or '' for node in _xlsx_collect_text_nodes(si, SML_T))
+                for si in shared_entries
+            ]
+            shared_contexts, sheet_names = _xlsx_collect_shared_string_contexts(
+                zin, names, shared_texts
+            )
+            for shared_index, si in enumerate(shared_entries):
                 unit = _xlsx_prepare_unit(
                     _xlsx_collect_text_nodes(si, SML_T), extra_glossary_terms,
                 )
                 if unit is not None:
                     unit['part_name'] = shared_name
+                    unit['role'] = 'table-cell'
+                    unit['mode'] = 'natural'
+                    unit['context'] = shared_contexts.get(shared_index, TranslationContext())
                     units.append(unit)
 
         # Some producers use inlineStr instead of sharedStrings.  Parse a sheet
@@ -824,6 +987,11 @@ def translate_xlsx(
                 )
                 if unit is not None:
                     unit['part_name'] = name
+                    unit['role'] = 'table-cell'
+                    unit['mode'] = 'natural'
+                    unit['context'] = _xlsx_inline_context(
+                        inline, sheet_name=sheet_names.get(name), part_name=name
+                    )
                     units.append(unit)
                     found_unit = True
             if found_unit:
@@ -851,6 +1019,11 @@ def translate_xlsx(
                 unit = _xlsx_prepare_unit(text_nodes, extra_glossary_terms)
                 if unit is not None:
                     unit['part_name'] = name
+                    unit['role'] = 'shape'
+                    unit['mode'] = 'concise'
+                    unit['context'] = TranslationContext.from_values(
+                        metadata={"xml_part": name, "part_role": "shape"}
+                    )
                     units.append(unit)
                     found_unit = True
             if found_unit:
@@ -861,10 +1034,39 @@ def translate_xlsx(
         _xlsx_rebuild_package(input_path, output_path, {})
         return
 
-    source_texts = [str(unit['source_text']) for unit in units]
-    translated, errors = _translate_many_with_fallback(
-        translator, source_texts, target_lang, cancel_event,
+    translation_service = TranslationService(translator, terminology=terminology)
+    semantic_units: list[SemanticTranslationUnit] = []
+    for unit in units:
+        masked_text = str(unit['source_text'])
+        raw_text = str(unit['raw_text'])
+        glossary_map = unit['glossary_map']
+        protected = (
+            ProtectedText(masked_text, glossary_map)
+            if glossary_map
+            else None
+        )
+        semantic_units.append(
+            SemanticTranslationUnit(
+                text=raw_text,
+                source_lang=source_lang,
+                role=str(unit.get('role', 'table-cell') or 'table-cell'),
+                mode=str(unit.get('mode', 'natural') or 'natural'),
+                context=(
+                    unit.get('context')
+                    if isinstance(unit.get('context'), TranslationContext)
+                    else TranslationContext()
+                ),
+                protected=protected,
+                allow_unprotected_fallback=bool(protected),
+                metadata={"content_hint": "table-cell", "strategy": "semantic"},
+            )
+        )
+
+    batch = translation_service.translate_units(
+        semantic_units, target_lang, cancel_event=cancel_event,
     )
+    translated = batch.texts
+    errors = len(batch.failed_indices)
 
     changed_parts: set[str] = set()
     for index, (unit, tr_text) in enumerate(zip(units, translated)):
@@ -875,26 +1077,6 @@ def translate_xlsx(
         if tr_text is None:
             # Per-item fallback already logged/counts this failure.
             continue
-
-        gmap = unit['glossary_map']
-        if gmap:
-            restored = _restore_glossary_terms(tr_text, gmap)
-            if _glossary_tokens_intact(restored):
-                tr_text = restored
-            else:
-                logger.debug('XLSX glossary token mismatch; retrying one unprotected unit')
-                try:
-                    retry = translator.translate_text(raw_text, target_lang)
-                except CancelledError:
-                    raise
-                except Exception:
-                    logger.debug('XLSX glossary retry failed', exc_info=True)
-                    errors += 1
-                    continue
-                if retry is None:
-                    errors += 1
-                    continue
-                tr_text = str(retry)
 
         final_text = _reattach_symbol_frame_multiline(tr_text, unit['frames'])
         original_text = str(unit['original_text'])

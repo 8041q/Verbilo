@@ -2,11 +2,8 @@ name: Build Nuitka Windows executable
 
 on:
   push:
-    branches:
-      - '**'
     tags:
       - 'v*'
-  pull_request: {}
   workflow_dispatch: {}
 
 jobs:
