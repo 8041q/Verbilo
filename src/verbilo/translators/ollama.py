@@ -12,6 +12,8 @@ import time
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
+import requests
+
 from .cache import get_cache
 from .http_session import make_session
 from ..utils import CancelledError
@@ -589,6 +591,8 @@ def _run_cancellable(
     fn,
     cancel_event: Optional[threading.Event],
     poll_interval: float = 0.05,
+    abort: Optional[Callable[[], None]] = None,
+    abort_grace: float = 0.5,
 ):
     # Avoid a thread hop for CLI/library callers that did not request
     # cancellation support. GUI/worker calls still use the polling wrapper.
@@ -609,6 +613,15 @@ def _run_cancellable(
     while thread.is_alive():
         thread.join(timeout=poll_interval)
         if cancel_event is not None and cancel_event.is_set():
+            if abort is not None:
+                try:
+                    abort()
+                except Exception:
+                    logger.debug("Failed aborting active Ollama request", exc_info=True)
+                # A streaming response normally exits immediately when closed.
+                # Join briefly so cancelled work does not keep generating in a
+                # stale daemon thread after the caller has moved on.
+                thread.join(timeout=max(float(abort_grace), 0.0))
             raise CancelledError("Translation cancelled")
     if exc[0] is not None:
         raise exc[0]
@@ -720,6 +733,7 @@ def check_ollama_model_available(
 
 class OllamaSemanticTranslator:
     supports_terminology = True
+    supports_progress = True
     def __init__(
         self,
         model: str = DEFAULT_OLLAMA_MODEL,
@@ -734,11 +748,19 @@ class OllamaSemanticTranslator:
         self._domain_hint = (domain_hint or "").strip() or None
         self._engine_name = f"ollama-semantic:{model.lower()}:{_OLLAMA_SEMANTIC_CACHE_VERSION}"
         self._base_url = _normalize_base_url(base_url)
+        request_timeout = max(float(timeout), 0.1)
         self._session = make_session(
             proxies=_session_proxies_for_base_url(self._base_url, proxies),
-            timeout=timeout,
+            # Keep connection failures short while preserving the caller's
+            # generation/read timeout for slow model inference.
+            timeout=(min(5.0, request_timeout), request_timeout),
         )
+        self._active_response_lock = threading.Lock()
+        self._active_responses: set[Any] = set()
         self._translate_all_blocks: bool = _is_translation_only_model(model)
+        # HY-MT / TranslateGemma use fixed model-specific prompt templates and
+        # therefore cannot react to Verbilo's mode/capacity layout guidance.
+        self.supports_layout_constraints = not self._translate_all_blocks
         with _SEMANTIC_L1_CACHE_LOCK:
             self._cache = _SEMANTIC_L1_CACHE.setdefault(self._engine_name, {})
 
@@ -758,12 +780,16 @@ class OllamaSemanticTranslator:
         target_lang: str,
         *,
         cancel_event: Optional[threading.Event] = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> list[str | None]:
         """Translate format-neutral semantic units without discarding metadata."""
+        kwargs = {"cancel_event": cancel_event}
+        if progress_callback is not None:
+            kwargs["progress_callback"] = progress_callback
         return self.translate_blocks(
             [unit.to_backend_block() for unit in units],
             target_lang,
-            cancel_event=cancel_event,
+            **kwargs,
         )
 
     def translate_batch(
@@ -772,7 +798,11 @@ class OllamaSemanticTranslator:
         target_lang: str,
         *,
         cancel_event: Optional[threading.Event] = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> list[str | None]:
+        kwargs = {"cancel_event": cancel_event}
+        if progress_callback is not None:
+            kwargs["progress_callback"] = progress_callback
         return self.translate_units(
             [
                 TranslationUnit(
@@ -784,7 +814,7 @@ class OllamaSemanticTranslator:
                 for text in texts
             ],
             target_lang,
-            cancel_event=cancel_event,
+            **kwargs,
         )
 
     def translate_blocks(
@@ -793,14 +823,27 @@ class OllamaSemanticTranslator:
         target_lang: str,
         *,
         cancel_event: Optional[threading.Event] = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> list[str | None]:
         if not blocks:
             return []
 
         results: list[str | None] = []
+        processed_indices: set[int] = set()
+
+        def mark_processed(indices) -> None:
+            processed_indices.update(int(idx) for idx in indices)
+            if progress_callback is not None:
+                progress_callback(len(processed_indices), len(blocks))
+
         for block in blocks:
             text = str(block.get("text", ""))
             results.append(text if not text.strip() else None)
+        for idx, value in enumerate(results):
+            if value is not None:
+                processed_indices.add(idx)
+        if processed_indices and progress_callback is not None:
+            progress_callback(len(processed_indices), len(blocks))
         target_cache = self._cache.setdefault(target_lang, {})
         pending: dict[str, dict[str, Any]] = {}
         metrics = {
@@ -856,6 +899,7 @@ class OllamaSemanticTranslator:
                 ) is None:
                     metrics["l1_hits"] += 1
                     results[idx] = cached
+                    mark_processed([idx])
                     continue
                 target_cache.pop(cache_source, None)
 
@@ -903,17 +947,20 @@ class OllamaSemanticTranslator:
             pending.pop(cache_source, None)
             for idx in item["indices"]:
                 results[idx] = translated
+            mark_processed(item["indices"])
 
         cache_pairs: list[tuple[str, str]] = []
 
         def store_result(cache_source: str, item: dict[str, Any], translated: str | None) -> None:
             if translated is None:
                 metrics["fallback_items"] += len(item["indices"])
+                mark_processed(item["indices"])
                 return
             target_cache[cache_source] = translated
             for result_idx in item["indices"]:
                 results[result_idx] = translated
             cache_pairs.append((cache_source, translated))
+            mark_processed(item["indices"])
 
         def translate_one_pending(cache_source: str, item: dict[str, Any]) -> None:
             if cancel_event is not None and cancel_event.is_set():
@@ -1032,6 +1079,7 @@ class OllamaSemanticTranslator:
         payload = _run_cancellable(
             lambda: self._request_translation_batch(system_prompt, user_prompt),
             cancel_event,
+            abort=self._abort_active_requests,
         )
         parsed = self._parse_batch_translation_payload(payload)
 
@@ -1093,12 +1141,14 @@ class OllamaSemanticTranslator:
             translated = _run_cancellable(
                 lambda: self._request_translategemma_translation(user_prompt),
                 cancel_event,
+                abort=self._abort_active_requests,
             )
         elif translation_only:
             user_prompt = self._build_hymt_prompt(text=text, source_lang=source_lang, target_lang=target_lang)
             translated = _run_cancellable(
                 lambda: self._request_hymt_translation(user_prompt),
                 cancel_event,
+                abort=self._abort_active_requests,
             )
         else:
             if _retry:
@@ -1129,6 +1179,7 @@ class OllamaSemanticTranslator:
             translated = _run_cancellable(
                 lambda: self._request_translation(system_prompt, user_prompt),
                 cancel_event,
+                abort=self._abort_active_requests,
             )
 
         raw_translated = str(translated or "")
@@ -1249,17 +1300,112 @@ class OllamaSemanticTranslator:
             f"Translate the following segment into {lang_name}, without additional explanation.\n{text}"
         )
 
+    def _response_registry(self) -> tuple[threading.Lock, set[Any]]:
+        """Return the lazily-created active-response registry.
+
+        Some unit tests construct translators with ``object.__new__`` to avoid
+        network setup, so keep this state lazy instead of assuming ``__init__``
+        has always run.
+        """
+        lock = getattr(self, "_active_response_lock", None)
+        responses = getattr(self, "_active_responses", None)
+        if lock is None or responses is None:
+            lock = threading.Lock()
+            responses = set()
+            self._active_response_lock = lock
+            self._active_responses = responses
+        return lock, responses
+
+    def _register_active_response(self, response: Any) -> None:
+        lock, responses = self._response_registry()
+        with lock:
+            responses.add(response)
+
+    def _unregister_active_response(self, response: Any) -> None:
+        lock, responses = self._response_registry()
+        with lock:
+            responses.discard(response)
+
+    def _abort_active_requests(self) -> None:
+        """Close live streaming responses so model generation stops promptly."""
+        lock, responses = self._response_registry()
+        with lock:
+            active = list(responses)
+        for response in active:
+            try:
+                response.close()
+            except Exception:
+                logger.debug("Failed closing active Ollama response", exc_info=True)
+
+    def _request_chat_content(self, payload: dict[str, Any]) -> str:
+        """Run one Ollama chat request using its NDJSON streaming protocol.
+
+        Streaming is used even though callers consume the final text.  It lets
+        cancellation close the active response socket instead of merely
+        abandoning a daemon thread while Ollama keeps generating tokens.
+        """
+        request_payload = dict(payload)
+        request_payload["stream"] = True
+        response = None
+        try:
+            response = self._session.post(
+                f"{self._base_url}/api/chat",
+                json=request_payload,
+                stream=True,
+            )
+            self._register_active_response(response)
+            response.raise_for_status()
+            chunks: list[str] = []
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+                try:
+                    event = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    logger.debug("Ignoring non-JSON Ollama stream event: %r", raw_line)
+                    continue
+                if event.get("error"):
+                    raise RuntimeError(f"Ollama generation failed: {event['error']}")
+                content = event.get("message", {}).get("content", "")
+                if content:
+                    chunks.append(str(content))
+                if event.get("done") is True:
+                    break
+            return "".join(chunks)
+        except requests.Timeout as exc:
+            raise RuntimeError(
+                "Ollama request timed out. The model may still be loading or the server is unresponsive."
+            ) from exc
+        except requests.HTTPError as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status == 404:
+                raise RuntimeError(
+                    f"Ollama model '{self._model}' is unavailable on the configured server."
+                ) from exc
+            if isinstance(status, int) and status >= 500:
+                raise RuntimeError(f"Ollama server error (HTTP {status}).") from exc
+            if isinstance(status, int):
+                raise RuntimeError(f"Ollama request failed (HTTP {status}).") from exc
+            raise RuntimeError("Ollama request failed.") from exc
+        except requests.ConnectionError as exc:
+            raise RuntimeError("Connection to the Ollama server was interrupted.") from exc
+        finally:
+            if response is not None:
+                self._unregister_active_response(response)
+                try:
+                    response.close()
+                except Exception:
+                    logger.debug("Failed closing Ollama streaming response", exc_info=True)
+
     def _request_hymt_translation(self, user_prompt: str) -> str:
         """Send a plain-text user message to a HY-MT model and return the translated text.
 
         No system message is included — HY-MT has no default system prompt
         and sending an empty system message corrupts its chat template.
         """
-        response = self._session.post(
-            f"{self._base_url}/api/chat",
-            json={
+        content = self._request_chat_content(
+            {
                 "model": self._model,
-                "stream": False,
                 "think": False,
                 "options": {
                     "temperature": 0.7,
@@ -1270,11 +1416,9 @@ class OllamaSemanticTranslator:
                 "messages": [
                     {"role": "user", "content": user_prompt},
                 ],
-            },
+            }
         )
-        response.raise_for_status()
-        payload = response.json()
-        content = re.sub(r"<think>.*?</think>", "", str(payload.get("message", {}).get("content", "")), flags=re.DOTALL).strip()
+        content = re.sub(r"<think>.*?</think>", "", str(content), flags=re.DOTALL).strip()
         if not content:
             logger.warning("HY-MT returned empty content for block; semantic fallback will be used")
         return content
@@ -1303,11 +1447,9 @@ class OllamaSemanticTranslator:
 
     def _request_translategemma_translation(self, user_prompt: str) -> str:
         """Send a plain-text user message to a TranslateGemma model."""
-        response = self._session.post(
-            f"{self._base_url}/api/chat",
-            json={
+        content = self._request_chat_content(
+            {
                 "model": self._model,
-                "stream": False,
                 "think": False,
                 "options": {
                     "temperature": 0.1,
@@ -1317,21 +1459,17 @@ class OllamaSemanticTranslator:
                 "messages": [
                     {"role": "user", "content": user_prompt},
                 ],
-            },
+            }
         )
-        response.raise_for_status()
-        payload = response.json()
-        content = re.sub(r"<think>.*?</think>", "", str(payload.get("message", {}).get("content", "")), flags=re.DOTALL).strip()
+        content = re.sub(r"<think>.*?</think>", "", str(content), flags=re.DOTALL).strip()
         if not content:
             logger.warning("TranslateGemma returned empty content for block; semantic fallback will be used")
         return content
 
     def _request_translation(self, system_prompt: str, user_prompt: str) -> str:
-        response = self._session.post(
-            f"{self._base_url}/api/chat",
-            json={
+        content = self._request_chat_content(
+            {
                 "model": self._model,
-                "stream": False,
                 "think": False,
                 "options": {
                     "temperature": 0.2,
@@ -1343,21 +1481,17 @@ class OllamaSemanticTranslator:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-            },
+            }
         )
-        response.raise_for_status()
-        payload = response.json()
-        content = re.sub(r"<think>.*?</think>", "", str(payload.get("message", {}).get("content", "")), flags=re.DOTALL).strip()
+        content = re.sub(r"<think>.*?</think>", "", str(content), flags=re.DOTALL).strip()
         if not content:
             logger.warning("Ollama translator returned empty content for block; source text will be kept")
         return content
 
     def _request_translation_batch(self, system_prompt: str, user_prompt: str) -> Any:
-        response = self._session.post(
-            f"{self._base_url}/api/chat",
-            json={
+        content = self._request_chat_content(
+            {
                 "model": self._model,
-                "stream": False,
                 "think": False,
                 "format": "json",
                 "options": {
@@ -1370,11 +1504,8 @@ class OllamaSemanticTranslator:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-            },
+            }
         )
-        response.raise_for_status()
-        payload = response.json()
-        content = payload.get("message", {}).get("content", "")
         if isinstance(content, str):
             return json.loads(content)
         return content

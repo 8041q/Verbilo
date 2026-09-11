@@ -22,6 +22,7 @@ from ..semantic import (
     TranslationService,
     TranslationUnit as SemanticTranslationUnit,
 )
+from ..progress import ProgressReporter, ProgressUpdate
 from lxml import etree
 
 logger = logging.getLogger(__name__)
@@ -918,6 +919,7 @@ def translate_xlsx(
     cancel_event: threading.Event | None = None,
     source_lang: str = "auto",
     progress_callback: 'Callable[[int, int], None] | None' = None,
+    progress_event_callback: 'Callable[[ProgressUpdate], None] | None' = None,
     protected_terms: list[str] | None = None,
     group_rows: bool = False,
     strict_errors: bool = False,
@@ -937,6 +939,9 @@ def translate_xlsx(
     remain attached.  Failed units retain their original text.  ``strict_errors``
     restores fail-the-whole-file behaviour for callers that explicitly want it.
     """
+    progress = ProgressReporter(progress_event_callback)
+    progress.update('analyzing', 0, 1)
+
     if group_rows:
         logger.info(
             'XLSX phase-2 OOXML mode ignores group_rows: shared/inline strings are translated as logical cells'
@@ -1044,8 +1049,11 @@ def translate_xlsx(
                 roots[name] = (root, raw)
 
     logger.info("XLSX '%s': collected %d logical OOXML text units", input_path, len(units))
+    progress.update('analyzing', 1, 1, detail=f'{len(units)} text unit(s)')
     if not units:
+        progress.update('saving', 0, 1)
         _xlsx_rebuild_package(input_path, output_path, {})
+        progress.complete()
         return
 
     translation_service = TranslationService(translator, terminology=terminology, translation_memory=translation_memory)
@@ -1076,13 +1084,18 @@ def translate_xlsx(
             )
         )
 
+    progress.update('translating', 0, len(semantic_units), detail=f'{len(semantic_units)} text unit(s)')
     batch = translation_service.translate_units(
-        semantic_units, target_lang, cancel_event=cancel_event,
+        semantic_units,
+        target_lang,
+        cancel_event=cancel_event,
+        progress_callback=lambda done, total: progress.update('translating', done, total),
     )
     translated = batch.texts
     errors = len(batch.failed_indices)
 
     changed_parts: set[str] = set()
+    progress.update('layout', 0, len(units))
     for index, (unit, tr_text) in enumerate(zip(units, translated)):
         if cancel_event is not None and cancel_event.is_set():
             raise CancelledError('Translation cancelled')
@@ -1090,11 +1103,13 @@ def translate_xlsx(
         raw_text = str(unit['raw_text'])
         if tr_text is None:
             # Per-item fallback already logged/counts this failure.
+            progress.update('layout', index + 1, len(units))
             continue
 
         final_text = _reattach_symbol_frame_multiline(tr_text, unit['frames'])
         original_text = str(unit['original_text'])
         if final_text == original_text:
+            progress.update('layout', index + 1, len(units))
             continue
 
         chunks = _redistribute_text_parts(unit['original_parts'], final_text)
@@ -1104,6 +1119,7 @@ def translate_xlsx(
 
         if progress_callback is not None and (index + 1 == len(units) or (index + 1) % 10 == 0):
             progress_callback(index + 1, len(units))
+        progress.update('layout', index + 1, len(units))
 
     if progress_callback is not None:
         progress_callback(len(units), len(units))
@@ -1115,7 +1131,9 @@ def translate_xlsx(
 
     if cancel_event is not None and cancel_event.is_set():
         raise CancelledError('Translation cancelled before saving XLSX')
+    progress.update('saving', 0, 1)
     _xlsx_rebuild_package(input_path, output_path, patches)
+    progress.complete()
 
     if errors:
         message = (

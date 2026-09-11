@@ -32,6 +32,7 @@ import fitz  # PyMuPDF >= 1.24
 from ..advisors import NullAdvisor
 from ..utils import CancelledError
 from ..semantic import TranslationConstraints, TranslationService, TranslationUnit as SemanticTranslationUnit
+from ..progress import ProgressReporter, ProgressUpdate
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,8 @@ _HEURISTIC_LITERAL_MAX_CHARS = 18
 _HEURISTIC_LABEL_MAX_CHARS = 42
 _HEURISTIC_ROOMY_FREE_RATIO = 0.72
 _HEURISTIC_ROOMY_CJK_FREE_RATIO = 0.33
+_LAYOUT_RETRY_RISK_RATIO = 0.92
+_LAYOUT_RETRY_TARGET_RATIO = 0.85
 # ────────────────────────────────────────────────────────────────────────────
 
 
@@ -982,6 +985,298 @@ def _fit_block(
     return fitz.Rect(best["rect"]), float(best["scale"]), float(best["spare"])
 
 
+def _probe_htmlbox_fit(
+    html: str,
+    css: str,
+    rect: fitz.Rect,
+    *,
+    rotate: int = 0,
+) -> tuple[float, float]:
+    probe = fitz.open()
+    try:
+        page = probe.new_page(width=max(rect.width + 2.0, 2.0), height=max(rect.height + 2.0, 2.0))
+        result = page.insert_htmlbox(
+            fitz.Rect(0, 0, max(rect.width, 1.0), max(rect.height, 1.0)),
+            html,
+            css=css,
+            scale_low=0,
+            rotate=rotate,
+        )
+        return float(result[1]), float(result[0])
+    except Exception:
+        return 0.0, -1.0
+    finally:
+        probe.close()
+
+
+def _probe_literal_fit(
+    translated_text: str,
+    rect: fitz.Rect,
+    line_styles: list[dict[str, Any]],
+    *,
+    rotate: int = 0,
+) -> tuple[float, float]:
+    html, css = _build_block_html(translated_text, line_styles)
+    return _probe_htmlbox_fit(html, css, rect, rotate=rotate)
+
+
+def _best_nonliteral_layout_plan(
+    block: dict[str, Any],
+    translated_text: str,
+    orig_rect: fitz.Rect,
+    line_styles: list[dict[str, Any]],
+    obstacles: list[fitz.Rect],
+    siblings: list[fitz.Rect],
+    page_height: float,
+    page_width: float,
+    source_lang: str,
+) -> dict[str, Any]:
+    preferred_scale = _preferred_scale_for_block(block["text"], source_lang)
+    rotation = int(block.get("rotation", 0))
+    plans: list[dict[str, Any]] = []
+    base_padding = float(block.get("padding_top_hint", 0.0) or 0.0)
+    padding_options = [(base_padding, 0)]
+    if base_padding > 1.0:
+        padding_options.append((0.0, 2))
+
+    for variant in _layout_variants_for_block(block["text"], source_lang):
+        for padding_top, padding_priority in padding_options:
+            html, css = _build_block_html(
+                translated_text,
+                line_styles,
+                line_height=variant["line_height"],
+                padding_top=padding_top,
+            )
+            fit_rect, probe_scale, probe_spare = _fit_block(
+                html,
+                css,
+                orig_rect,
+                obstacles,
+                siblings,
+                page_height,
+                page_width=page_width,
+                preferred_scale=preferred_scale,
+                rotate=rotation,
+            )
+            plans.append({
+                "html": html,
+                "css": css,
+                "rect": fit_rect,
+                "scale": probe_scale,
+                "spare": probe_spare,
+                "variant_name": variant["name"],
+                "variant_priority": variant["priority"] + padding_priority,
+                "line_height": variant["line_height"],
+                "padding_top": padding_top,
+            })
+
+    plan = _choose_block_plan(plans, orig_rect, preferred_scale)
+    placement = _placement_overrides_for_block(
+        orig_rect,
+        plan["rect"],
+        line_styles,
+    )
+    final_padding = max(
+        float(plan.get("padding_top", 0.0) or 0.0),
+        float(placement.get("padding_top", 0.0) or 0.0),
+    )
+    final_html, final_css = _build_block_html(
+        translated_text,
+        line_styles,
+        line_height=plan["line_height"],
+        align_override=placement.get("align"),
+        padding_top=final_padding,
+    )
+    return {
+        **plan,
+        "html": final_html,
+        "css": final_css,
+        "padding_top": final_padding,
+    }
+
+
+def _probe_block_layout(
+    block: dict[str, Any],
+    translated_text: str,
+    source_lang: str,
+) -> tuple[float, float]:
+    orig_rect = fitz.Rect(block["rect"])
+    line_styles = block.get("line_styles", [])
+    rotation = int(block.get("rotation", 0))
+    if _strategy_for_block(block) == "literal":
+        return _probe_literal_fit(
+            translated_text,
+            orig_rect,
+            line_styles,
+            rotate=rotation,
+        )
+    # Preflight should be cheap: probe the original container once using the
+    # compact line-height variant. The final placement still runs the exhaustive
+    # obstacle-aware expansion search. This avoids doubling a several-second
+    # fit search for every at-risk block merely to decide whether to retry text.
+    variants = _layout_variants_for_block(block["text"], source_lang)
+    compact = variants[-1]
+    html, css = _build_block_html(
+        translated_text,
+        line_styles,
+        line_height=compact["line_height"],
+        padding_top=float(block.get("padding_top_hint", 0.0) or 0.0),
+    )
+    return _probe_htmlbox_fit(html, css, orig_rect, rotate=rotation)
+
+
+def _layout_fit_rank(scale: float, spare: float, preferred_scale: float) -> tuple[int, float, float]:
+    fits = int(spare >= 0 and scale >= preferred_scale)
+    return fits, float(scale), float(spare)
+
+
+def _is_layout_retry_risk(block: dict[str, Any], translated_text: str) -> bool:
+    capacity = max(int(block.get("capacity_chars") or 0), 0)
+    if capacity <= 0:
+        return False
+    visible = len(_visible_block_text(translated_text))
+    if visible <= 0:
+        return False
+    threshold = capacity * _LAYOUT_RETRY_RISK_RATIO
+    if block.get("fixed_container"):
+        threshold = capacity * 0.82
+    return visible > threshold
+
+
+def _layout_retry_unit_from_pdf_block(block: dict[str, Any]) -> SemanticTranslationUnit:
+    base = _translation_unit_from_pdf_block(block)
+    capacity = max(int(block.get("capacity_chars") or 0), 0)
+    if capacity > 1:
+        tightened_capacity = max(
+            1,
+            min(capacity - 1, int(capacity * _LAYOUT_RETRY_TARGET_RATIO)),
+        )
+    else:
+        tightened_capacity = capacity or None
+    return SemanticTranslationUnit(
+        text=base.text,
+        source_lang=base.source_lang,
+        role=base.role,
+        mode="concise",
+        constraints=TranslationConstraints(
+            max_chars=tightened_capacity,
+            max_lines=base.constraints.max_lines,
+            source_visible_chars=base.constraints.source_visible_chars,
+            source_line_count=base.constraints.source_line_count,
+        ),
+        context=base.context,
+        protected=base.protected,
+        allow_unprotected_fallback=base.allow_unprotected_fallback,
+        metadata={**dict(base.metadata), "layout_retry": "1"},
+    )
+
+
+def _supports_layout_guidance(translator: Any) -> bool:
+    explicit = getattr(translator, "supports_layout_constraints", None)
+    if explicit is not None:
+        return bool(explicit)
+    return any(
+        callable(getattr(translator, name, None))
+        for name in ("translate_units", "translate_blocks")
+    )
+
+
+def _retry_pdf_layout_overflow_blocks(
+    page_blocks: list[tuple[int, list[dict[str, Any]]]],
+    translator: Any,
+    semantic_translator: Any | None,
+    target_lang: str,
+    *,
+    source_lang: str = "auto",
+    cancel_event: threading.Event | None = None,
+    terminology: Mapping[str, str] | None = None,
+    translation_memory: Any | None = None,
+) -> dict[str, int]:
+    stats = {"candidates": 0, "retried": 0, "accepted": 0}
+    semantic_all = bool(getattr(semantic_translator, "_translate_all_blocks", False))
+    groups: dict[str, list[dict[str, Any]]] = {"primary": [], "semantic": []}
+
+    for _page_num, blocks in page_blocks:
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError("Translation cancelled")
+        if not blocks:
+            continue
+        for block in blocks:
+            translated = str(block.get("translated", block.get("text", "")))
+            source = str(block.get("text", ""))
+            if translated == source or not _is_layout_retry_risk(block, translated):
+                continue
+            preferred = _preferred_scale_for_block(source, source_lang)
+            scale, spare = _probe_block_layout(
+                block,
+                translated,
+                source_lang,
+            )
+            if spare >= 0 and scale >= preferred:
+                continue
+            stats["candidates"] += 1
+            use_semantic = semantic_translator is not None and (
+                _strategy_for_block(block) == "semantic" or semantic_all
+            )
+            group_name = "semantic" if use_semantic else "primary"
+            active_translator = semantic_translator if use_semantic else translator
+            if not _supports_layout_guidance(active_translator):
+                continue
+            groups[group_name].append({
+                "block": block,
+                "unit": _layout_retry_unit_from_pdf_block(block),
+                "old_scale": scale,
+                "old_spare": spare,
+                "preferred": preferred,
+            })
+
+    for group_name, candidates in groups.items():
+        if not candidates:
+            continue
+        active_translator = semantic_translator if group_name == "semantic" else translator
+        fallback = translator if group_name == "semantic" else None
+        service = TranslationService(
+            active_translator,
+            fallback_translator=fallback,
+            terminology=terminology,
+            translation_memory=translation_memory,
+        )
+        batch = service.translate_units(
+            [item["unit"] for item in candidates],
+            target_lang,
+            cancel_event=cancel_event,
+        )
+        stats["retried"] += len(candidates)
+        for item, candidate, engine in zip(candidates, batch.texts, batch.engines):
+            if candidate is None:
+                continue
+            block = item["block"]
+            new_scale, new_spare = _probe_block_layout(
+                block,
+                str(candidate),
+                source_lang,
+            )
+            old_rank = _layout_fit_rank(item["old_scale"], item["old_spare"], item["preferred"])
+            new_rank = _layout_fit_rank(new_scale, new_spare, item["preferred"])
+            improved = new_rank[0] > old_rank[0] or (
+                new_rank[0] == old_rank[0]
+                and (
+                    new_rank[1] > old_rank[1] + 0.02
+                    or (
+                        abs(new_rank[1] - old_rank[1]) <= 0.02
+                        and new_rank[2] > old_rank[2] + 1.0
+                    )
+                )
+            )
+            if improved:
+                block["translated"] = str(candidate)
+                if engine:
+                    block["translation_engine"] = engine
+                stats["accepted"] += 1
+
+    return stats
+
+
 def _strategy_for_block(block: dict[str, Any]) -> str:
     strategy = str(block.get("strategy", "free")).strip().lower()
     if strategy in {"literal", "semantic", "free"}:
@@ -1129,6 +1424,7 @@ def _translate_units_with_fallback(
     log_prefix: str = "Batch translation",
     terminology: Mapping[str, str] | None = None,
     translation_memory: Any | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> tuple[list[str], list[int]]:
     if not texts:
         return [], []
@@ -1141,6 +1437,7 @@ def _translate_units_with_fallback(
         ],
         target_lang,
         cancel_event=cancel_event,
+        progress_callback=progress_callback,
     )
     failed = batch.failed_indices
     results = [
@@ -1238,6 +1535,7 @@ def _translate_pdf_open_document(
     cancel_event: threading.Event | None = None,
     source_lang: str = "auto",
     progress_callback: Callable[[int, int], None] | None = None,
+    progress_event_callback: Callable[[ProgressUpdate], None] | None = None,
     advisor: Any | None = None,
     semantic_translator: Any | None = None,
     strict_errors: bool = False,
@@ -1252,6 +1550,9 @@ def _translate_pdf_open_document(
             Path(input_path).name,
         )
         return "skipped-ocr"
+
+    progress = ProgressReporter(progress_event_callback)
+    progress.update("analyzing", 0, max(src.page_count + 1, 1))
 
     errors = 0
 
@@ -1279,6 +1580,7 @@ def _translate_pdf_open_document(
         page_blocks.append((page_num, blocks))
 
         _report(page_num + 1)
+        progress.update("analyzing", page_num + 1, _n_pages + 1)
 
     classify_started = time.perf_counter()
     page_blocks = _classify_blocks(
@@ -1291,6 +1593,7 @@ def _translate_pdf_open_document(
     classify_elapsed = time.perf_counter() - classify_started
     logger.info("PDF semantic classification finished in %.2fs", classify_elapsed)
     _report(_n_pages + 1)
+    progress.update("analyzing", _n_pages + 1, _n_pages + 1)
 
     # ── Phase 2: translate ────────────────────────────────────────────────────
     primary_entries: list[tuple[int, int]] = []
@@ -1310,6 +1613,14 @@ def _translate_pdf_open_document(
                 primary_entries.append((pdi, bi))
                 primary_units.append(block["text"])
 
+    translation_total = len(primary_entries) + len(semantic_entries)
+    progress.update(
+        "translating",
+        0,
+        max(translation_total, 1),
+        detail=f"{translation_total} text block(s)",
+    )
+
     primary_results, primary_failures = _translate_units_with_fallback(
         translator,
         primary_units,
@@ -1319,6 +1630,11 @@ def _translate_pdf_open_document(
         log_prefix="Primary PDF translation",
         terminology=terminology,
         translation_memory=translation_memory,
+        progress_callback=(
+            (lambda done, total: progress.update("translating", done, max(translation_total, 1)))
+            if primary_entries
+            else None
+        ),
     )
     errors += len(primary_failures)
     primary_engine = _engine_name_for_translator(translator)
@@ -1337,7 +1653,14 @@ def _translate_pdf_open_document(
             translation_memory=translation_memory,
         )
         semantic_batch = semantic_service.translate_units(
-            semantic_units, target_lang, cancel_event=cancel_event,
+            semantic_units,
+            target_lang,
+            cancel_event=cancel_event,
+            progress_callback=lambda done, total: progress.update(
+                "translating",
+                len(primary_entries) + done,
+                max(translation_total, 1),
+            ),
         )
         errors += len(semantic_batch.failed_indices)
 
@@ -1356,12 +1679,34 @@ def _translate_pdf_open_document(
         semantic_elapsed,
         len(semantic_entries),
     )
+    progress.update("translating", max(translation_total, 1), max(translation_total, 1))
+
+    layout_retry_stats = _retry_pdf_layout_overflow_blocks(
+        page_blocks,
+        translator,
+        semantic_translator,
+        target_lang,
+        source_lang=source_lang,
+        cancel_event=cancel_event,
+        terminology=terminology,
+        translation_memory=translation_memory,
+    )
+    if layout_retry_stats["candidates"]:
+        logger.info(
+            "PDF layout preflight found %d at-risk block(s), retried %d and accepted %d improved fit(s)",
+            layout_retry_stats["candidates"],
+            layout_retry_stats["retried"],
+            layout_retry_stats["accepted"],
+        )
 
     _report(_n_pages + 2)  # extraction + classification + translation done
+    progress.update("layout", 0, max(_n_pages, 1))
 
     # ── Phase 3: redact + insert ──────────────────────────────────────────────
     for pdi, (page_num, blocks) in enumerate(page_blocks):
         if not blocks:
+            _report(_n_pages + 2 + pdi + 1)
+            progress.update("layout", pdi + 1, max(_n_pages, 1))
             continue
 
         if cancel_event is not None and cancel_event.is_set():
@@ -1449,60 +1794,19 @@ def _translate_pdf_open_document(
                         orig_rect,
                     )
                 else:
-                    plans: list[dict[str, Any]] = []
-                    base_padding = float(block.get("padding_top_hint", 0.0) or 0.0)
-                    padding_options = [(base_padding, 0)]
-                    if base_padding > 1.0:
-                        # If a translated table cell no longer fits at its original
-                        # vertical offset, sacrifice the offset before shrinking text
-                        # to an unreadable size.
-                        padding_options.append((0.0, 2))
-                    for variant in _layout_variants_for_block(block["text"], source_lang):
-                        for padding_top, padding_priority in padding_options:
-                            html, css = _build_block_html(
-                                tr_text,
-                                line_styles,
-                                line_height=variant["line_height"],
-                                padding_top=padding_top,
-                            )
-                            fit_rect, probe_scale, probe_spare = _fit_block(
-                                html, css, orig_rect,
-                                obstacles, siblings, page_height,
-                                page_width=page_width,
-                                preferred_scale=preferred_scale,
-                                rotate=rotation,
-                            )
-                            plans.append({
-                                "html": html,
-                                "css": css,
-                                "rect": fit_rect,
-                                "scale": probe_scale,
-                                "spare": probe_spare,
-                                "variant_name": variant["name"],
-                                "variant_priority": variant["priority"] + padding_priority,
-                                "line_height": variant["line_height"],
-                                "padding_top": padding_top,
-                            })
-
-                    plan = _choose_block_plan(plans, orig_rect, preferred_scale)
-                    placement = _placement_overrides_for_block(
-                        orig_rect,
-                        plan["rect"],
-                        line_styles,
-                    )
-                    final_padding = max(
-                        float(plan.get("padding_top", 0.0) or 0.0),
-                        float(placement.get("padding_top", 0.0) or 0.0),
-                    )
-                    final_html, final_css = _build_block_html(
+                    plan = _best_nonliteral_layout_plan(
+                        block,
                         tr_text,
+                        orig_rect,
                         line_styles,
-                        line_height=plan["line_height"],
-                        align_override=placement.get("align"),
-                        padding_top=final_padding,
+                        obstacles,
+                        siblings,
+                        page_height,
+                        page_width,
+                        source_lang,
                     )
                     result = page.insert_htmlbox(
-                        plan["rect"], final_html, css=final_css, scale_low=0,
+                        plan["rect"], plan["html"], css=plan["css"], scale_low=0,
                         rotate=rotation,
                     )
                     placed_rects[bi] = plan["rect"]
@@ -1549,12 +1853,15 @@ def _translate_pdf_open_document(
                 errors += 1
 
         _report(_n_pages + 2 + pdi + 1)  # extract + classify + translate + pages redacted so far
+        progress.update("layout", pdi + 1, max(_n_pages, 1))
 
     # ── Save ──────────────────────────────────────────────────────────────────
     if cancel_event is not None and cancel_event.is_set():
         raise CancelledError("Translation cancelled before saving")
 
+    progress.update("saving", 0, 1)
     src.save(str(output_path), garbage=4, deflate=True, clean=True)
+    progress.complete()
 
     if errors:
         message = (
@@ -1575,6 +1882,7 @@ def translate_pdf(
     cancel_event: threading.Event | None = None,
     source_lang: str = "auto",
     progress_callback: Callable[[int, int], None] | None = None,
+    progress_event_callback: Callable[[ProgressUpdate], None] | None = None,
     advisor: Any | None = None,
     semantic_translator: Any | None = None,
     strict_errors: bool = False,
@@ -1587,7 +1895,9 @@ def translate_pdf(
         return _translate_pdf_open_document(
             src, input_path, output_path, translator, target_lang,
             cancel_event=cancel_event, source_lang=source_lang,
-            progress_callback=progress_callback, advisor=advisor,
+            progress_callback=progress_callback,
+            progress_event_callback=progress_event_callback,
+            advisor=advisor,
             semantic_translator=semantic_translator, strict_errors=strict_errors,
             terminology=terminology, translation_memory=translation_memory,
         )

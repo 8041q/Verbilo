@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from ..semantic import ProtectedText, TranslationContext, TranslationService, TranslationUnit
+from ..progress import ProgressReporter, ProgressUpdate
 from ..utils import CancelledError
 from .text_converter import _decode_text, _split_line_ending
 
@@ -204,18 +205,24 @@ def translate_markdown(
     cancel_event: threading.Event | None = None,
     source_lang: str = "auto",
     progress_callback: Callable[[int, int], None] | None = None,
+    progress_event_callback: Callable[[ProgressUpdate], None] | None = None,
     terminology: Mapping[str, str] | None = None,
     strict_errors: bool = False,
     translation_memory: Any | None = None,
 ) -> None:
+    progress = ProgressReporter(progress_event_callback)
+    progress.update("analyzing", 0, 1)
     if cancel_event is not None and cancel_event.is_set():
         raise CancelledError("Translation cancelled before starting")
 
     raw = Path(input_path).read_bytes()
     text, encoding, bom = _decode_text(raw)
     rendered, segments = _prepare_markdown(text)
+    progress.update("analyzing", 1, 1, detail=f"{len(segments)} text unit(s)")
     if not segments:
+        progress.update("saving", 0, 1)
         Path(output_path).write_bytes(raw)
+        progress.complete()
         return
 
     units = [
@@ -230,12 +237,17 @@ def translate_markdown(
         )
         for segment in segments
     ]
+    progress.update("translating", 0, len(units), detail=f"{len(units)} text unit(s)")
     result = TranslationService(translator, terminology=terminology, translation_memory=translation_memory).translate_units(
-        units, target_lang, cancel_event=cancel_event
+        units,
+        target_lang,
+        cancel_event=cancel_event,
+        progress_callback=lambda done, total: progress.update("translating", done, total),
     )
 
     translated_by_id: dict[int, str] = {}
     errors = 0
+    progress.update("layout", 0, len(segments))
     for index, (segment, translated) in enumerate(zip(segments, result.texts), start=1):
         if translated is None:
             errors += 1
@@ -244,6 +256,7 @@ def translate_markdown(
             translated_by_id[id(segment)] = translated
         if progress_callback is not None:
             progress_callback(index, len(segments))
+        progress.update("layout", index, len(segments))
 
     output_parts: list[str] = []
     for item in rendered:
@@ -253,7 +266,9 @@ def translate_markdown(
             output_parts.append(
                 item.prefix + translated_by_id[id(item)] + item.suffix + item.newline
             )
+    progress.update("saving", 0, 1)
     Path(output_path).write_bytes(bom + "".join(output_parts).encode(encoding))
+    progress.complete()
 
     if errors:
         message = f"Translation completed with {errors} failed Markdown lines; originals were preserved"

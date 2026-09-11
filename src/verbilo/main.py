@@ -13,6 +13,7 @@ from .converters import (
 from .utils.io import resolve_output_path
 from .utils import CancelledError
 from .translation_memory import TranslationMemory, default_translation_memory_path
+from .progress import ProgressUpdate
 
 __all__ = ["translate_file", "CancelledError"]
 
@@ -42,6 +43,7 @@ def translate_file(
     translator_override: Translator | None = None,
     *,
     overwrite: bool = False,
+    progress_event_callback: Callable[[ProgressUpdate], None] | None = None,
     terminology: Mapping[str, str] | None = None,
     translation_memory: bool = False,
     translation_memory_path: str | os.PathLike[str] | None = None,
@@ -104,6 +106,7 @@ def translate_file(
                 str(p), str(staged_output), translator, target_lang,
                 cancel_event=cancel_event, source_lang=source_lang,
                 progress_callback=progress_callback, terminology=terminology,
+                progress_event_callback=progress_event_callback,
                 translation_memory=memory,
             )
         elif suffix == ".xlsx":
@@ -111,6 +114,7 @@ def translate_file(
                 str(p), str(staged_output), translator, target_lang,
                 cancel_event=cancel_event, source_lang=source_lang,
                 progress_callback=progress_callback, terminology=terminology,
+                progress_event_callback=progress_event_callback,
                 translation_memory=memory,
             )
         elif suffix == ".pptx":
@@ -118,6 +122,7 @@ def translate_file(
                 str(p), str(staged_output), translator, target_lang,
                 cancel_event=cancel_event, source_lang=source_lang,
                 progress_callback=progress_callback, terminology=terminology,
+                progress_event_callback=progress_event_callback,
                 translation_memory=memory,
             )
         elif suffix == ".txt":
@@ -125,6 +130,7 @@ def translate_file(
                 str(p), str(staged_output), translator, target_lang,
                 cancel_event=cancel_event, source_lang=source_lang,
                 progress_callback=progress_callback, terminology=terminology,
+                progress_event_callback=progress_event_callback,
                 translation_memory=memory,
             )
         elif suffix in {".md", ".markdown"}:
@@ -132,13 +138,16 @@ def translate_file(
                 str(p), str(staged_output), translator, target_lang,
                 cancel_event=cancel_event, source_lang=source_lang,
                 progress_callback=progress_callback, terminology=terminology,
+                progress_event_callback=progress_event_callback,
                 translation_memory=memory,
             )
         else:
             result = pdf_converter.translate_pdf(
                 str(p), str(staged_output), translator, target_lang,
                 cancel_event=cancel_event, source_lang=source_lang,
-                progress_callback=progress_callback, advisor=advisor,
+                progress_callback=progress_callback,
+                progress_event_callback=progress_event_callback,
+                advisor=advisor,
                 semantic_translator=semantic_translator, terminology=terminology,
                 translation_memory=memory,
             )

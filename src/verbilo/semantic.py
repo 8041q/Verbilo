@@ -855,11 +855,19 @@ class TranslationService:
         units: Sequence[TranslationUnit],
         target_lang: str,
         cancel_event: threading.Event | None,
+        progress_callback: Any | None = None,
     ) -> list[str | None]:
         self._check_cancel(cancel_event)
+        progress_kwargs = (
+            {"progress_callback": progress_callback}
+            if progress_callback is not None and bool(getattr(translator, "supports_progress", False))
+            else {}
+        )
         translate_units = getattr(translator, "translate_units", None)
         if callable(translate_units):
-            result = translate_units(list(units), target_lang, cancel_event=cancel_event)
+            result = translate_units(
+                list(units), target_lang, cancel_event=cancel_event, **progress_kwargs
+            )
         else:
             translate_blocks = getattr(translator, "translate_blocks", None)
             if callable(translate_blocks):
@@ -867,6 +875,7 @@ class TranslationService:
                     [unit.to_backend_block() for unit in units],
                     target_lang,
                     cancel_event=cancel_event,
+                    **progress_kwargs,
                 )
             else:
                 translate_batch = getattr(translator, "translate_batch", None)
@@ -876,6 +885,7 @@ class TranslationService:
                     [unit.source_text for unit in units],
                     target_lang,
                     cancel_event=cancel_event,
+                    **progress_kwargs,
                 )
 
         items = result if isinstance(result, (list, tuple)) else []
@@ -923,6 +933,7 @@ class TranslationService:
         target_lang: str,
         *,
         cancel_event: threading.Event | None = None,
+        progress_callback: Any | None = None,
     ) -> TranslationBatchResult:
         metrics = TranslationMetrics(units=len(units))
         self.last_metrics = metrics
@@ -1027,6 +1038,18 @@ class TranslationService:
             unit_by_key.setdefault(key, unit)
 
         metrics.unique_units = len(grouped)
+        progress_total = len(grouped)
+        progress_reported = -1
+
+        def report_progress(done: int) -> None:
+            nonlocal progress_reported
+            if progress_callback is not None and progress_total > 0:
+                normalized = min(max(int(done), 0), progress_total)
+                if normalized <= progress_reported:
+                    return
+                progress_reported = normalized
+                progress_callback(normalized, progress_total)
+
         pending_keys: list[str] = []
         for key, indices in grouped.items():
             cached = self._cache.get((primary_engine, key))
@@ -1048,6 +1071,8 @@ class TranslationService:
                 if cached_report is not None:
                     record_rejection(cached_report, len(indices))
                 pending_keys.append(key)
+
+        report_progress(progress_total - len(pending_keys))
 
         if pending_keys and self.translation_memory is not None:
             tm_key_by_group = {
@@ -1091,14 +1116,30 @@ class TranslationService:
                     logger.debug("Could not delete rejected translation-memory entries", exc_info=True)
                     metrics.tm_errors += 1
             pending_keys = still_pending
+            report_progress(progress_total - len(pending_keys))
 
         pending_tm_writes: list[TranslationMemoryEntry] = []
         if pending_keys:
             pending_units = [unit_by_key[key] for key in pending_keys]
+            progress_base = progress_total - len(pending_keys)
+
+            def backend_progress(done: int, total: int) -> None:
+                if total <= 0:
+                    return
+                # The backend receives exactly the currently pending unique units.
+                # Clamp defensively in case a third-party translator reports a
+                # slightly different denominator.
+                local_done = min(max(int(done), 0), len(pending_keys))
+                report_progress(progress_base + local_done)
+
             try:
                 metrics.backend_requests += 1
                 primary_results = self._dispatch_many(
-                    self.translator, pending_units, target_lang, cancel_event
+                    self.translator,
+                    pending_units,
+                    target_lang,
+                    cancel_event,
+                    progress_callback=backend_progress,
                 )
             except CancelledError:
                 raise
@@ -1245,6 +1286,7 @@ class TranslationService:
                     texts[idx] = visible_translation
                     engines[idx] = used_engine
                     quality_reports[idx] = final_report
+                report_progress(progress_base + local_idx + 1)
 
         if pending_tm_writes and self.translation_memory is not None:
             self._check_cancel(cancel_event)
@@ -1257,5 +1299,7 @@ class TranslationService:
             except Exception:
                 logger.warning("Translation memory write failed; translation output is still valid", exc_info=True)
                 metrics.tm_errors += 1
+
+        report_progress(progress_total)
 
         return TranslationBatchResult(texts, engines, metrics, quality_reports, eligibility)

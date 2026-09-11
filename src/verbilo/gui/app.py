@@ -3338,41 +3338,28 @@ class App:
     # --- file management ---
 
     def _add_files(self):
+        from ..gui.helpers import SUPPORTED_EXTS
         init = self._initialdir_for_input()
-        filetypes = [
-            (self.t("file_dialog.all_supported"), ("*.docx", "*.pdf", "*.xlsx")),
-            (self.t("file_dialog.excel_spreadsheets"), ("*.xlsx",)),
-            (self.t("file_dialog.word_documents"), ("*.docx",)),
-            (self.t("file_dialog.pdf_documents"), ("*.pdf",)),
-            (self.t("file_dialog.all_files"), "*.*"),
-        ]
+        
+        all_patterns = tuple(f"*{ext}" for ext in SUPPORTED_EXTS)
+        
+        def ext_to_label(ext: str) -> str:
+            name = ext.lstrip(".").upper()
+            return f"{name} Files"
+        
+        filetypes = [("All Supported Files", all_patterns)]
+        seen = set()
+        for ext in SUPPORTED_EXTS:
+            if ext not in seen:
+                seen.add(ext)
+                filetypes.append((ext_to_label(ext), (f"*{ext}",)))
+        filetypes.append(("All Files", ("*.*",)))
+        
         paths = filedialog.askopenfilenames(
-            title=self.t("file_dialog.select_files"), parent=self.root, initialdir=init, filetypes=filetypes,
+            title="Select Files", parent=self.root, initialdir=init, filetypes=filetypes,
         )
-        if not paths:
-            return
 
-        from pathlib import Path as _Path
-        allowed = {ext.lower() for ext in SUPPORTED_EXTS}
-        # normalize current files to resolved absolute strings to detect duplicates reliably
-        existing = {str(_Path(p).resolve()) for p in self.files}
-        invalid = []
 
-        for p in paths:
-            suf = _Path(p).suffix.lower()
-            resolved = str(_Path(p).resolve())
-            if suf in allowed:
-                if resolved not in existing:
-                    self._add_file_to_table(resolved)
-                    existing.add(resolved)
-            else:
-                invalid.append(p)
-
-        if invalid:
-            messagebox.showwarning(
-                self.t("message.unsupported_files_title"),
-                self.t("message.unsupported_files_body"),
-            )
 
     def _select_folder(self):
         init = self._initialdir_for_input()

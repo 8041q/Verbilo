@@ -19,6 +19,7 @@ from ..semantic import (
     TranslationService,
     TranslationUnit as SemanticTranslationUnit,
 )
+from ..progress import ProgressReporter, ProgressUpdate
 
 logger = logging.getLogger(__name__)
 
@@ -1782,11 +1783,14 @@ def translate_docx(
     cancel_event: threading.Event | None = None,
     source_lang: str = "auto",
     progress_callback: Callable[[int, int], None] | None = None,
+    progress_event_callback: Callable[[ProgressUpdate], None] | None = None,
     aggressive_layout_fixes: bool = False,
     strict_errors: bool = False,
     terminology: Mapping[str, str] | None = None,
     translation_memory: Any | None = None,
 ) -> None:
+    progress = ProgressReporter(progress_event_callback)
+    progress.update("analyzing", 0, 1)
     auto_detect = source_lang == "auto"
     errors = 0
     translation_service = TranslationService(translator, terminology=terminology, translation_memory=translation_memory)
@@ -1872,6 +1876,14 @@ def translate_docx(
         _total_groups += len(groups_sa)
         _parsed_smartart_parts.append((part_name, root_sa, pool_sa, groups_sa))
 
+    progress.update(
+        "analyzing",
+        1,
+        1,
+        detail=f"{_total_groups} translation group(s)",
+    )
+    progress.update("translating", 0, max(_total_groups, 1))
+
     _groups_done = 0
 
     def _offset_progress(done: int, total: int) -> None:
@@ -1879,6 +1891,7 @@ def translate_docx(
         _groups_done = _groups_base + done
         if progress_callback is not None:
             progress_callback(_groups_done, _total_groups)
+        progress.update("translating", _groups_done, max(_total_groups, 1))
 
     # --- text parts (w:t, a:t, VML) ---
     for part_name, root, pool, groups in _parsed_text_parts:
@@ -1896,7 +1909,7 @@ def translate_docx(
         _groups_base = _groups_done
         part_errors = _translate_and_writeback(
             pool, groups, translator, target_lang, cancel_event,
-            progress_callback=_offset_progress if progress_callback else None,
+            progress_callback=_offset_progress if (progress_callback or progress_event_callback) else None,
             source_lang=source_lang,
             translation_service=translation_service,
             part_name=part_name,
@@ -1947,7 +1960,7 @@ def translate_docx(
         _groups_base = _groups_done
         errors += _translate_and_writeback(
             pool_sa, groups_sa, translator, target_lang, cancel_event,
-            progress_callback=_offset_progress if progress_callback else None,
+            progress_callback=_offset_progress if (progress_callback or progress_event_callback) else None,
             source_lang=source_lang,
             translation_service=translation_service,
             part_name=part_name,
@@ -1982,10 +1995,15 @@ def translate_docx(
                     "Failed to patch %s", settings_part, exc_info=True
                 )
 
+    progress.update("translating", max(_total_groups, 1), max(_total_groups, 1))
+    progress.update("layout", 1, 1, detail=f"{len(patches)} modified XML part(s)")
+
     # ── Step 4: write only modified parts back into the zip ──────────────────
+    progress.update("saving", 0, 1)
     if patches:
         logger.debug("Patching %d XML parts in %s", len(patches), output_path)
         _patch_docx_in_place(output_path, patches)
+    progress.complete()
 
     if errors:
         message = (

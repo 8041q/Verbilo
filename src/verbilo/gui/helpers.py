@@ -9,6 +9,7 @@ import traceback
 from urllib.parse import urlparse
 
 from ..main import translate_file
+from ..progress import ProgressUpdate
 from ..utils import CancelledError
 from .config import redact_sensitive_text
 
@@ -219,21 +220,12 @@ class Worker:
                     )
             return pdf_advisor, translator
 
-        # Compute file-size weights for smooth global progress
-        file_sizes = []
-        for f in files:
-            try:
-                file_sizes.append(os.path.getsize(f))
-            except OSError:
-                file_sizes.append(1)
-        total_size = sum(file_sizes) or 1
-        # cumulative_weight[i] = fraction of total work completed by files before i
-        cumulative_weight = []
-        cumsum = 0.0
-        for sz in file_sizes:
-            cumulative_weight.append(cumsum / total_size)
-            cumsum += sz
-        file_weight = [sz / total_size for sz in file_sizes]
+        # Batch progress is based on completed documents, not source byte size.
+        # Byte weighting made image-heavy Office/PDF files look like much more
+        # translation work than text-heavy smaller files.  Each current file now
+        # contributes its real stage-aware document progress to one equal share
+        # of the batch bar.
+        file_count = max(len(files), 1)
 
         for fi, f in enumerate(files):
             if self._stop.is_set():
@@ -242,20 +234,34 @@ class Worker:
             name = Path(f).name
             t0 = time.perf_counter()
 
-            # Build a per-file progress callback that maps (done, total)
-            # within this file to a global fraction and forwards it
-            base = cumulative_weight[fi]
-            weight = file_weight[fi]
+            base = fi / file_count
+            weight = 1.0 / file_count
+            last_stage: list[str | None] = [None]
+            last_forwarded: list[float] = [base]
 
-            def _file_progress(done: int, total: int, _base=base, _weight=weight) -> None:
-                if total > 0:
-                    frac = _base + _weight * (done / total)
-                else:
-                    frac = _base
-                progress_cb(f, "progress", frac)
+            def _file_progress_event(
+                update: ProgressUpdate,
+                _base=base,
+                _weight=weight,
+                _name=name,
+            ) -> None:
+                frac = _base + _weight * update.overall_fraction
+                frac = min(max(frac, 0.0), 1.0)
+                stage_changed = update.stage != last_stage[0]
+                # Avoid flooding Tk with one UI update per tiny text unit while
+                # preserving real work-based progress. Always forward stage
+                # boundaries and completion; otherwise sample at 0.2% steps.
+                if stage_changed or frac >= 1.0 or frac - last_forwarded[0] >= 0.002:
+                    progress_cb(f, "progress", frac)
+                    last_forwarded[0] = frac
+                if stage_changed:
+                    last_stage[0] = update.stage
+                    detail = f" — {update.detail}" if update.detail else ""
+                    log_cb(f"{_name}: {update.label}{detail}")
 
             try:
                 progress_cb(f, "started", None)
+                progress_cb(f, "progress", base)
                 log_cb(f"Translating {name} ...")
                 suffix = Path(f).suffix.lower()
                 advisor = None
@@ -282,7 +288,8 @@ class Worker:
                     google_project_id=google_project_id,
                     google_sa_json=google_sa_json,
                     local_model_dir=local_model_dir,
-                    progress_callback=_file_progress,
+                    progress_callback=None,
+                    progress_event_callback=_file_progress_event,
                     advisor=advisor,
                     semantic_translator=semantic_translator,
                     translator_override=primary_translator,
@@ -299,6 +306,7 @@ class Worker:
                     progress_cb(f, "finished", elapsed)
                     log_cb(f"Skipped {name} (scanned/image PDF requiring OCR)")
                 else:
+                    progress_cb(f, "progress", base + weight)
                     progress_cb(f, "finished", elapsed)
                     try:
                         if out:
