@@ -12,6 +12,7 @@ from .converters import (
 )
 from .utils.io import resolve_output_path
 from .utils import CancelledError
+from .translation_memory import TranslationMemory, default_translation_memory_path
 
 __all__ = ["translate_file", "CancelledError"]
 
@@ -42,9 +43,11 @@ def translate_file(
     *,
     overwrite: bool = False,
     terminology: Mapping[str, str] | None = None,
+    translation_memory: bool = False,
+    translation_memory_path: str | os.PathLike[str] | None = None,
 ):
-    # source_lang="auto" translates everything. Results are staged and committed
-    # atomically, so a cancellation or error never publishes a partial document.
+    # source_lang="auto" uses conservative per-unit language selection. Results
+    # are staged and committed atomically, so failures never publish partial output.
     p = Path(input_path)
     if not p.exists():
         raise FileNotFoundError(input_path)
@@ -91,36 +94,45 @@ def translate_file(
     if advisor is None:
         advisor = NullAdvisor()
 
+    memory = None
+    if translation_memory:
+        memory = TranslationMemory(translation_memory_path or default_translation_memory_path())
+
     try:
         if suffix == ".docx":
             docx_converter.translate_docx(
                 str(p), str(staged_output), translator, target_lang,
                 cancel_event=cancel_event, source_lang=source_lang,
                 progress_callback=progress_callback, terminology=terminology,
+                translation_memory=memory,
             )
         elif suffix == ".xlsx":
             xlsx_converter.translate_xlsx(
                 str(p), str(staged_output), translator, target_lang,
                 cancel_event=cancel_event, source_lang=source_lang,
                 progress_callback=progress_callback, terminology=terminology,
+                translation_memory=memory,
             )
         elif suffix == ".pptx":
             pptx_converter.translate_pptx(
                 str(p), str(staged_output), translator, target_lang,
                 cancel_event=cancel_event, source_lang=source_lang,
                 progress_callback=progress_callback, terminology=terminology,
+                translation_memory=memory,
             )
         elif suffix == ".txt":
             text_converter.translate_txt(
                 str(p), str(staged_output), translator, target_lang,
                 cancel_event=cancel_event, source_lang=source_lang,
                 progress_callback=progress_callback, terminology=terminology,
+                translation_memory=memory,
             )
         elif suffix in {".md", ".markdown"}:
             markdown_converter.translate_markdown(
                 str(p), str(staged_output), translator, target_lang,
                 cancel_event=cancel_event, source_lang=source_lang,
                 progress_callback=progress_callback, terminology=terminology,
+                translation_memory=memory,
             )
         else:
             result = pdf_converter.translate_pdf(
@@ -128,6 +140,7 @@ def translate_file(
                 cancel_event=cancel_event, source_lang=source_lang,
                 progress_callback=progress_callback, advisor=advisor,
                 semantic_translator=semantic_translator, terminology=terminology,
+                translation_memory=memory,
             )
             if result == "skipped-ocr":
                 return "skipped-ocr"
@@ -167,5 +180,11 @@ if __name__ == "__main__":
                         help="source language code (e.g., 'en'). 'auto' = translate all text")
     parser.add_argument("--out", "-o", default=None, help="output path")
     parser.add_argument("--translator", default=None, help="translator backend (default: auto)")
+    parser.add_argument("--translation-memory", action="store_true", help="reuse validated exact translations across documents")
+    parser.add_argument("--translation-memory-path", default=None, help="SQLite translation-memory path")
     args = parser.parse_args()
-    translate_file(args.input, args.to, args.out, args.translator, source_lang=args.source)
+    translate_file(
+        args.input, args.to, args.out, args.translator, source_lang=args.source,
+        translation_memory=args.translation_memory,
+        translation_memory_path=args.translation_memory_path,
+    )

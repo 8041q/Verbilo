@@ -1785,10 +1785,11 @@ def translate_docx(
     aggressive_layout_fixes: bool = False,
     strict_errors: bool = False,
     terminology: Mapping[str, str] | None = None,
+    translation_memory: Any | None = None,
 ) -> None:
     auto_detect = source_lang == "auto"
     errors = 0
-    translation_service = TranslationService(translator, terminology=terminology)
+    translation_service = TranslationService(translator, terminology=terminology, translation_memory=translation_memory)
 
     if cancel_event is not None and cancel_event.is_set():
         raise CancelledError("Translation cancelled before starting")

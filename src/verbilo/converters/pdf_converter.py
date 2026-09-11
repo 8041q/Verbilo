@@ -1124,15 +1124,21 @@ def _translate_units_with_fallback(
     texts: list[str],
     target_lang: str,
     *,
+    source_lang: str = "auto",
     cancel_event: threading.Event | None = None,
     log_prefix: str = "Batch translation",
+    terminology: Mapping[str, str] | None = None,
+    translation_memory: Any | None = None,
 ) -> tuple[list[str], list[int]]:
     if not texts:
         return [], []
 
-    service = TranslationService(translator)
+    service = TranslationService(translator, terminology=terminology, translation_memory=translation_memory)
     batch = service.translate_units(
-        [SemanticTranslationUnit(text=text, mode="natural") for text in texts],
+        [
+            SemanticTranslationUnit(text=text, source_lang=source_lang, mode="natural")
+            for text in texts
+        ],
         target_lang,
         cancel_event=cancel_event,
     )
@@ -1172,12 +1178,14 @@ def _translate_blocks_with_fallback(
     *,
     cancel_event: threading.Event | None = None,
     log_prefix: str = "Semantic translation",
+    terminology: Mapping[str, str] | None = None,
+    translation_memory: Any | None = None,
 ) -> tuple[list[str], list[int]]:
     if not blocks:
         return [], []
 
     units = [_translation_unit_from_pdf_block(block) for block in blocks]
-    service = TranslationService(translator)
+    service = TranslationService(translator, terminology=terminology, translation_memory=translation_memory)
     batch = service.translate_units(units, target_lang, cancel_event=cancel_event)
     failed = batch.failed_indices
     results = [
@@ -1234,6 +1242,7 @@ def _translate_pdf_open_document(
     semantic_translator: Any | None = None,
     strict_errors: bool = False,
     terminology: Mapping[str, str] | None = None,
+    translation_memory: Any | None = None,
 ) -> str | None:
     # Translate an already-open PDF while preserving the original layout.
 
@@ -1305,8 +1314,11 @@ def _translate_pdf_open_document(
         translator,
         primary_units,
         target_lang,
+        source_lang=source_lang,
         cancel_event=cancel_event,
         log_prefix="Primary PDF translation",
+        terminology=terminology,
+        translation_memory=translation_memory,
     )
     errors += len(primary_failures)
     primary_engine = _engine_name_for_translator(translator)
@@ -1322,6 +1334,7 @@ def _translate_pdf_open_document(
             semantic_translator,
             fallback_translator=translator,
             terminology=terminology,
+            translation_memory=translation_memory,
         )
         semantic_batch = semantic_service.translate_units(
             semantic_units, target_lang, cancel_event=cancel_event,
@@ -1566,6 +1579,7 @@ def translate_pdf(
     semantic_translator: Any | None = None,
     strict_errors: bool = False,
     terminology: Mapping[str, str] | None = None,
+    translation_memory: Any | None = None,
 ) -> str | None:
     """Open, translate, and always close a PDF document."""
     src = fitz.open(input_path)
@@ -1575,7 +1589,7 @@ def translate_pdf(
             cancel_event=cancel_event, source_lang=source_lang,
             progress_callback=progress_callback, advisor=advisor,
             semantic_translator=semantic_translator, strict_errors=strict_errors,
-            terminology=terminology,
+            terminology=terminology, translation_memory=translation_memory,
         )
     finally:
         try:

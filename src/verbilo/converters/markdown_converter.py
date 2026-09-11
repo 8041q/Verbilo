@@ -206,6 +206,7 @@ def translate_markdown(
     progress_callback: Callable[[int, int], None] | None = None,
     terminology: Mapping[str, str] | None = None,
     strict_errors: bool = False,
+    translation_memory: Any | None = None,
 ) -> None:
     if cancel_event is not None and cancel_event.is_set():
         raise CancelledError("Translation cancelled before starting")
@@ -229,7 +230,7 @@ def translate_markdown(
         )
         for segment in segments
     ]
-    result = TranslationService(translator, terminology=terminology).translate_units(
+    result = TranslationService(translator, terminology=terminology, translation_memory=translation_memory).translate_units(
         units, target_lang, cancel_event=cancel_event
     )
 
