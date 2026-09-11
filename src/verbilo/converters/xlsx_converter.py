@@ -129,11 +129,24 @@ def _protect_glossary_terms(text: str, extra_terms: frozenset | None) -> tuple[s
         return text, {}
 
     token_map: dict[str, str] = {}
-    counter = 0
+    # Start after any literal Verbilo-style glossary tokens already present in
+    # the user's text. Reusing one of those tokens would make restoration
+    # replace the literal source token as if it were a generated placeholder.
+    existing = [
+        int(match.group(1))
+        for match in re.finditer(
+            re.escape(_GLOSSARY_OPEN) + r"G(\d+)" + re.escape(_GLOSSARY_CLOSE),
+            text,
+        )
+    ]
+    counter = max(existing, default=-1) + 1
 
     def _sub(m: re.Match) -> str:
         nonlocal counter
         token = f"{_GLOSSARY_OPEN}G{counter}{_GLOSSARY_CLOSE}"
+        while token in text or token in token_map:
+            counter += 1
+            token = f"{_GLOSSARY_OPEN}G{counter}{_GLOSSARY_CLOSE}"
         token_map[token] = m.group(0)
         counter += 1
         return token

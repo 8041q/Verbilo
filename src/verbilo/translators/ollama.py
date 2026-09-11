@@ -590,6 +590,11 @@ def _run_cancellable(
     cancel_event: Optional[threading.Event],
     poll_interval: float = 0.05,
 ):
+    # Avoid a thread hop for CLI/library callers that did not request
+    # cancellation support. GUI/worker calls still use the polling wrapper.
+    if cancel_event is None:
+        return fn()
+
     result = [None]
     exc: list[BaseException | None] = [None]
 
@@ -714,6 +719,7 @@ def check_ollama_model_available(
 
 
 class OllamaSemanticTranslator:
+    supports_terminology = True
     def __init__(
         self,
         model: str = DEFAULT_OLLAMA_MODEL,

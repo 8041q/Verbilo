@@ -1220,7 +1220,8 @@ def _insert_literal_block(
 
 # ── main entry point ─────────────────────────────────────────────────────────
 
-def translate_pdf(
+def _translate_pdf_open_document(
+    src: Any,
     input_path: str,
     output_path: str,
     translator: Any,
@@ -1234,15 +1235,13 @@ def translate_pdf(
     strict_errors: bool = False,
     terminology: Mapping[str, str] | None = None,
 ) -> str | None:
-    # Translate a PDF in-place while preserving the original layout
-    src = fitz.open(input_path)
+    # Translate an already-open PDF while preserving the original layout.
 
     if _is_ocr_required(src):
         logger.warning(
             "Skipping '%s': scanned/image PDF (OCR required).",
             Path(input_path).name,
         )
-        src.close()
         return "skipped-ocr"
 
     errors = 0
@@ -1262,7 +1261,6 @@ def translate_pdf(
     page_blocks: list[tuple[int, list[dict]]] = []
     for page_num in range(src.page_count):
         if cancel_event is not None and cancel_event.is_set():
-            src.close()
             raise CancelledError("Translation cancelled")
 
         page   = src[page_num]
@@ -1354,7 +1352,6 @@ def translate_pdf(
             continue
 
         if cancel_event is not None and cancel_event.is_set():
-            src.close()
             raise CancelledError("Translation cancelled")
 
         page        = src[page_num]
@@ -1542,11 +1539,9 @@ def translate_pdf(
 
     # ── Save ──────────────────────────────────────────────────────────────────
     if cancel_event is not None and cancel_event.is_set():
-        src.close()
         raise CancelledError("Translation cancelled before saving")
 
     src.save(str(output_path), garbage=4, deflate=True, clean=True)
-    src.close()
 
     if errors:
         message = (
@@ -1557,3 +1552,34 @@ def translate_pdf(
             raise RuntimeError(message)
         logger.warning(message)
     return None
+
+def translate_pdf(
+    input_path: str,
+    output_path: str,
+    translator: Any,
+    target_lang: str,
+    *,
+    cancel_event: threading.Event | None = None,
+    source_lang: str = "auto",
+    progress_callback: Callable[[int, int], None] | None = None,
+    advisor: Any | None = None,
+    semantic_translator: Any | None = None,
+    strict_errors: bool = False,
+    terminology: Mapping[str, str] | None = None,
+) -> str | None:
+    """Open, translate, and always close a PDF document."""
+    src = fitz.open(input_path)
+    try:
+        return _translate_pdf_open_document(
+            src, input_path, output_path, translator, target_lang,
+            cancel_event=cancel_event, source_lang=source_lang,
+            progress_callback=progress_callback, advisor=advisor,
+            semantic_translator=semantic_translator, strict_errors=strict_errors,
+            terminology=terminology,
+        )
+    finally:
+        try:
+            if not bool(getattr(src, "is_closed", False)):
+                src.close()
+        except Exception:
+            logger.debug("Failed closing PDF document", exc_info=True)

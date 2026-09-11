@@ -12,7 +12,7 @@ from ..main import translate_file
 from ..utils import CancelledError
 from .config import redact_sensitive_text
 
-SUPPORTED_EXTS = (".docx", ".pdf", ".xlsx")
+SUPPORTED_EXTS = (".docx", ".pdf", ".xlsx", ".pptx", ".txt", ".md", ".markdown")
 
 
 def _normalize_ollama_config(cfg: Optional[dict[str, Any]]) -> dict[str, Any]:
@@ -263,7 +263,7 @@ class Worker:
                 primary_translator = None
                 if suffix == ".pdf":
                     advisor, semantic_translator = _get_pdf_ollama_components()
-                elif suffix in {".docx", ".xlsx"} and normalized_ollama_config["supports_non_pdf"]:
+                elif suffix in {".docx", ".xlsx", ".pptx", ".txt", ".md", ".markdown"} and normalized_ollama_config["supports_non_pdf"]:
                     primary_translator = _get_ollama_translator()
                 out = translate_file(
                     f, target_lang, output_dir, translator_name,

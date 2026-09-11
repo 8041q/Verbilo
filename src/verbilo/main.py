@@ -6,7 +6,10 @@ from typing import Callable, Mapping
 from .advisors import AdvisorBase, NullAdvisor
 from .translators.factory import TranslatorFactory
 from .translators.base import Translator
-from .converters import docx_converter, xlsx_converter, pdf_converter
+from .converters import (
+    docx_converter, xlsx_converter, pdf_converter, pptx_converter,
+    text_converter, markdown_converter,
+)
 from .utils.io import resolve_output_path
 from .utils import CancelledError
 
@@ -50,7 +53,7 @@ def translate_file(
         raise ValueError("target_lang must be a non-empty language code (e.g. 'en', 'pt')")
 
     suffix = p.suffix.lower()
-    if suffix not in (".docx", ".xlsx", ".pdf"):
+    if suffix not in (".docx", ".xlsx", ".pdf", ".pptx", ".txt", ".md", ".markdown"):
         if suffix == ".xls":
             raise ValueError("Legacy .xls files are not supported; convert the workbook to .xlsx first.")
         raise ValueError(f"Unsupported file type: {suffix}")
@@ -97,6 +100,24 @@ def translate_file(
             )
         elif suffix == ".xlsx":
             xlsx_converter.translate_xlsx(
+                str(p), str(staged_output), translator, target_lang,
+                cancel_event=cancel_event, source_lang=source_lang,
+                progress_callback=progress_callback, terminology=terminology,
+            )
+        elif suffix == ".pptx":
+            pptx_converter.translate_pptx(
+                str(p), str(staged_output), translator, target_lang,
+                cancel_event=cancel_event, source_lang=source_lang,
+                progress_callback=progress_callback, terminology=terminology,
+            )
+        elif suffix == ".txt":
+            text_converter.translate_txt(
+                str(p), str(staged_output), translator, target_lang,
+                cancel_event=cancel_event, source_lang=source_lang,
+                progress_callback=progress_callback, terminology=terminology,
+            )
+        elif suffix in {".md", ".markdown"}:
+            markdown_converter.translate_markdown(
                 str(p), str(staged_output), translator, target_lang,
                 cancel_event=cancel_event, source_lang=source_lang,
                 progress_callback=progress_callback, terminology=terminology,

@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import threading
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Literal, Mapping, Sequence
@@ -29,6 +30,57 @@ TranslationRole = Literal[
 # Shared placeholder syntax already used by the existing DOCX/XLSX/PDF paths.
 # Keeping it here gives every format adapter the same parity rules.
 _PROTECTED_TOKEN_RE = re.compile(r"\[\[[NU]\d+\]\]|⟦G\d+⟧|⟪SEP⟫")
+_HAN_CHAR_RE = re.compile(r"[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]")
+_LEXICAL_WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+
+def _language_base(code: str | None) -> str:
+    value = str(code or "").strip().lower().replace("_", "-")
+    return value.split("-", 1)[0]
+
+
+def _normalized_echo_text(text: str) -> str:
+    value = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    return "".join(ch for ch in value if ch.isalnum())
+
+
+def _term_present(text: str, term: str) -> bool:
+    haystack = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    needle = unicodedata.normalize("NFKC", str(term or "")).casefold().strip()
+    if not needle:
+        return False
+    # CJK and non-ASCII terminology is commonly written without word separators,
+    # so substring matching is more reliable than Unicode word boundaries there.
+    if any(ord(ch) > 127 for ch in needle):
+        return needle in haystack
+    if needle[0].isalnum() and needle[-1].isalnum():
+        return re.search(r"(?<!\w)" + re.escape(needle) + r"(?!\w)", haystack) is not None
+    return needle in haystack
+
+
+def _looks_like_source_echo(
+    source_text: str,
+    translated_text: str,
+    source_lang: str,
+    target_lang: str,
+) -> bool:
+    source_base = _language_base(source_lang)
+    target_base = _language_base(target_lang)
+    if not source_base or source_base == "auto" or not target_base or source_base == target_base:
+        return False
+    if _normalized_echo_text(source_text) != _normalized_echo_text(translated_text):
+        return False
+
+    source = str(source_text or "")
+    han_count = len(_HAN_CHAR_RE.findall(source))
+    if han_count >= 4:
+        return True
+
+    words = _LEXICAL_WORD_RE.findall(source)
+    letters = sum(len(word) for word in words)
+    # Deliberately conservative: do not reject unchanged product names, acronyms,
+    # model identifiers, or short labels that may legitimately remain unchanged.
+    return len(words) >= 2 and letters >= 12
 
 
 @dataclass(frozen=True)
@@ -164,6 +216,30 @@ class ProtectedText:
 
 
 @dataclass(frozen=True)
+class TranslationQualityReport:
+    hard_failures: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    terminology_required: int = 0
+    terminology_matched: int = 0
+    visible_chars: int = 0
+    visible_lines: int = 0
+
+    @property
+    def valid(self) -> bool:
+        return not self.hard_failures
+
+    @property
+    def failure_reason(self) -> str | None:
+        return self.hard_failures[0] if self.hard_failures else None
+
+    @property
+    def terminology_score(self) -> float | None:
+        if self.terminology_required <= 0:
+            return None
+        return self.terminology_matched / self.terminology_required
+
+
+@dataclass(frozen=True)
 class TranslationUnit:
     """The shared semantic unit passed between format adapters and translators."""
 
@@ -225,15 +301,92 @@ class TranslationUnit:
             return self.protected.restore(translated_text)
         return str(translated_text)
 
-    def validate_translation(self, translated_text: str | None) -> str | None:
+    def evaluate_translation(
+        self,
+        translated_text: str | None,
+        target_lang: str = "",
+        *,
+        enforce_terminology: bool = False,
+        detect_source_echo: bool = True,
+    ) -> TranslationQualityReport:
+        failures: list[str] = []
+        warnings: list[str] = []
+
+        raw = "" if translated_text is None else str(translated_text)
         if translated_text is None:
-            return "missing"
-        if self.source_text.strip() and not str(translated_text).strip():
-            return "empty"
+            failures.append("missing")
+        elif self.source_text.strip() and not raw.strip():
+            failures.append("empty")
+
         protected = self.protected or ProtectedText(self.source_text)
-        if not protected.tokens_match(str(translated_text)):
-            return "protected-token-mismatch"
-        return None
+        tokens_ok = protected.tokens_match(raw)
+        if translated_text is not None and not tokens_ok:
+            failures.append("protected-token-mismatch")
+
+        visible = self.output_text(raw) if translated_text is not None else ""
+        if (
+            translated_text is not None
+            and raw.strip()
+            and detect_source_echo
+            and _looks_like_source_echo(self.text, visible, self.source_lang, target_lang)
+        ):
+            failures.append("source-echo")
+
+        terminology_required = 0
+        terminology_matched = 0
+        missing_terms: list[tuple[str, str]] = []
+        for source_term, target_term in self.context.terminology:
+            if not _term_present(self.text, source_term):
+                continue
+            terminology_required += 1
+            if _term_present(visible, target_term):
+                terminology_matched += 1
+            else:
+                missing_terms.append((source_term, target_term))
+
+        if missing_terms:
+            if enforce_terminology:
+                failures.append("terminology-mismatch")
+            else:
+                warnings.append("terminology-mismatch")
+
+        normalized_constraints = self.constraints.normalized(self.source_text)
+        visible_chars = len(" ".join(visible.split())) if visible else 0
+        visible_lines = max(1, len(visible.splitlines())) if visible else 0
+        if (
+            normalized_constraints.max_chars is not None
+            and visible_chars > normalized_constraints.max_chars
+        ):
+            warnings.append("max-chars-exceeded")
+        if (
+            normalized_constraints.max_lines is not None
+            and visible_lines > normalized_constraints.max_lines
+        ):
+            warnings.append("max-lines-exceeded")
+
+        return TranslationQualityReport(
+            hard_failures=tuple(dict.fromkeys(failures)),
+            warnings=tuple(dict.fromkeys(warnings)),
+            terminology_required=terminology_required,
+            terminology_matched=terminology_matched,
+            visible_chars=visible_chars,
+            visible_lines=visible_lines,
+        )
+
+    def validate_translation(
+        self,
+        translated_text: str | None,
+        target_lang: str = "",
+        *,
+        enforce_terminology: bool = False,
+        detect_source_echo: bool = True,
+    ) -> str | None:
+        return self.evaluate_translation(
+            translated_text,
+            target_lang,
+            enforce_terminology=enforce_terminology,
+            detect_source_echo=detect_source_echo,
+        ).failure_reason
 
 
 @dataclass
@@ -246,6 +399,9 @@ class TranslationMetrics:
     fallback_items: int = 0
     unprotected_retries: int = 0
     failed_items: int = 0
+    terminology_mismatches: int = 0
+    source_echo_rejections: int = 0
+    constraint_warnings: int = 0
 
 
 @dataclass
@@ -253,6 +409,7 @@ class TranslationBatchResult:
     texts: list[str | None]
     engines: list[str | None]
     metrics: TranslationMetrics
+    quality_reports: list[TranslationQualityReport | None] = field(default_factory=list)
 
     @property
     def failed_indices(self) -> list[int]:
@@ -391,17 +548,52 @@ class TranslationService:
         metrics = TranslationMetrics(units=len(units))
         self.last_metrics = metrics
         if not units:
-            return TranslationBatchResult([], [], metrics)
+            return TranslationBatchResult([], [], metrics, [])
 
         units = [self._with_service_terminology(unit) for unit in units]
         texts: list[str | None] = [None] * len(units)
         engines: list[str | None] = [None] * len(units)
+        quality_reports: list[TranslationQualityReport | None] = [None] * len(units)
         primary_engine = self._engine_name(self.translator)
         fallback_engine = self._engine_name(self.fallback_translator)
         primary_can_batch = any(
             callable(getattr(self.translator, name, None))
             for name in ("translate_units", "translate_blocks", "translate_batch")
         )
+        primary_enforces_terminology = bool(
+            getattr(self.translator, "supports_terminology", False)
+        )
+        fallback_enforces_terminology = bool(
+            getattr(self.fallback_translator, "supports_terminology", False)
+        )
+
+        def evaluate(
+            unit: TranslationUnit,
+            translated: str | None,
+            *,
+            structured: bool,
+        ) -> TranslationQualityReport:
+            return unit.evaluate_translation(
+                translated,
+                target_lang,
+                enforce_terminology=structured,
+                detect_source_echo=True,
+            )
+
+        def record_rejection(report: TranslationQualityReport, count: int = 1) -> None:
+            if report.failure_reason == "terminology-mismatch":
+                metrics.terminology_mismatches += count
+            elif report.failure_reason == "source-echo":
+                metrics.source_echo_rejections += count
+
+        def record_final_quality(report: TranslationQualityReport, count: int) -> None:
+            if any(
+                warning in {"max-chars-exceeded", "max-lines-exceeded"}
+                for warning in report.warnings
+            ):
+                metrics.constraint_warnings += count
+            if "terminology-mismatch" in report.warnings:
+                metrics.terminology_mismatches += count
 
         grouped: dict[str, list[int]] = {}
         unit_by_key: dict[str, TranslationUnit] = {}
@@ -410,6 +602,7 @@ class TranslationService:
             if not unit.source_text.strip():
                 texts[idx] = unit.source_text
                 engines[idx] = primary_engine
+                quality_reports[idx] = evaluate(unit, unit.source_text, structured=primary_enforces_terminology)
                 continue
             key = unit.cache_identity(target_lang)
             grouped.setdefault(key, []).append(idx)
@@ -420,13 +613,22 @@ class TranslationService:
         for key, indices in grouped.items():
             cached = self._cache.get((primary_engine, key))
             unit = unit_by_key[key]
-            if cached is not None and unit.validate_translation(cached) is None:
+            cached_report = (
+                evaluate(unit, cached, structured=primary_enforces_terminology)
+                if cached is not None
+                else None
+            )
+            if cached is not None and cached_report is not None and cached_report.valid:
                 metrics.cache_hits += 1
                 visible_cached = unit.output_text(cached)
+                record_final_quality(cached_report, len(indices))
                 for idx in indices:
                     texts[idx] = visible_cached
                     engines[idx] = primary_engine
+                    quality_reports[idx] = cached_report
             else:
+                if cached_report is not None:
+                    record_rejection(cached_report, len(indices))
                 pending_keys.append(key)
 
         if pending_keys:
@@ -449,7 +651,10 @@ class TranslationService:
                 self._check_cancel(cancel_event)
                 unit = unit_by_key[key]
                 translated = primary_results[local_idx] if local_idx < len(primary_results) else None
-                failure_reason = unit.validate_translation(translated)
+                report = evaluate(unit, translated, structured=primary_enforces_terminology)
+                failure_reason = report.failure_reason
+                if failure_reason is not None:
+                    record_rejection(report)
 
                 # A corrupted protected token should not be sent through the same
                 # masked request again when the adapter explicitly allows an
@@ -474,9 +679,13 @@ class TranslationService:
                             "TranslationService per-item retry failed", exc_info=True
                         )
                         translated = None
-                    failure_reason = unit.validate_translation(translated)
+                    report = evaluate(unit, translated, structured=primary_enforces_terminology)
+                    failure_reason = report.failure_reason
+                    if failure_reason is not None:
+                        record_rejection(report)
 
                 used_engine = primary_engine
+                used_structured = primary_enforces_terminology
                 if (
                     failure_reason is not None
                     and unit.protected is not None
@@ -501,8 +710,13 @@ class TranslationService:
                             "TranslationService unprotected retry failed", exc_info=True
                         )
                         translated = None
-                    failure_reason = unprotected_unit.validate_translation(translated)
-                    if failure_reason is None:
+                    report = evaluate(
+                        unprotected_unit, translated, structured=primary_enforces_terminology
+                    )
+                    failure_reason = report.failure_reason
+                    if failure_reason is not None:
+                        record_rejection(report)
+                    else:
                         # The successful result corresponds to the unprotected source,
                         # so do not attempt placeholder restoration below.
                         unit = unprotected_unit
@@ -521,11 +735,17 @@ class TranslationService:
                             "TranslationService fallback translator failed", exc_info=True
                         )
                         translated = None
-                    failure_reason = unit.validate_translation(translated)
+                    report = evaluate(unit, translated, structured=fallback_enforces_terminology)
+                    failure_reason = report.failure_reason
+                    if failure_reason is not None:
+                        record_rejection(report)
                     used_engine = fallback_engine
+                    used_structured = fallback_enforces_terminology
 
                 if failure_reason is not None or translated is None:
                     metrics.failed_items += len(grouped[key])
+                    for idx in grouped[key]:
+                        quality_reports[idx] = report
                     continue
 
                 translated = str(translated)
@@ -536,8 +756,13 @@ class TranslationService:
                 ):
                     self._cache[(primary_engine, key)] = translated
                 visible_translation = unit.output_text(translated)
+                # Re-evaluate the final chosen output once for diagnostics. This is
+                # intentionally non-destructive for layout warnings.
+                final_report = evaluate(unit, translated, structured=used_structured)
+                record_final_quality(final_report, len(grouped[key]))
                 for idx in grouped[key]:
                     texts[idx] = visible_translation
                     engines[idx] = used_engine
+                    quality_reports[idx] = final_report
 
-        return TranslationBatchResult(texts, engines, metrics)
+        return TranslationBatchResult(texts, engines, metrics, quality_reports)

@@ -1703,14 +1703,22 @@ def _collect_smartart_units_from_blob(
 ) -> tuple[list[_TranslationUnit], etree._Element]:
     # SmartArt diagramData uses DrawingML text runs too; translate logical
     # paragraphs so run-level formatting does not fragment sentences.
-    root = etree.fromstring(blob)
+    root = _parse_xml_part(blob)
     return _collect_drawingml_units(root), root
 
 
 # Zip-level patching — the key to preserving all formatting
 
 def _parse_xml_part(data: bytes) -> etree._Element:
-    return etree.fromstring(data)
+    # OOXML is untrusted input. Disable entity expansion/network access so a
+    # document cannot turn parsing into local-file disclosure or external fetches.
+    parser = etree.XMLParser(
+        resolve_entities=False,
+        no_network=True,
+        remove_blank_text=False,
+        recover=False,
+    )
+    return etree.fromstring(data, parser=parser)
 
 
 def _serialise_xml_part(root: etree._Element, original_data: bytes) -> bytes:
