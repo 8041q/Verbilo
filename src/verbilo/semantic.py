@@ -124,6 +124,125 @@ def _looks_like_source_echo(
     return len(words) >= 2 and letters >= 12
 
 
+_CONSISTENCY_ROLES = frozenset({"heading", "table-cell", "label", "shape", "caption"})
+
+
+@dataclass(frozen=True)
+class _PresentationVariant:
+    canonical_index: int
+    leading_ws: str = ""
+    trailing_ws: str = ""
+    uppercase: bool = False
+
+
+def _split_outer_whitespace(text: str) -> tuple[str, str, str]:
+    value = str(text or "")
+    left = len(value) - len(value.lstrip())
+    right = len(value) - len(value.rstrip())
+    if right:
+        core = value[left:len(value) - right]
+        trailing = value[len(value) - right:]
+    else:
+        core = value[left:]
+        trailing = ""
+    return value[:left], core, trailing
+
+
+def _is_all_caps_label(text: str) -> bool:
+    letters = [ch for ch in str(text or "") if ch.isalpha()]
+    return len(letters) >= 2 and any(ch.isupper() for ch in letters) and all(
+        not ch.islower() for ch in letters
+    )
+
+
+def _presentation_consistency_key(unit: "TranslationUnit", target_lang: str) -> str | None:
+    """Return a safe document-local key for presentation-equivalent short text.
+
+    This intentionally does *not* perform fuzzy semantic matching.  It only
+    groups short UI/document labels whose meaningful text differs by casing or
+    whitespace while every semantic/layout input remains the same.
+    """
+    policy = str(unit.metadata.get("consistency_policy", "") or "").strip().lower()
+    if policy in {"off", "never", "disabled"}:
+        return None
+    role = str(unit.role or "body")
+    if role not in _CONSISTENCY_ROLES:
+        return None
+    if unit.protected is not None or _PROTECTED_TOKEN_RE.search(unit.source_text):
+        return None
+    _leading, core, _trailing = _split_outer_whitespace(unit.source_text)
+    if not core or "\n" in core or "\r" in core:
+        return None
+    normalized_core = unicodedata.normalize("NFKC", core)
+    normalized_core = re.sub(r"[ \t\f\v]+", " ", normalized_core).strip()
+    if _language_base(target_lang) in {"tr", "az"} and _is_all_caps_label(normalized_core):
+        # Locale-sensitive dotted/dotless-I casing cannot be reconstructed safely
+        # with Python's locale-independent str.upper(). Keep that occurrence
+        # independent instead of risking incorrect target typography.
+        return None
+    if not normalized_core or len(normalized_core) > 80:
+        return None
+    words = _LEXICAL_WORD_RE.findall(normalized_core)
+    if not words or len(words) > 8:
+        return None
+    letters = [ch for ch in normalized_core if ch.isalpha()]
+    if len(letters) < 4:
+        # Avoid case-sensitive short labels/acronyms such as US/us, IT/it, etc.
+        return None
+
+    constraints = unit.constraints.normalized(unit.source_text)
+    identity = {
+        "text": normalized_core.casefold(),
+        "source_lang": _language_base(unit.source_lang) or str(unit.source_lang or "auto").lower(),
+        "target_lang": _language_base(target_lang) or str(target_lang or "").lower(),
+        "role": role,
+        "mode": unit.mode,
+        "max_chars": constraints.max_chars,
+        "max_lines": constraints.max_lines,
+        "context": unit.context.to_payload(),
+        "strategy": str(unit.metadata.get("strategy", "semantic") or "semantic"),
+        "content_hint": str(unit.metadata.get("content_hint", unit.role) or unit.role or "body"),
+        "translation_policy": str(unit.metadata.get("translation_policy", "") or "").strip().lower(),
+    }
+    return json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _presentation_spelling(unit: "TranslationUnit") -> str:
+    _leading, core, _trailing = _split_outer_whitespace(unit.source_text)
+    value = unicodedata.normalize("NFKC", core)
+    return re.sub(r"[ \t\f\v]+", " ", value).strip()
+
+
+def _variant_score(unit: "TranslationUnit", index: int) -> tuple[int, int, int, int]:
+    leading, core, trailing = _split_outer_whitespace(unit.source_text)
+    # Prefer a normal-cased, cleanly-spaced representative.  Stable index is the
+    # final tiebreaker so results never depend on dict/hash ordering.
+    return (
+        1 if _is_all_caps_label(core) else 0,
+        1 if leading or trailing else 0,
+        1 if re.search(r"[ \t]{2,}", core) else 0,
+        index,
+    )
+
+
+def _apply_presentation_variant(
+    translated: str | None,
+    *,
+    original: "TranslationUnit",
+    canonical: "TranslationUnit",
+) -> str | None:
+    if translated is None:
+        return None
+    leading, original_core, trailing = _split_outer_whitespace(original.source_text)
+    _c_leading, canonical_core, _c_trailing = _split_outer_whitespace(canonical.source_text)
+    value = str(translated)
+    if leading or trailing:
+        value = value.strip()
+    if _is_all_caps_label(original_core) and not _is_all_caps_label(canonical_core):
+        value = value.upper()
+    return f"{leading}{value}{trailing}"
+
+
 @dataclass(frozen=True)
 class LanguageDetection:
     language: str | None = None
@@ -750,6 +869,8 @@ class TranslationMetrics:
     tm_writes: int = 0
     tm_rejected: int = 0
     tm_errors: int = 0
+    consistency_families: int = 0
+    consistency_reuses: int = 0
 
 
 @dataclass
@@ -829,6 +950,76 @@ class TranslationService:
         if normalized == unit.context.terminology:
             return unit
         return replace(unit, context=replace(unit.context, terminology=normalized))
+
+    def _prepare_document_consistency(
+        self,
+        units: Sequence[TranslationUnit],
+        target_lang: str,
+    ) -> tuple[list[TranslationUnit], list[_PresentationVariant | None], int, int]:
+        """Alias presentation-equivalent short labels to one document-local unit.
+
+        The alias never crosses semantic context, role, mode, terminology, or
+        layout constraints.  It is deliberately document-scoped and does not
+        create fuzzy Translation Memory entries.
+        """
+        prepared = list(units)
+        variants: list[_PresentationVariant | None] = [None] * len(prepared)
+        families: dict[str, list[int]] = {}
+        for idx, unit in enumerate(prepared):
+            key = _presentation_consistency_key(unit, target_lang)
+            if key is not None:
+                families.setdefault(key, []).append(idx)
+
+        family_count = 0
+        reuse_count = 0
+        for indices in families.values():
+            if len(indices) < 2:
+                continue
+
+            # Case can carry meaning.  Only let ALL-CAPS presentation variants
+            # follow a single unambiguous non-uppercase spelling. If both
+            # ``March`` and ``march`` occur, keep them semantically independent.
+            non_upper_spellings = {
+                _presentation_spelling(prepared[idx])
+                for idx in indices
+                if not _is_all_caps_label(_presentation_spelling(prepared[idx]))
+            }
+            subfamilies: list[list[int]] = []
+            if len(non_upper_spellings) == 1:
+                subfamilies = [indices]
+            else:
+                by_spelling: dict[str, list[int]] = {}
+                for idx in indices:
+                    by_spelling.setdefault(_presentation_spelling(prepared[idx]), []).append(idx)
+                subfamilies = list(by_spelling.values())
+
+            for sub_indices in subfamilies:
+                if len(sub_indices) < 2:
+                    continue
+                canonical_idx = min(
+                    sub_indices, key=lambda item: _variant_score(prepared[item], item)
+                )
+                canonical = prepared[canonical_idx]
+                changed_indices = [
+                    idx for idx in sub_indices
+                    if prepared[idx].source_text != canonical.source_text
+                ]
+                # Exact duplicates are already handled by the normal document L1
+                # dedupe and must not inflate Phase-13 consistency metrics.
+                if not changed_indices:
+                    continue
+                family_count += 1
+                reuse_count += len(changed_indices)
+                for idx in changed_indices:
+                    original = prepared[idx]
+                    variants[idx] = _PresentationVariant(
+                        canonical_index=canonical_idx,
+                        leading_ws=_split_outer_whitespace(original.source_text)[0],
+                        trailing_ws=_split_outer_whitespace(original.source_text)[2],
+                        uppercase=_is_all_caps_label(_split_outer_whitespace(original.source_text)[1]),
+                    )
+                    prepared[idx] = canonical
+        return prepared, variants, family_count, reuse_count
 
     def _emit_metrics(self, metrics: TranslationMetrics) -> None:
         callback = self.metrics_callback
@@ -981,6 +1172,10 @@ class TranslationService:
             return TranslationBatchResult([], [], metrics, [], [])
 
         units = [self._with_service_terminology(unit) for unit in units]
+        original_units = list(units)
+        units, consistency_variants, _candidate_families, _candidate_reuses = (
+            self._prepare_document_consistency(units, target_lang)
+        )
         texts: list[str | None] = [None] * len(units)
         engines: list[str | None] = [None] * len(units)
         quality_reports: list[TranslationQualityReport | None] = [None] * len(units)
@@ -1416,6 +1611,33 @@ class TranslationService:
             except Exception:
                 logger.warning("Translation memory write failed; translation output is still valid", exc_info=True)
                 metrics.tm_errors += 1
+
+        # Restore per-occurrence presentation without changing semantic wording.
+        # Skipped units must remain byte-for-byte equivalent to their own source
+        # presentation rather than inheriting the canonical family member.
+        active_consistency_groups: set[int] = set()
+        active_consistency_reuses = 0
+        for idx, variant in enumerate(consistency_variants):
+            if variant is None:
+                continue
+            original = original_units[idx]
+            canonical = units[idx]
+            if engines[idx] is None and texts[idx] is not None:
+                texts[idx] = original.output_text(original.source_text)
+                quality_reports[idx] = original.evaluate_translation(
+                    original.source_text, target_lang,
+                    enforce_terminology=False, detect_source_echo=False,
+                )
+                continue
+            if texts[idx] is not None:
+                active_consistency_groups.add(variant.canonical_index)
+                active_consistency_reuses += 1
+            texts[idx] = _apply_presentation_variant(
+                texts[idx], original=original, canonical=canonical
+            )
+
+        metrics.consistency_families = len(active_consistency_groups)
+        metrics.consistency_reuses = active_consistency_reuses
 
         report_progress(progress_total)
         self._emit_metrics(metrics)

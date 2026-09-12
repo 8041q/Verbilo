@@ -12,6 +12,7 @@ _METRIC_FIELDS = (
     "source_echo_rejections", "constraint_warnings", "translated_units", "skipped_units",
     "nonlinguistic_skips", "target_language_skips", "non_source_skips", "explicit_skips",
     "detected_units", "tm_hits", "tm_misses", "tm_writes", "tm_rejected", "tm_errors",
+    "consistency_families", "consistency_reuses",
 )
 
 

@@ -4682,6 +4682,11 @@ class App:
                 other=totals.get("non_source_skips", 0),
             ),
             self.t(
+                "report.summary.consistency",
+                reuses=totals.get("consistency_reuses", 0),
+                families=totals.get("consistency_families", 0),
+            ),
+            self.t(
                 "report.summary.cache",
                 hits=totals.get("persistent_cache_hits", 0),
                 writes=totals.get("persistent_cache_writes", 0),
