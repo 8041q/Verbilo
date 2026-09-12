@@ -1,107 +1,239 @@
 <p align="center">
-  <img src=".\src\verbilo\assets/favicon.jpg" alt="Verbilo logo" width="220" />
+  <img src="./src/verbilo/assets/favicon.jpg" alt="Verbilo logo" width="220" />
 </p>
 
 <div align="center">
 
 [![Releases](https://img.shields.io/github/v/release/8041q/Verbilo)](https://github.com/8041q/Verbilo/releases)
 [![Release Notes](https://img.shields.io/badge/release-notes-blue)](https://github.com/8041q/Verbilo/releases)
-[![Python](https://img.shields.io/badge/python-3.12%2B-brightgreen)](https://www.python.org/downloads/)
+[![Python](https://img.shields.io/badge/python-3.12.x-brightgreen)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-AGPL)](https://www.gnu.org/licenses/agpl-3.0.en.html)
 [![Stars](https://img.shields.io/github/stars/8041q/Verbilo?style=flat)](https://github.com/8041q/Verbilo/stargazers)
 [![Issues](https://img.shields.io/github/issues/8041q/Verbilo)](https://github.com/8041q/Verbilo/issues)
 
 </div>
 
-### Verbilo — Portable
-<p align="center"><em>Translate DOCX, XLSX and PDF into languages while preserving layout, styles, and images.</em></p>
+### Verbilo - Portable
+
+<p align="center"><em>Translate DOCX, XLSX and PDF documents while preserving layout, styles, formatting, and images.</em></p>
 
 ---
+---
 
-## How it works (high level)
+## How it works
 
-- Converts document content into translation units (runs, spans, rows, paragraphs)
-- Sends grouped units in batches to translation backends with resilient HTTP retries and sub-batch fallbacks for large requests.
-- Uses API-aware inline tagging where supported to preserve run/span formatting across the round-trip.
-- Reconstructs translated text back into the original document structure, applying formatting where feasible.
+Verbilo extracts document content into translation units, sends those units to the selected translation backend, and reconstructs the translated document while preserving the original structure as closely as possible.
 
+* Converts document content into translation units such as runs, spans, rows, and paragraphs.
+* Groups translation units into batches to reduce API calls and improve throughput.
+* Uses resilient HTTP handling with retries, backoff, timeouts, and sub-batch fallbacks for large requests.
+* Uses API-aware inline tagging where supported to preserve run and span formatting across the translation round trip.
+* Reconstructs translated text into the original document structure while retaining formatting where feasible.
+* Applies layout-aware handling for PDFs, including optional semantic/local-LLM routing for text that may not fit safely inside its original bounding box.
 
 ## Feature Highlights
 
-- **Multiple translation engines**: Google Translate (free), Google Cloud Translation API, Baidu, Azure, DeepL.
-- **Proxy & resilience**: All engines use a resilient HTTP session with retries, backoff, timeouts, and optional HTTPS/HTTP proxy.
-- **Selective Translation**: Translate only text in a specified source language (or use auto).
-- **Formatting Preserved**: DOCX run-level, XLSX cell and in-place PDF Editing are preserved. 
-- **Multi-Engine Detection**: Lingua, FastText — choose your preferred engine. (quality / speed)
-- **Batching for Efficiency**: Segments are batched to reduce API calls and avoid rate limits.
-- **Semantic Translation**: Uses a dual-model approach - a translation model plus a smaller companion advisor that classifies blocks before LLM calls, with pre-routing and batch grouping to minimise latency.
-- **GUI Language**: Interface available in English and Chinese Simplified (ZH-Hans), selectable in Settings.
+* **Multiple translation engines** - Google Translate (free), Google Cloud Translation API, Baidu, Microsoft Azure Translator, DeepL, Local OPUS-MT, and Ollama-based local models.
+* **Broad language coverage** - Google-based translation backends support a large range of languages, including 130+ languages through Google Cloud Translation. Exact language support depends on the selected engine.
+* **Proxy & resilience** - Network translation engines use resilient HTTP sessions with retries, backoff, timeouts, and optional HTTPS/HTTP proxy support.
+* **Selective Translation** - Translate only text detected as a specified source language, or use automatic source-language handling.
+* **Formatting Preservation** - Preserves DOCX run-level formatting, XLSX cell structure, and in-place PDF layout where possible.
+* **Multi-Engine Detection** - Choose between Lingua and FastText depending on your preferred accuracy/speed trade-off.
+* **Batching for Efficiency** - Translation segments are grouped to reduce API calls and help avoid rate limits.
+* **Semantic PDF Translation** - Optional local-LLM assistance can classify and route layout-constrained PDF blocks before translation.
+* **Local Translation** - OPUS-MT and Ollama models can run locally without sending document text to a remote translation API.
+* **GUI Language** - Interface available in English and Simplified Chinese (`ZH-Hans`), selectable in Settings.
 
-## Known limitations
+## Known Limitations
 
-- Tag survival is API-dependent; inline tag preservation is not guaranteed on every backend.
-- Z-order guard is conservative: it avoids translating text entirely covered by opaque graphics rather than rewriting PDF content streams to change stacking order.
-- Very-short CJK tokens (1–2 characters) can behave inconsistently across translation APIs—prefer explicit source_lang to ensure correct source language.
-- Extremely complex layouts (heavy overlays, rotated text, or nonstandard encodings) can still produce visual artifacts - manual verification recommended for critical documents.
-- Chinese→English can be challenging for complex documents because Chinese often uses topic-prominent constructions while English is subject-prominent.
+* Inline-tag survival is API-dependent; formatting tags are not guaranteed to survive every translation backend.
+* The PDF Z-order guard is conservative. Text entirely covered by opaque graphics can be skipped rather than rewriting PDF content streams to change stacking order.
+* Very short CJK tokens (1–2 characters) can behave inconsistently across translation APIs. When possible, specify the source language explicitly.
+* Extremely complex layouts, including heavy overlays, rotated text, or unusual encodings, can still produce visual artifacts. Manual verification is recommended for critical documents.
+* Chinese → English translation can be particularly challenging in layout-constrained documents because translated English text frequently occupies more horizontal space.
+* Image-only/scanned PDFs are not OCR-translated. They are detected and skipped rather than producing broken output.
+* Language availability varies by translation engine and local model.
 
-## Quick Start — For Developers
 
-1. Install core dependencies:
+## Quick Start - For Developers
+
+### 1. Requirements
+
+Verbilo currently supports:
+
+* **Python 3.12.x**
+* Windows is the primary target for the portable GUI/Nuitka build.
+
+A virtual environment is recommended.
+
+### 2. Install dependencies
+
+From the repository root:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-2. Launch the GUI:
+### 3. Launch the GUI
 
 ```bash
 cd src
 python -m launch
 ```
 
-***
 
-### GUI translation engines & network settings
+## Translation Engines & Network Settings
 
-In the GUI sidebar you can choose the translation engine:
+The translation engine can be selected from the GUI sidebar.
 
-- Google Translate (free) ~ default, no API key required.
-- Google Cloud Translation API ~ requires: API key for v2, Project ID & Account Credentials for v3.
-- Baidu Translate ~ requires Baidu App ID and App Key.
-- Microsoft Azure Translator ~ requires a Subscription Key and Region.
-- DeepL ~ requires a DeepL API key (Free or Pro).
-- Local (offline) ~ free and unlimited use, requires download of each language model source+target
-- Ollama (local LLM) ~ free and unlimited use, requires [Ollama] running locally.
+### Google Translate
 
-**Settings → Network & API keys** to configure
+* Free.
+* Default translation engine.
+* No API key required.
+* Broad language coverage.
 
-If any API method is selected without credentials, the GUI will show a warning instead of starting the job.
+### Google Cloud Translation API
 
-### Local AI translation via Ollama (offline, no API key)
+Supports Google Cloud Translation API configurations.
 
-Verbilo can use local Ollama models as the translation engine for DOCX, XLSX, and PDF. The role differs by file type:
+* **v2** - API key.
+* **v3** - Project ID and account/service credentials.
 
-- **DOCX / XLSX** — Ollama is the primary (and only) translator; it handles all text directly.
-- **PDF** — Ollama works alongside the selected primary engine (Google, DeepL, etc.). Because translating Chinese to English typically expands text by 2–3×, some blocks would overflow their original bounding boxes. Ollama receives both the source text and the physical character budget of each box, translating only the layout-constrained blocks while the primary engine handles the rest.
+Google Cloud Translation supports 130+ languages, although available language combinations and capabilities can depend on the API/model being used.
 
-| | **HY-MT 1.5 1.8B** · Tencent | **Qwen3.5 4B** · Alibaba |
-|---|---|---|
-| Size | ~1.1 GB | ~2.4 GB |
-| Languages | 33 major languages | Broad coverage |
-| Speed | Faster (smaller model) | Slower |
-| PDF routing | All blocks | Layout-constrained blocks only |
-| DOCX / XLSX | ✓ | ✓ |
+### Baidu Translate
 
-**HY-MT** is a purpose-built translation model. For PDF it translates every block directly; for DOCX/XLSX it translates all text as the primary engine.
+Requires:
 
-**Qwen** is a general-purpose LLM. For PDF, it first classifies each block to decide which need layout-constrained translation and which can go to the primary engine - giving smarter results on complex layouts. For DOCX/XLSX it also acts as the primary translator.
+* Baidu App ID
+* Baidu App Key
 
-> Install Ollama from [ollama.com/download](https://ollama.com/download) before enabling it. Verbilo can then download selected models into `%USERPROFILE%\.ollama\models\` (Windows), outside the app folder.
+### Microsoft Azure Translator
+
+Requires:
+
+* Subscription Key
+* Region
+
+### DeepL
+
+Requires a DeepL API key:
+
+* DeepL API Free
+* DeepL API Pro
+
+### Local - OPUS-MT
+
+* Offline.
+* No translation API key required.
+* Free and unlimited local use.
+* Requires a separate downloaded model for each supported source → target language pair.
+
+### Ollama / Local LLM
+
+* Runs locally.
+* No translation API key required.
+* Free and unlimited local use after the required models are installed.
+* Used directly for DOCX/XLSX translation and for layout-aware/semantic PDF translation workflows.
+
+Configure network settings, API credentials, proxy options, and related settings under:
+
+**Settings → Network & API keys**
+
+If an API-based translation method is selected without the required credentials, the GUI displays a warning instead of starting the translation job.
 
 
+## Local AI Translation via Ollama
 
-</details>
+Verbilo can use local Ollama models for DOCX, XLSX, and PDF translation.
+
+The role of the local model differs depending on the document type and selected model.
+
+### DOCX / XLSX
+
+When Ollama is selected as the translation engine, the selected Ollama model handles the document text directly.
+
+This does **not** mean Ollama is required for DOCX or XLSX. Other translation engines such as Google, DeepL, Azure, Baidu, and Local OPUS-MT can also be used.
+
+### PDF
+
+For PDF documents, local models can work alongside the selected primary translation engine.
+
+Translated text can be substantially longer than the source text. This is particularly noticeable for languages such as Chinese → English, where translated text may require significantly more physical space.
+
+Verbilo can use the dimensions and available character budget of each PDF text block to decide how translation should be handled.
+
+|             | **HY-MT 1.5 1.8B · Tencent** | **Qwen3.5 4B · Alibaba**  |
+| ----------- | ---------------------------- | ------------------------- |
+| Size        | ~1.1 GB                      | ~2.4 GB                   |
+| Languages   | 33 major languages           | Broad coverage            |
+| Speed       | Faster / smaller             | Slower / larger           |
+| PDF routing | All routed blocks            | Layout-constrained blocks |
+| DOCX / XLSX | ✓                            | ✓                         |
+
+### HY-MT
+
+HY-MT is a purpose-built machine-translation model.
+
+For PDF workflows, HY-MT can translate routed blocks directly.
+
+For DOCX and XLSX, it can operate as the selected primary local translator.
+
+### Qwen
+
+Qwen is a general-purpose local LLM.
+
+For semantic PDF translation, Verbilo can use a smaller companion/advisor stage to classify blocks before translation. This allows layout-constrained content to be routed to the local model while ordinary blocks can continue through the selected primary translation engine.
+
+This reduces unnecessary local-LLM calls while allowing difficult blocks to receive layout-aware translation.
+
+For DOCX and XLSX, Qwen can also operate as the selected local translation engine.
+
+### Ollama installation
+
+Ollama is **not installed automatically during normal Verbilo setup**.
+
+If Ollama is already installed, Verbilo can use it directly.
+
+If Ollama is not installed and the user enables the Semantic Translation workflow and attempts to download a supported local model, Verbilo can download/install Ollama automatically as part of that model-download process.
+
+Downloaded Ollama models are stored outside the Verbilo application directory, for example on Windows:
+
+```text
+%USERPROFILE%\.ollama\models\
+```
+
+
+## Language Detection
+
+Verbilo supports multiple local language-detection engines.
+
+### Lingua
+
+* High accuracy.
+* Particularly useful for short strings.
+* Heavier than FastText.
+
+### FastText
+
+* Very fast.
+* Good accuracy/performance balance.
+* Requires the FastText language identification model.
+
+To download the required FastText model, run:
+
+```bash
+python download_models.py
+```
+
+This downloads:
+
+```text
+models/lid.176.bin
+```
+
+When a specific source language is selected, local language detection can prevent text in other languages from being sent unnecessarily to translation APIs.
 
 
 ## Project Structure
@@ -109,24 +241,27 @@ Verbilo can use local Ollama models as the translation engine for DOCX, XLSX, an
 <details>
 <summary>Click to expand</summary>
 
-```
+```text
 src/
   Origin/
   Output/
   verbilo/
     launch.py
     cli.py
-    main.py         - `translate_file()` core API
+    main.py              - translate_file() core API
+
     gui/
-      app.py        - CustomTkinter GUI
+      app.py             - CustomTkinter GUI
       config.py
       helpers.py
       theme.py
       icons.py
+
     converters/
       docx_converter.py
       xlsx_converter.py
       pdf_converter.py
+
     translators/
       azure.py
       baidu.py
@@ -139,10 +274,13 @@ src/
       lang_detect.py
       local.py
       usage.py
+
     assets/
       __init__.py
+
     utils/
       io.py
+
 pyproject.toml
 requirements.txt
 README.md
@@ -150,69 +288,143 @@ README.md
 
 </details>
 
-## Nuitka build (Windows)
+> The project structure above highlights the main modules rather than every internal implementation file.
 
-Prerequisites:
 
-- A Python virtual environment (recommended) activated.
-- `nuitka` installed in the virtualenv (`pip install nuitka`).
+## Nuitka Build - Windows
 
-Build the GUI executable:
+### Prerequisites
+
+* Python 3.12.x
+* An activated virtual environment is recommended.
+* Nuitka installed in the environment.
+
+Install Nuitka if necessary:
 
 ```bash
-# From the repository root, with your virtualenv active
+pip install nuitka
+```
+
+### Build the GUI executable
+
+From the repository root, with the virtual environment active:
+
+```bash
 .venv\Scripts\python.exe scripts\build_nuitka.py --entry gui --output dist/nuitka
 ```
 
-Notes:
+### Notes
 
-- For a final GUI build without a console window, pass the flag `--windows-console-mode=disable` to the underlying Nuitka command (the helper script already exposes this behavior when appropriate).
-- If build fails and you try with changes, clean the Nuitka cache at `%LOCALAPPDATA%\Nuitka\Nuitka\`
+* For a final GUI build without a console window, use the appropriate `--windows-console-mode=disable` behavior exposed by the build helper.
+* If a build fails after configuration or dependency changes, clearing the Nuitka cache can help:
 
-Run the built GUI directly by double-clicking the `verbilo.exe` in Explorer to launch without the console.
+```text
+%LOCALAPPDATA%\Nuitka\Nuitka\
+```
 
-Troubleshooting:
+After a successful build, launch the GUI by running `verbilo.exe`.
 
-- You will need the language model used by fasttext detector, run `download_models.py` to download `models/lid.176.bin`. For Local use, you will also need the OPUS-MT model, each language source+target is a diferent model.
-- If paths or behavior differ, confirm you executed the commands from the repository root and that your virtualenv has `nuitka` installed.
+### Build troubleshooting
+
+FastText language detection requires:
+
+```text
+models/lid.176.bin
+```
+
+Run:
+
+```bash
+python download_models.py
+```
+
+For Local OPUS-MT translation, the corresponding source → target translation model must also be downloaded.
+
+Each supported source/target language pair uses its own model.
+
+If paths or build behavior differ, verify that:
+
+* Commands are being executed from the repository root.
+* The intended virtual environment is active.
+* Nuitka is installed in that environment.
+* Runtime dependencies are synchronized between `requirements.txt` and `pyproject.toml`.
 
 
 ## Requirements & Notes
 
-- **Python**: 3.12+  
-- **Install (has all)**: `pip install -r requirements.txt`  
-- Detection engines:
-  - Lingua: high accuracy for short strings (heavier).
-  - FastText: very fast, good balance.
+### Python
 
-Notes:
-- Scanned (image-only) PDFs are detected and skipped - they will be logged rather than producing broken output.  
-- When a specific source language is set, local detection prevents unnecessary API translation calls.  
-- Verbilo batches segments to reduce API usage and avoid rate limits.
+```text
+>=3.12,<3.13
+```
 
+In other words, use **Python 3.12.x**.
+
+### Install runtime dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### Important behavior
+
+* Scanned/image-only PDFs are detected and skipped rather than producing malformed translated output.
+* Selecting an explicit source language allows local detection to avoid unnecessary translation requests.
+* Translation units are batched to reduce API usage and improve throughput.
+* Language support depends on the selected translation backend.
+* Local models must be downloaded before they can be used.
+* API-based engines require their corresponding credentials where applicable.
+
+
+## Development Dependencies
+
+Runtime dependencies should be kept synchronized between:
+
+```text
+requirements.txt
+pyproject.toml
+poetry.lock
+```
+
+When adding or changing a runtime dependency, update the Poetry dependency configuration as well.
+
+For example, `tkinterdnd2` is currently:
+
+```text
+tkinterdnd2==0.6.3
+```
+
+in `requirements.txt`, so the corresponding Poetry dependency should be:
+
+```toml
+tkinterdnd2 = "==0.6.3"
+```
 
 ## Contributing
 
-Contributions are what makes open source great!
+Contributions are welcome.
 
-- Found a bug? Open an issue with steps to reproduce and a sample file if possible
-- Want to add features? Fork, create a feature branch, and open a PR referencing the issue
-- PR checklist:
-  - Keep changes focused and minimal
-  - Follow existing code style
-- Development tips:
-  - Run unit tests locally before
-  - Any change needs to be documented, even if small
+* Found a bug? Open an issue with steps to reproduce it and, if possible, include a sample file.
+* Want to add a feature? Fork the repository, create a focused feature branch, and open a pull request.
+* Keep changes focused and minimal.
+* Follow the existing code style.
+* Run the relevant tests locally before submitting a pull request.
+* Document user-visible changes, even when they are small.
 
 
 ## Acknowledgments
 
-- Tabler Icons / `pytablericons` for GUI icons.  
-- PyMuPDF for in-place PDF text editing.  
-- Lingua, FastText for language detection options.   
-- Everyone who files issues and contributes patches.
+* [PyMuPDF](https://pymupdf.readthedocs.io/) for PDF processing and in-place PDF text editing.
+* [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter) for the GUI framework.
+* Tabler Icons / `pytablericons` for GUI icons.
+* Lingua and FastText for language detection.
+* CTranslate2 and SentencePiece for local translation support.
+* Ollama and supported local models for local LLM translation.
+* Everyone who files issues, reports bugs, and contributes patches.
 
 
 ## License
 
-This project is released under the **GNU Affero General Public License v3 (AGPL-3.0-or-later)** — see the LICENSE file for details.
+This project is released under the **GNU Affero General Public License v3 (AGPL-3.0-or-later)**.
+
+See the `LICENSE` file for details.
