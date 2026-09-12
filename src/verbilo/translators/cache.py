@@ -162,10 +162,10 @@ class TranslationCache:
 
     def put(
         self, engine: str, text: str, target_lang: str, translated_text: str
-    ) -> None:
+    ) -> bool:
         # Store a single translation; silently overwrites existing entries
         if not text or not translated_text:
-            return
+            return False
         try:
             with self._write_lock:
                 db = self._get_conn()
@@ -176,19 +176,21 @@ class TranslationCache:
                     (engine, text, target_lang, translated_text, self._access_stamp()),
                 )
                 self._maybe_evict(db)
+            return True
         except Exception:
             logger.debug("Cache.put failed", exc_info=True)
+            return False
 
     def put_batch(
         self,
         engine: str,
         pairs: list[tuple[str, str]],   # (source_text, translated_text)
         target_lang: str,
-    ) -> None:
+    ) -> bool:
         # Bulk-insert translations; silently overwrites existing entries
         valid = [(src, tgt) for src, tgt in pairs if src and tgt]
         if not valid:
-            return
+            return False
         try:
             with self._write_lock:
                 db = self._get_conn()
@@ -199,8 +201,36 @@ class TranslationCache:
                     [(engine, src, target_lang, tgt, self._access_stamp()) for src, tgt in valid],
                 )
                 self._maybe_evict(db)
+            return True
         except Exception:
             logger.debug("Cache.put_batch failed", exc_info=True)
+            return False
+
+    def delete_batch(
+        self, engine: str, texts: list[str], target_lang: str
+    ) -> int:
+        """Delete matching cache entries and return the number removed."""
+        values = [str(text) for text in texts if str(text)]
+        if not values:
+            return 0
+        removed = 0
+        try:
+            with self._write_lock:
+                db = self._get_conn()
+                for start in range(0, len(values), 900):
+                    chunk = values[start:start + 900]
+                    placeholders = ",".join("?" * len(chunk))
+                    before = db.total_changes
+                    db.execute(
+                        f"DELETE FROM translations WHERE engine=? AND target_lang=? "
+                        f"AND source_text IN ({placeholders})",
+                        (engine, target_lang, *chunk),
+                    )
+                    removed += db.total_changes - before
+            return removed
+        except Exception:
+            logger.debug("Cache.delete_batch failed", exc_info=True)
+            return 0
 
     # ── Maintenance ───────────────────────────────────────────────────────────
 

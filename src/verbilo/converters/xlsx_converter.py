@@ -925,6 +925,8 @@ def translate_xlsx(
     strict_errors: bool = False,
     terminology: Mapping[str, str] | None = None,
     translation_memory: Any | None = None,
+    translation_cache: Any | None = None,
+    metrics_callback: 'Callable[[Any], None] | None' = None,
 ):
     """Translate spreadsheet text by patching OOXML text parts directly.
 
@@ -1056,7 +1058,10 @@ def translate_xlsx(
         progress.complete()
         return
 
-    translation_service = TranslationService(translator, terminology=terminology, translation_memory=translation_memory)
+    translation_service = TranslationService(
+        translator, terminology=terminology, translation_memory=translation_memory, persistent_cache=translation_cache,
+        metrics_callback=metrics_callback,
+    )
     semantic_units: list[SemanticTranslationUnit] = []
     for unit in units:
         masked_text = str(unit['source_text'])

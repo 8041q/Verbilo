@@ -12,6 +12,7 @@ from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
 
 from .utils import CancelledError
 from .translation_memory import TranslationMemory, TranslationMemoryEntry
+from .translators.cache import TranslationCache
 
 logger = logging.getLogger(__name__)
 
@@ -732,6 +733,10 @@ class TranslationMetrics:
     detected_units: int = 0
     unique_units: int = 0
     cache_hits: int = 0
+    persistent_cache_hits: int = 0
+    persistent_cache_writes: int = 0
+    persistent_cache_rejected: int = 0
+    persistent_cache_errors: int = 0
     backend_requests: int = 0
     retry_items: int = 0
     fallback_items: int = 0
@@ -765,9 +770,9 @@ class TranslationService:
 
     The service intentionally knows nothing about PDF rectangles, Word runs, or
     spreadsheet XML. Adapters provide TranslationUnit objects and keep write-back
-    responsibility. Translator-specific persistent caches remain inside backends;
-    this layer provides format-neutral dedupe/L1 reuse, persistent translation
-    memory, validation, retry/fallback, engine attribution, and metrics.
+    responsibility. This layer provides format-neutral dedupe/L1 reuse, an optional
+    shared persistent translation cache, persistent Translation Memory, validation,
+    retry/fallback, engine attribution, and metrics.
     """
 
     def __init__(
@@ -780,10 +785,14 @@ class TranslationService:
         language_detector: Callable[[str], Any] | None = None,
         eligibility_policy: TranslationEligibilityPolicy | None = None,
         translation_memory: TranslationMemory | None = None,
+        persistent_cache: TranslationCache | None = None,
+        metrics_callback: Callable[[TranslationMetrics], None] | None = None,
     ) -> None:
         self.translator = translator
         self.fallback_translator = fallback_translator
         self.translation_memory = translation_memory
+        self.persistent_cache = persistent_cache
+        self.metrics_callback = metrics_callback
         self._cache = cache if cache is not None else {}
         self._terminology = {
             str(key).strip(): str(value).strip()
@@ -805,23 +814,53 @@ class TranslationService:
     def _with_service_terminology(self, unit: TranslationUnit) -> TranslationUnit:
         if not self._terminology:
             return unit
-        merged = dict(self._terminology)
-        # Unit-level guidance is more specific and therefore wins.
+        # Do not stuff an entire document glossary into every prompt. Only attach
+        # service-level terms that actually occur in this source unit; unit-level
+        # context remains authoritative and is always preserved.
+        merged = {
+            source_term: target_term
+            for source_term, target_term in self._terminology.items()
+            if _term_present(unit.text, source_term)
+        }
         merged.update(dict(unit.context.terminology))
+        if not merged:
+            return unit
         normalized = tuple(sorted(merged.items()))
         if normalized == unit.context.terminology:
             return unit
         return replace(unit, context=replace(unit.context, terminology=normalized))
 
+    def _emit_metrics(self, metrics: TranslationMetrics) -> None:
+        callback = self.metrics_callback
+        if callback is None:
+            return
+        try:
+            callback(metrics)
+        except Exception:
+            logger.debug("Translation metrics callback failed", exc_info=True)
+
     @staticmethod
     def _engine_name(translator: Any) -> str:
         if translator is None:
             return ""
-        for attr in ("_engine_name", "engine_name", "name"):
+        for attr in ("_engine_name", "engine_name", "name", "_engine", "engine", "translator_name", "provider"):
             value = getattr(translator, attr, None)
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return type(translator).__name__
+
+    @classmethod
+    def _persistent_cache_engine(cls, translator: Any) -> str:
+        # Versioned namespace so future cache-identity changes cannot reuse old
+        # entries accidentally.  Backend/model identity remains part of the key.
+        return f"verbilo-shared-v1:{cls._engine_name(translator)}"
+
+    @staticmethod
+    def _backend_manages_persistent_cache(translator: Any) -> bool:
+        # Ollama historically owned its own persistent L2 cache. Keep that path
+        # authoritative to avoid writing the same translation twice while other
+        # backends use the shared cache below.
+        return bool(getattr(translator, "manages_persistent_cache", False))
 
     @staticmethod
     def _check_cancel(cancel_event: threading.Event | None) -> None:
@@ -938,6 +977,7 @@ class TranslationService:
         metrics = TranslationMetrics(units=len(units))
         self.last_metrics = metrics
         if not units:
+            self._emit_metrics(metrics)
             return TranslationBatchResult([], [], metrics, [], [])
 
         units = [self._with_service_terminology(unit) for unit in units]
@@ -1073,6 +1113,65 @@ class TranslationService:
                 pending_keys.append(key)
 
         report_progress(progress_total - len(pending_keys))
+
+        shared_cache_enabled = (
+            self.persistent_cache is not None
+            and not self._backend_manages_persistent_cache(self.translator)
+        )
+        if pending_keys and shared_cache_enabled:
+            cache_engine = self._persistent_cache_engine(self.translator)
+            try:
+                persistent_hits = self.persistent_cache.get_batch(
+                    cache_engine, pending_keys, target_lang
+                )
+            except Exception:
+                logger.warning(
+                    "Persistent translation cache lookup failed; continuing without it",
+                    exc_info=True,
+                )
+                metrics.persistent_cache_errors += 1
+                persistent_hits = {}
+
+            still_pending: list[str] = []
+            rejected_cache_keys: list[str] = []
+            for key in pending_keys:
+                translated = persistent_hits.get(key)
+                if translated is None:
+                    still_pending.append(key)
+                    continue
+                unit = unit_by_key[key]
+                report = evaluate(
+                    unit, translated, structured=primary_enforces_terminology
+                )
+                if not report.valid:
+                    metrics.persistent_cache_rejected += 1
+                    record_rejection(report)
+                    rejected_cache_keys.append(key)
+                    still_pending.append(key)
+                    continue
+                metrics.persistent_cache_hits += 1
+                record_final_quality(report, len(grouped[key]))
+                visible_translation = unit.output_text(translated)
+                # Prime the document-scoped L1 cache as well.
+                self._cache[(primary_engine, key)] = translated
+                for idx in grouped[key]:
+                    texts[idx] = visible_translation
+                    engines[idx] = primary_engine
+                    quality_reports[idx] = report
+
+            if rejected_cache_keys:
+                try:
+                    self.persistent_cache.delete_batch(
+                        cache_engine, rejected_cache_keys, target_lang
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not delete rejected persistent-cache entries",
+                        exc_info=True,
+                    )
+                    metrics.persistent_cache_errors += 1
+            pending_keys = still_pending
+            report_progress(progress_total - len(pending_keys))
 
         if pending_keys and self.translation_memory is not None:
             tm_key_by_group = {
@@ -1258,6 +1357,24 @@ class TranslationService:
                     and unit.source_text == original_unit.source_text
                 ):
                     self._cache[(primary_engine, key)] = translated
+                    if shared_cache_enabled:
+                        try:
+                            wrote = self.persistent_cache.put(
+                                self._persistent_cache_engine(self.translator),
+                                key,
+                                target_lang,
+                                translated,
+                            )
+                            if wrote:
+                                metrics.persistent_cache_writes += 1
+                            else:
+                                metrics.persistent_cache_errors += 1
+                        except Exception:
+                            logger.debug(
+                                "Persistent translation cache write failed",
+                                exc_info=True,
+                            )
+                            metrics.persistent_cache_errors += 1
                 if (
                     self.translation_memory is not None
                     and unit.source_text == original_unit.source_text
@@ -1301,5 +1418,6 @@ class TranslationService:
                 metrics.tm_errors += 1
 
         report_progress(progress_total)
+        self._emit_metrics(metrics)
 
         return TranslationBatchResult(texts, engines, metrics, quality_reports, eligibility)

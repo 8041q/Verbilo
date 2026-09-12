@@ -488,6 +488,8 @@ def translate_pptx(
     terminology: Mapping[str, str] | None = None,
     strict_errors: bool = False,
     translation_memory: Any | None = None,
+    translation_cache: Any | None = None,
+    metrics_callback: Callable[[Any], None] | None = None,
 ) -> None:
     progress = ProgressReporter(progress_event_callback)
     progress.update("analyzing", 0, 1)
@@ -544,7 +546,8 @@ def translate_pptx(
     service = TranslationService(
         translator,
         terminology=terminology,
-        translation_memory=translation_memory,
+        translation_memory=translation_memory, persistent_cache=translation_cache,
+        metrics_callback=metrics_callback,
     )
     progress.update("translating", 0, len(semantic_units), detail=f"{len(semantic_units)} text unit(s)")
     result = service.translate_units(
@@ -584,7 +587,10 @@ def translate_pptx(
     if retry_units and _supports_layout_guidance(translator):
         layout_total = len(retry_units) + len(units)
         progress.update("layout", 0, layout_total, detail=f"{len(retry_units)} compact retry unit(s)")
-        retry_result = service.translate_units(
+        retry_service = TranslationService(
+            translator, terminology=terminology, translation_memory=translation_memory, persistent_cache=translation_cache
+        )
+        retry_result = retry_service.translate_units(
             retry_units,
             target_lang,
             cancel_event=cancel_event,

@@ -117,6 +117,8 @@ def translate_txt(
     terminology: Mapping[str, str] | None = None,
     strict_errors: bool = False,
     translation_memory: Any | None = None,
+    translation_cache: Any | None = None,
+    metrics_callback: Callable[[Any], None] | None = None,
 ) -> None:
     progress = ProgressReporter(progress_event_callback)
     progress.update("analyzing", 0, 1)
@@ -145,7 +147,10 @@ def translate_txt(
         for segment in segments
     ]
     progress.update("translating", 0, len(units), detail=f"{len(units)} text unit(s)")
-    result = TranslationService(translator, terminology=terminology, translation_memory=translation_memory).translate_units(
+    result = TranslationService(
+        translator, terminology=terminology, translation_memory=translation_memory, persistent_cache=translation_cache,
+        metrics_callback=metrics_callback,
+    ).translate_units(
         units,
         target_lang,
         cancel_event=cancel_event,

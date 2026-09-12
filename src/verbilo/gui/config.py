@@ -39,6 +39,8 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "ollama_enabled": False,
     "ollama_model": "qwen3.5:4b",
     "ollama_base_url": "http://127.0.0.1:11434",
+    "translation_memory_enabled": False,
+    "translation_memory_path": "",
 }
 
 
@@ -63,7 +65,7 @@ def load_config() -> Dict[str, Any]:
     return cfg
 
 
-def save_config(cfg: Dict[str, Any]) -> None:
+def save_config(cfg: Dict[str, Any]) -> bool:
     p = _config_path()
     try:
         serialized = dict(cfg)
@@ -91,9 +93,11 @@ def save_config(cfg: Dict[str, Any]) -> None:
                 Path(tmp_name).unlink(missing_ok=True)
             except OSError:
                 pass
+        return True
     except Exception:
         # best-effort, don't crash the GUI; log for visibility during development
         try:
             logging.exception("Failed to write GUI config %s", p)
         except Exception:
             pass
+        return False

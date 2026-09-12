@@ -9,6 +9,7 @@ lingua-language-detector==2.1.1
 fast-langdetect==1.0.0
 customtkinter==5.2.2
 pytablericons==1.0.1
+tkinterdnd2==0.6.3
 platformdirs==4.9.4
 tomli==2.4.0
 ctranslate2==4.7.1

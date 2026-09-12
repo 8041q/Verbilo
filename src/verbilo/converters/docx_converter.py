@@ -1788,12 +1788,17 @@ def translate_docx(
     strict_errors: bool = False,
     terminology: Mapping[str, str] | None = None,
     translation_memory: Any | None = None,
+    translation_cache: Any | None = None,
+    metrics_callback: Callable[[Any], None] | None = None,
 ) -> None:
     progress = ProgressReporter(progress_event_callback)
     progress.update("analyzing", 0, 1)
     auto_detect = source_lang == "auto"
     errors = 0
-    translation_service = TranslationService(translator, terminology=terminology, translation_memory=translation_memory)
+    translation_service = TranslationService(
+        translator, terminology=terminology, translation_memory=translation_memory, persistent_cache=translation_cache,
+        metrics_callback=metrics_callback,
+    )
 
     if cancel_event is not None and cancel_event.is_set():
         raise CancelledError("Translation cancelled before starting")

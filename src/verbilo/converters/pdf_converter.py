@@ -1191,6 +1191,7 @@ def _retry_pdf_layout_overflow_blocks(
     cancel_event: threading.Event | None = None,
     terminology: Mapping[str, str] | None = None,
     translation_memory: Any | None = None,
+    translation_cache: Any | None = None,
 ) -> dict[str, int]:
     stats = {"candidates": 0, "retried": 0, "accepted": 0}
     semantic_all = bool(getattr(semantic_translator, "_translate_all_blocks", False))
@@ -1240,6 +1241,7 @@ def _retry_pdf_layout_overflow_blocks(
             fallback_translator=fallback,
             terminology=terminology,
             translation_memory=translation_memory,
+            persistent_cache=translation_cache,
         )
         batch = service.translate_units(
             [item["unit"] for item in candidates],
@@ -1424,12 +1426,17 @@ def _translate_units_with_fallback(
     log_prefix: str = "Batch translation",
     terminology: Mapping[str, str] | None = None,
     translation_memory: Any | None = None,
+    translation_cache: Any | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
+    metrics_callback: Callable[[Any], None] | None = None,
 ) -> tuple[list[str], list[int]]:
     if not texts:
         return [], []
 
-    service = TranslationService(translator, terminology=terminology, translation_memory=translation_memory)
+    service = TranslationService(
+        translator, terminology=terminology, translation_memory=translation_memory, persistent_cache=translation_cache,
+        metrics_callback=metrics_callback,
+    )
     batch = service.translate_units(
         [
             SemanticTranslationUnit(text=text, source_lang=source_lang, mode="natural")
@@ -1477,12 +1484,13 @@ def _translate_blocks_with_fallback(
     log_prefix: str = "Semantic translation",
     terminology: Mapping[str, str] | None = None,
     translation_memory: Any | None = None,
+    translation_cache: Any | None = None,
 ) -> tuple[list[str], list[int]]:
     if not blocks:
         return [], []
 
     units = [_translation_unit_from_pdf_block(block) for block in blocks]
-    service = TranslationService(translator, terminology=terminology, translation_memory=translation_memory)
+    service = TranslationService(translator, terminology=terminology, translation_memory=translation_memory, persistent_cache=translation_cache)
     batch = service.translate_units(units, target_lang, cancel_event=cancel_event)
     failed = batch.failed_indices
     results = [
@@ -1541,6 +1549,8 @@ def _translate_pdf_open_document(
     strict_errors: bool = False,
     terminology: Mapping[str, str] | None = None,
     translation_memory: Any | None = None,
+    translation_cache: Any | None = None,
+    metrics_callback: Callable[[Any], None] | None = None,
 ) -> str | None:
     # Translate an already-open PDF while preserving the original layout.
 
@@ -1630,6 +1640,8 @@ def _translate_pdf_open_document(
         log_prefix="Primary PDF translation",
         terminology=terminology,
         translation_memory=translation_memory,
+        translation_cache=translation_cache,
+        metrics_callback=metrics_callback,
         progress_callback=(
             (lambda done, total: progress.update("translating", done, max(translation_total, 1)))
             if primary_entries
@@ -1651,6 +1663,8 @@ def _translate_pdf_open_document(
             fallback_translator=translator,
             terminology=terminology,
             translation_memory=translation_memory,
+            persistent_cache=translation_cache,
+            metrics_callback=metrics_callback,
         )
         semantic_batch = semantic_service.translate_units(
             semantic_units,
@@ -1690,6 +1704,7 @@ def _translate_pdf_open_document(
         cancel_event=cancel_event,
         terminology=terminology,
         translation_memory=translation_memory,
+        translation_cache=translation_cache,
     )
     if layout_retry_stats["candidates"]:
         logger.info(
@@ -1888,6 +1903,8 @@ def translate_pdf(
     strict_errors: bool = False,
     terminology: Mapping[str, str] | None = None,
     translation_memory: Any | None = None,
+    translation_cache: Any | None = None,
+    metrics_callback: Callable[[Any], None] | None = None,
 ) -> str | None:
     """Open, translate, and always close a PDF document."""
     src = fitz.open(input_path)
@@ -1900,6 +1917,8 @@ def translate_pdf(
             advisor=advisor,
             semantic_translator=semantic_translator, strict_errors=strict_errors,
             terminology=terminology, translation_memory=translation_memory,
+            translation_cache=translation_cache,
+            metrics_callback=metrics_callback,
         )
     finally:
         try:

@@ -53,7 +53,7 @@ class TranslationMemory:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=self.timeout)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout = 10000")
+        connection.execute(f"PRAGMA busy_timeout = {max(int(self.timeout * 1000), 1)}")
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
@@ -206,6 +206,56 @@ class TranslationMemory:
             row = connection.execute("SELECT COUNT(*) FROM translations").fetchone()
         return int(row[0] if row else 0)
 
-    def clear(self) -> None:
+    def clear(self, *, vacuum: bool = False) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM translations")
+        if vacuum:
+            # VACUUM cannot run inside the DELETE transaction. It is intentionally
+            # opt-in because normal programmatic clears should stay fast, while the
+            # explicit GUI Clear action should also reclaim disk space.
+            with self._connect() as connection:
+                connection.execute("VACUUM")
+
+    def disk_usage_bytes(self) -> int:
+        total = 0
+        for candidate in (self.path, Path(str(self.path) + "-wal"), Path(str(self.path) + "-shm")):
+            try:
+                total += candidate.stat().st_size
+            except OSError:
+                pass
+        return total
+
+    def search(
+        self,
+        query: str = "",
+        *,
+        source_lang: str | None = None,
+        target_lang: str | None = None,
+        limit: int = 500,
+    ) -> list[TranslationMemoryEntry]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if query.strip():
+            clauses.append("(source_text LIKE ? ESCAPE '\\' OR translation LIKE ? ESCAPE '\\')")
+            escaped = query.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
+            params.extend([pattern, pattern])
+        if source_lang:
+            clauses.append("source_lang = ?")
+            params.append(str(source_lang))
+        if target_lang:
+            clauses.append("target_lang = ?")
+            params.append(str(target_lang))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        safe_limit = min(max(int(limit), 1), 5000)
+        params.append(safe_limit)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM translations" + where +
+                " ORDER BY COALESCE(last_used_at, updated_at) DESC, updated_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._entry_from_row(row) for row in rows]
+
+    def stats(self) -> dict[str, int]:
+        return {"entries": self.count(), "bytes": self.disk_usage_bytes()}

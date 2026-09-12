@@ -732,6 +732,7 @@ def check_ollama_model_available(
 
 
 class OllamaSemanticTranslator:
+    manages_persistent_cache = True
     supports_terminology = True
     supports_progress = True
     def __init__(

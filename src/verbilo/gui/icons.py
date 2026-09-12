@@ -37,6 +37,7 @@ if OutlineIcon is not None:
         "language":         OutlineIcon.LANGUAGE,
         "world":            OutlineIcon.WORLD,
         "settings":         OutlineIcon.SETTINGS,
+        "terminology":      getattr(OutlineIcon, "BOOK_2", getattr(OutlineIcon, "BOOK", OutlineIcon.LANGUAGE)),
 
         # Actions
         "play":             OutlineIcon.PLAYER_PLAY,

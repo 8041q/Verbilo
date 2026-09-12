@@ -21,9 +21,12 @@ import webbrowser
 
 from . import theme
 from .helpers import Worker, list_supported_files, center_window, GuiLoggingHandler, SUPPORTED_EXTS
+from .dnd import install_file_drop
 from .config import load_config, save_config
 from .icons import get_icon, get_photo_image, get_app_icon, apply_window_icon
 from .i18n import DEFAULT_UI_LOCALE, get_supported_ui_locales, load_ui_localizer, resolve_ui_locale
+from ..terminology import TerminologyEntry, TerminologyStore
+from ..translation_memory import TranslationMemory, default_translation_memory_path
 
 logger = logging.getLogger(__name__)
 
@@ -339,6 +342,28 @@ def _get_local_language_options(codes: set[str], locale: str | None = None) -> l
 
 # --- searchable dropdown ---
 
+def _install_tree_hover(tree, hover_color: str) -> None:
+    """Add non-invasive row hover feedback to a ttk.Treeview."""
+    tree.tag_configure("_hover", background=hover_color)
+    state = {"row": None}
+
+    def _set_row(row):
+        previous = state["row"]
+        if previous == row:
+            return
+        state["row"] = row
+        if previous and tree.exists(previous):
+            tags = tuple(tag for tag in tree.item(previous, "tags") if tag != "_hover")
+            tree.item(previous, tags=tags)
+        if row and tree.exists(row):
+            tags = tuple(tree.item(row, "tags"))
+            if "_hover" not in tags:
+                tree.item(row, tags=tags + ("_hover",))
+
+    tree.bind("<Motion>", lambda event: _set_row(tree.identify_row(event.y) or None), "+")
+    tree.bind("<Leave>", lambda _event: _set_row(None), "+")
+
+
 class SimpleComboBox:
     # Non-searchable dropdown — same visual style as SearchableComboBox but read-only
 
@@ -394,7 +419,7 @@ class SimpleComboBox:
             master=self._frame,
             width=28, height=28,
             fg_color="transparent",
-            hover_color=p.bg_input,
+            hover_color=p.bg_heading,
             corner_radius=4,
             command=self._on_arrow,
             border_width=0,
@@ -621,7 +646,7 @@ class SearchableComboBox:
             master=self._frame,
             width=28, height=28,
             fg_color="transparent",
-            hover_color=p.bg_input,
+            hover_color=p.bg_heading,
             corner_radius=4,
             command=self._on_arrow,
             border_width=0,
@@ -950,6 +975,9 @@ class App:
         self._running = False
         self._ollama_pull_lock = threading.Lock()
         self._ollama_install_cancel: threading.Event | None = None
+        self._terminology_store = TerminologyStore()
+        self._last_run_report: dict | None = None
+        self._last_run_cancelled = False
 
         # Thread-safe log queue: worker threads put messages here; main thread drains it
         self._log_queue: queue.SimpleQueue = queue.SimpleQueue()
@@ -966,6 +994,7 @@ class App:
         theme.set_mode(saved_mode)
 
         self._build_ui()
+        self._drop_registration = self._install_drag_and_drop()
 
         def _reapply_icon():
             try:
@@ -991,10 +1020,7 @@ class App:
         default_in = self.cfg.get("default_input")
         
         if default_in:
-            found = list_supported_files(default_in)
-            for f in found:
-                if f not in self.files:
-                    self._add_file_to_table(f)
+            self._add_paths([default_in], announce=False)
 
         # Apply saved translation engine so language dropdowns reflect it
         try:
@@ -1286,28 +1312,31 @@ class App:
         self.cancel_btn.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 4))
         row += 1
 
-        # Settings at the very bottom
+        # Utility actions at the bottom share the same icon/text layout.
         theme.make_divider(self.sidebar).grid(
             row=row, column=0, sticky="ew", padx=PAD, pady=4,
         )
+        row += 1
+
+        terminology_icon = get_icon("terminology", size=16)
+        theme.make_button(
+            self.sidebar, self.t("sidebar.terminology"), command=self._open_terminology_manager,
+            style="ghost", anchor="w", image=terminology_icon,
+        ).grid(row=row, column=0, sticky="ew", padx=PAD, pady=(4, 2))
         row += 1
 
         settings_icon = get_icon("settings", size=16)
         theme.make_button(
             self.sidebar, self.t("sidebar.settings"), command=self._open_settings, style="ghost",
             anchor="w", image=settings_icon,
-        ).grid(row=row, column=0, sticky="ew", padx=PAD, pady=(4, 4))
+        ).grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 2))
         row += 1
 
         info_icon = get_icon("info", size=16)
-        about_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        about_frame.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, PAD))
-        about_frame.grid_columnconfigure(0, weight=1)
-        about_btn = theme.make_button(
-            about_frame, self.t("sidebar.about"), command=self._open_about, style="ghost",
+        theme.make_button(
+            self.sidebar, self.t("sidebar.about"), command=self._open_about, style="ghost",
             anchor="w", image=info_icon,
-        )
-        about_btn.grid(row=0, column=0, sticky="ew")
+        ).grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, PAD))
 
     # --- content area ---
 
@@ -1340,18 +1369,21 @@ class App:
         folder_icon = get_icon("open-folder", size=16, on_accent=True)
         trash_icon = get_icon("trash", size=16)
 
-        theme.make_button(
+        self.add_files_btn = theme.make_button(
             btn_frame, self.t("content.add_files"), command=self._add_files, style="primary",
             image=add_icon, height=30,
-        ).pack(side=tk.LEFT, padx=(0, 6))
-        theme.make_button(
+        )
+        self.add_files_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.select_folder_btn = theme.make_button(
             btn_frame, self.t("content.select_folder"), command=self._select_folder, style="primary",
             image=folder_icon, height=30,
-        ).pack(side=tk.LEFT, padx=(0, 6))
-        theme.make_button(
+        )
+        self.select_folder_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.clear_files_btn = theme.make_button(
             btn_frame, self.t("content.clear"), command=self._clear_files, style="secondary",
             image=trash_icon, height=30,
-        ).pack(side=tk.LEFT)
+        )
+        self.clear_files_btn.pack(side=tk.LEFT)
 
         # File table card
         table_card = theme.make_card(content)
@@ -1362,6 +1394,7 @@ class App:
         progress_card = theme.make_card(content)
         progress_card.grid(row=2, column=0, sticky="ew", pady=(0, PAD))
         progress_card.grid_columnconfigure(0, weight=1)
+        progress_card.grid_columnconfigure(1, weight=0)
 
         self.progress_label = theme.make_label(
             progress_card, self.t("content.ready"), level="small",
@@ -1369,6 +1402,14 @@ class App:
         self.progress_label.grid(
             row=0, column=0, sticky="w", padx=PAD, pady=(10, 4),
         )
+        self.report_btn = theme.make_button(
+            progress_card, self.t("report.view"), command=self._open_translation_report,
+            style="ghost", height=24, state="disabled",
+        )
+        self.report_btn.grid(row=0, column=1, sticky="e", padx=(4, PAD), pady=(6, 2))
+        # A report is a post-run artifact. Keep the button completely out of the
+        # layout until a completed run has produced one.
+        self.report_btn.grid_remove()
 
         self.progress = ctk.CTkProgressBar(
             progress_card,
@@ -1377,7 +1418,7 @@ class App:
             corner_radius=4,
             height=8,
         )
-        self.progress.grid(row=1, column=0, sticky="ew", padx=PAD, pady=(0, 10))
+        self.progress.grid(row=1, column=0, columnspan=2, sticky="ew", padx=PAD, pady=(0, 10))
         self._set_progress(0.0)
 
         # Log card
@@ -1509,6 +1550,7 @@ class App:
         if fallback:
             self._file_icons["_default"] = fallback
 
+
         container = tk.Frame(parent, bg=p.bg_card)
         container.pack(
             fill=tk.BOTH, expand=True,
@@ -1555,6 +1597,35 @@ class App:
             if not self.file_table.identify_row(event.y):
                 self.file_table.selection_set([])
         self.file_table.bind("<Button-1>", _on_table_click, "+")
+
+        # Lightweight row hover makes the table feel interactive without
+        # changing the selected/status foreground colours.
+        self.file_table.tag_configure("hover", background=p.bg_heading)
+        self._hovered_file_row = None
+
+        def _on_table_motion(event):
+            row = self.file_table.identify_row(event.y) or None
+            if row == self._hovered_file_row:
+                return
+            previous = self._hovered_file_row
+            self._hovered_file_row = row
+            if previous and self.file_table.exists(previous):
+                tags = tuple(tag for tag in self.file_table.item(previous, "tags") if tag != "hover")
+                self.file_table.item(previous, tags=tags)
+            if row and self.file_table.exists(row):
+                tags = tuple(self.file_table.item(row, "tags"))
+                if "hover" not in tags:
+                    self.file_table.item(row, tags=tags + ("hover",))
+
+        def _on_table_leave(_event=None):
+            previous = self._hovered_file_row
+            self._hovered_file_row = None
+            if previous and self.file_table.exists(previous):
+                tags = tuple(tag for tag in self.file_table.item(previous, "tags") if tag != "hover")
+                self.file_table.item(previous, tags=tags)
+
+        self.file_table.bind("<Motion>", _on_table_motion, "+")
+        self.file_table.bind("<Leave>", _on_table_leave, "+")
 
         # Status colour tags
         self.file_table.tag_configure("pending",   foreground=p.status_pending)
@@ -2438,6 +2509,18 @@ class App:
         usage_lbl.grid(row=_rrow, column=0, sticky="w", pady=(0, 6))
         _rrow += 1
 
+        theme.make_label(
+            right, self.t("settings.backend_cache.title"), level="small",
+        ).grid(row=_rrow, column=0, sticky="w", pady=(0, 2))
+        _rrow += 1
+
+        cache_hint = theme.make_label(
+            right, self.t("settings.backend_cache.hint"), level="tiny",
+        )
+        cache_hint.configure(anchor="w", justify="left", wraplength=390)
+        cache_hint.grid(row=_rrow, column=0, sticky="ew", pady=(0, 5))
+        _rrow += 1
+
         # Create a small row with the button and a ghost label beside it
         try:
             # compute initial text (always visible, even when 0)
@@ -2484,11 +2567,143 @@ class App:
                 pass
 
         clear_btn = theme.make_button(
-            _cache_row, self.t("settings.clear_translation_cache"),
+            _cache_row, self.t("settings.backend_cache.clear"),
             command=_clear_cache, style="secondary", height=26,
         )
         clear_btn.pack(side=tk.LEFT)
         cache_lbl.pack(side=tk.LEFT, padx=(8, 0))
+        _rrow += 1
+
+        # Translation Memory controls. These settings are snapshotted when a
+        # worker starts, so edits here never mutate an in-flight job.
+        theme.make_divider(right).grid(row=_rrow, column=0, sticky="ew", pady=(8, 8))
+        _rrow += 1
+        theme.make_label(right, self.t("settings.section.translation_memory"), level="section").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 4),
+        )
+        _rrow += 1
+
+        tm_enabled_var = tk.BooleanVar(value=bool(self.cfg.get("translation_memory_enabled", False)))
+        tm_enabled_cb = ctk.CTkCheckBox(
+            right, text=self.t("settings.translation_memory.enable"),
+            variable=tm_enabled_var, onvalue=True, offvalue=False,
+            checkmark_color=p.bg_main, fg_color=p.accent, hover_color=p.accent_hover,
+            border_color=p.border, text_color=p.text_secondary,
+            font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]),
+        )
+        tm_enabled_cb.grid(row=_rrow, column=0, sticky="w", pady=(0, 3))
+        _rrow += 1
+        tm_explain = theme.make_label(
+            right, self.t("settings.translation_memory.hint"), level="tiny",
+        )
+        tm_explain.configure(anchor="w", justify="left", wraplength=390)
+        tm_explain.grid(row=_rrow, column=0, sticky="ew", pady=(0, 6))
+        _rrow += 1
+
+        theme.make_label(right, self.t("settings.translation_memory_path"), level="small").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 2),
+        )
+        _rrow += 1
+        _tm_path_row = ctk.CTkFrame(right, fg_color="transparent")
+        _tm_path_row.grid(row=_rrow, column=0, sticky="ew", pady=(0, 2))
+        _tm_path_row.grid_columnconfigure(0, weight=1)
+        tm_path_entry = theme.make_entry(_tm_path_row, height=28)
+        tm_path_entry.grid(row=0, column=0, sticky="ew")
+        _configured_tm_path = str(self.cfg.get("translation_memory_path") or "").strip()
+        tm_path_entry.insert(0, _configured_tm_path or str(default_translation_memory_path()))
+
+        def _browse_tm_path():
+            raw = tm_path_entry.get().strip() or str(default_translation_memory_path())
+            candidate = Path(raw).expanduser()
+            initialdir = candidate.parent if candidate.parent.exists() else Path.home()
+            chosen = filedialog.asksaveasfilename(
+                title=self.t("dialog.select_translation_memory"), parent=win,
+                initialdir=str(initialdir), initialfile=candidate.name or "translation_memory.sqlite3",
+                defaultextension=".sqlite3", filetypes=[("SQLite", "*.sqlite3"), ("All files", "*.*")],
+            )
+            if chosen:
+                tm_path_entry.delete(0, tk.END)
+                tm_path_entry.insert(0, chosen)
+                _update_tm_label()
+
+        theme.make_button(
+            _tm_path_row, self.t("settings.browse"), command=_browse_tm_path,
+            style="secondary", image=browse_icon_s, height=28,
+        ).grid(row=0, column=1, padx=(6, 0))
+        _rrow += 1
+
+        theme.make_label(
+            right, self.t("settings.translation_memory_path_hint"), level="tiny",
+        ).grid(row=_rrow, column=0, sticky="w", pady=(0, 4))
+        _rrow += 1
+
+        _tm_actions = ctk.CTkFrame(right, fg_color="transparent")
+        _tm_actions.grid(row=_rrow, column=0, sticky="w", pady=(0, 4))
+        tm_info_lbl = theme.make_label(_tm_actions, "", level="tiny")
+
+        def _tm_selected_path() -> Path:
+            raw = tm_path_entry.get().strip()
+            return Path(raw).expanduser() if raw else default_translation_memory_path()
+
+        def _update_tm_label():
+            try:
+                path = _tm_selected_path()
+                if path.exists():
+                    from ..utils.io import format_bytes
+                    stats = TranslationMemory(path, timeout=0.75).stats()
+                    text = self.t(
+                        "settings.translation_memory.entries",
+                        entries=f"{stats['entries']:,}", size=format_bytes(stats["bytes"]),
+                    )
+                else:
+                    text = self.t("settings.translation_memory.entries", entries="0", size="0 B")
+            except Exception as exc:
+                text = self.t("settings.error.translation_memory", error=exc)
+            tm_info_lbl.configure(text=text)
+
+        def _manage_tm_from_settings():
+            path = _tm_selected_path()
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            self._open_translation_memory_manager(str(path), parent=win)
+
+        def _clear_tm_from_settings():
+            if self._running:
+                messagebox.showwarning(
+                    self.t("settings.section.translation_memory"),
+                    self.t("settings.translation_memory.running_note"), parent=win,
+                )
+                return
+            if not messagebox.askyesno(
+                self.t("settings.translation_memory.confirm_clear_title"),
+                self.t("settings.translation_memory.confirm_clear_body"), parent=win,
+            ):
+                return
+            try:
+                TranslationMemory(_tm_selected_path(), timeout=0.75).clear(vacuum=True)
+                _update_tm_label()
+            except Exception as exc:
+                self._settings_error.configure(
+                    text=self.t("settings.error.translation_memory", error=exc)
+                )
+
+        tm_manage_btn = theme.make_button(
+            _tm_actions, self.t("settings.translation_memory.manage"),
+            command=_manage_tm_from_settings, style="secondary", height=26,
+        )
+        tm_manage_btn.pack(side=tk.LEFT)
+        tm_clear_btn = theme.make_button(
+            _tm_actions, self.t("settings.translation_memory.clear"),
+            command=_clear_tm_from_settings, style="secondary", height=26,
+        )
+        tm_clear_btn.pack(side=tk.LEFT, padx=(6, 0))
+        if self._running:
+            self._set_button_disabled(tm_clear_btn, True)
+        tm_info_lbl.pack(side=tk.LEFT, padx=(8, 0))
+        _update_tm_label()
+        _rrow += 1
 
         # ── Bottom row: error label + buttons ────────────────────────────
         bottom = ctk.CTkFrame(card, fg_color="transparent")
@@ -2500,7 +2715,7 @@ class App:
             bottom, "", level="tiny",
             text_color=p.status_error,
         )
-        self._settings_error.grid(row=1, column=2, sticky="w", pady=(0, 6))
+        self._settings_error.grid(row=0, column=0, sticky="w", pady=(0, 6))
 
         # Button row
         btn_frame = ctk.CTkFrame(bottom, fg_color="transparent")
@@ -2513,6 +2728,16 @@ class App:
                 self._settings_error.configure(text=self.t("settings.error.input_or_output_empty"))
                 return
             self._settings_error.configure(text="")
+            tm_path_value = tm_path_entry.get().strip()
+            if tm_enabled_var.get():
+                try:
+                    TranslationMemory(tm_path_value or default_translation_memory_path(), timeout=0.75).count()
+                except Exception as exc:
+                    self._settings_error.configure(
+                        text=self.t("settings.error.translation_memory", error=exc)
+                    )
+                    return
+            previous_cfg = dict(self.cfg)
             self.cfg["default_input"] = inp
             self.cfg["default_output"] = out
             new_mode = "Dark" if mode_switch_var.get() else "Light"
@@ -2538,7 +2763,13 @@ class App:
             self.cfg["azure_key"] = azure_key_entry.get().strip()
             self.cfg["azure_region"] = azure_region_entry.get().strip()
             self.cfg["deepl_api_key"] = deepl_key_entry.get().strip()
-            save_config(self.cfg)
+            self.cfg["translation_memory_enabled"] = bool(tm_enabled_var.get())
+            default_tm = str(default_translation_memory_path())
+            self.cfg["translation_memory_path"] = "" if not tm_path_value or tm_path_value == default_tm else tm_path_value
+            if not save_config(self.cfg):
+                self.cfg = previous_cfg
+                self._settings_error.configure(text=self.t("settings.error.save_failed"))
+                return
 
             # Refresh engine-dependent UI after config changes
             try:
@@ -2580,6 +2811,362 @@ class App:
             win.resizable(False, False)
         except Exception:
             pass
+
+
+    # --- terminology / translation-memory management ---
+
+    def _open_terminology_manager(self):
+        p = theme.get()
+        win = ctk.CTkToplevel(self.root)
+        apply_window_icon(win)
+        win.title(self.t("terminology.title"))
+        win.transient(self.root)
+        win.grab_set()
+        win.configure(fg_color=p.bg_main)
+        win.geometry("900x560")
+        win.minsize(760, 460)
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=1)
+
+        header = ctk.CTkFrame(win, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=theme.PADDING, pady=(theme.PADDING, 8))
+        header.grid_columnconfigure(0, weight=1)
+        theme.make_label(header, self.t("terminology.title"), level="heading").grid(row=0, column=0, sticky="w")
+        theme.make_label(header, self.t("terminology.intro"), level="tiny").grid(row=1, column=0, sticky="w", pady=(2, 0))
+        if self._running:
+            theme.make_label(
+                header, self.t("terminology.running_note"), level="tiny", text_color=p.status_warning,
+            ).grid(row=2, column=0, sticky="w", pady=(2, 0))
+
+        card = theme.make_card(win)
+        card.grid(row=1, column=0, sticky="nsew", padx=theme.PADDING, pady=(0, 8))
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_rowconfigure(0, weight=1)
+
+        columns = ("enabled", "source_lang", "target_lang", "source", "target")
+        tree = ttk.Treeview(card, columns=columns, show="headings", selectmode="browse")
+        _install_tree_hover(tree, p.bg_heading)
+        tree.heading("enabled", text=self.t("terminology.column.enabled"))
+        tree.heading("source_lang", text=self.t("terminology.column.source_language"))
+        tree.heading("target_lang", text=self.t("terminology.column.target_language"))
+        tree.heading("source", text=self.t("terminology.column.source"))
+        tree.heading("target", text=self.t("terminology.column.target"))
+        tree.column("enabled", width=55, stretch=False, anchor="center")
+        tree.column("source_lang", width=85, stretch=False, anchor="center")
+        tree.column("target_lang", width=85, stretch=False, anchor="center")
+        tree.column("source", width=260, stretch=True)
+        tree.column("target", width=260, stretch=True)
+        scrollbar = ttk.Scrollbar(card, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.grid(row=0, column=0, sticky="nsew", padx=(12, 0), pady=12)
+        scrollbar.grid(row=0, column=1, sticky="ns", padx=(0, 12), pady=12)
+
+        status = theme.make_label(win, "", level="tiny")
+        status.grid(row=2, column=0, sticky="w", padx=theme.PADDING, pady=(0, 4))
+
+        entries_by_id: dict[str, TerminologyEntry] = {}
+
+        def _refresh():
+            nonlocal entries_by_id
+            entries = self._terminology_store.load()
+            entries_by_id = {entry.id: entry for entry in entries}
+            for iid in tree.get_children():
+                tree.delete(iid)
+            for entry in sorted(entries, key=lambda e: (e.source_lang, e.target_lang, e.source_text.casefold())):
+                tree.insert(
+                    "", tk.END, iid=entry.id,
+                    values=("✓" if entry.enabled else "", entry.source_lang, entry.target_lang, entry.source_text, entry.target_text),
+                )
+            if self._terminology_store.last_error:
+                status.configure(text=self.t("terminology.import_error", error=self._terminology_store.last_error), text_color=p.status_error)
+            else:
+                status.configure(text=f"{len(entries):,} entries", text_color=p.text_muted)
+
+        language_options = _get_language_options(self.ui.locale)
+        lang_display = [self._format_language_option(code, name) for code, name in language_options]
+        lang_map = {self._format_language_option(code, name): code for code, name in language_options}
+        reverse_lang = {code.lower(): display for display, code in lang_map.items()}
+
+        def _edit_entry(existing: TerminologyEntry | None = None):
+            dlg = ctk.CTkToplevel(win)
+            apply_window_icon(dlg)
+            dlg.title(self.t("terminology.edit") if existing else self.t("terminology.add"))
+            dlg.transient(win)
+            dlg.grab_set()
+            dlg.configure(fg_color=p.bg_main)
+            frame = theme.make_card(dlg)
+            frame.pack(fill=tk.BOTH, expand=True, padx=theme.PADDING, pady=theme.PADDING)
+            frame.grid_columnconfigure(0, weight=1)
+
+            theme.make_label(frame, self.t("terminology.source_language"), level="small").grid(row=0, column=0, sticky="w", padx=12, pady=(12, 2))
+            source_initial = reverse_lang.get(existing.source_lang.lower(), "") if existing else ""
+            source_var = tk.StringVar(value=source_initial)
+            source_box = SearchableComboBox(frame, values=lang_display, variable=source_var)
+            source_box.grid(row=1, column=0, sticky="ew", padx=12)
+
+            theme.make_label(frame, self.t("terminology.target_language"), level="small").grid(row=2, column=0, sticky="w", padx=12, pady=(10, 2))
+            target_initial = reverse_lang.get(existing.target_lang.lower(), "") if existing else ""
+            target_var = tk.StringVar(value=target_initial)
+            target_box = SearchableComboBox(frame, values=lang_display, variable=target_var)
+            target_box.grid(row=3, column=0, sticky="ew", padx=12)
+
+            theme.make_label(frame, self.t("terminology.source_term"), level="small").grid(row=4, column=0, sticky="w", padx=12, pady=(10, 2))
+            source_entry = theme.make_entry(frame)
+            source_entry.grid(row=5, column=0, sticky="ew", padx=12)
+            if existing:
+                source_entry.insert(0, existing.source_text)
+
+            theme.make_label(frame, self.t("terminology.target_term"), level="small").grid(row=6, column=0, sticky="w", padx=12, pady=(10, 2))
+            target_entry = theme.make_entry(frame)
+            target_entry.grid(row=7, column=0, sticky="ew", padx=12)
+            if existing:
+                target_entry.insert(0, existing.target_text)
+
+            enabled_var = tk.BooleanVar(value=True if existing is None else existing.enabled)
+            ctk.CTkCheckBox(
+                frame, text=self.t("terminology.enabled"), variable=enabled_var,
+                fg_color=p.accent, hover_color=p.accent_hover, border_color=p.border,
+                text_color=p.text_secondary,
+            ).grid(row=8, column=0, sticky="w", padx=12, pady=(10, 2))
+            error_lbl = theme.make_label(frame, "", level="tiny", text_color=p.status_error)
+            error_lbl.grid(row=9, column=0, sticky="w", padx=12, pady=(2, 0))
+
+            def _resolve_code(box, var):
+                display = var.get().strip() or box.get().strip()
+                return lang_map.get(display, display.split("(")[-1].rstrip(") ").strip() if "(" in display else "")
+
+            def _save():
+                src = _resolve_code(source_box, source_var)
+                tgt = _resolve_code(target_box, target_var)
+                source_text = source_entry.get().strip()
+                target_text = target_entry.get().strip()
+                if not src or not tgt or not source_text or not target_text:
+                    error_lbl.configure(text=self.t("terminology.error.required"))
+                    return
+                entries = self._terminology_store.load()
+                duplicate = next((
+                    e for e in entries
+                    if e.id != (existing.id if existing else "")
+                    and e.source_lang.lower() == src.lower()
+                    and e.target_lang.lower() == tgt.lower()
+                    and e.source_text.casefold() == source_text.casefold()
+                ), None)
+                if duplicate is not None:
+                    error_lbl.configure(text=self.t("terminology.error.duplicate"))
+                    return
+                try:
+                    updated = TerminologyEntry.create(
+                        src, tgt, source_text, target_text, enabled=enabled_var.get(),
+                        entry_id=existing.id if existing else None,
+                    )
+                    new_entries = [e for e in entries if e.id != updated.id] + [updated]
+                    self._terminology_store.save(new_entries)
+                except Exception as exc:
+                    error_lbl.configure(text=str(exc))
+                    return
+                _close_edit()
+                _refresh()
+
+            def _close_edit():
+                try:
+                    dlg.destroy()
+                finally:
+                    try:
+                        if win.winfo_exists():
+                            win.grab_set()
+                    except Exception:
+                        pass
+
+            buttons = ctk.CTkFrame(frame, fg_color="transparent")
+            buttons.grid(row=10, column=0, sticky="w", padx=12, pady=12)
+            theme.make_button(buttons, self.t("settings.save"), command=_save, style="primary", height=28).pack(side=tk.LEFT, padx=(0, 6))
+            theme.make_button(buttons, self.t("sidebar.cancel"), command=_close_edit, style="secondary", height=28).pack(side=tk.LEFT)
+            dlg.protocol("WM_DELETE_WINDOW", _close_edit)
+            dlg.update_idletasks()
+            center_window(dlg, parent=win)
+
+        def _selected_entry() -> TerminologyEntry | None:
+            selection = tree.selection()
+            return entries_by_id.get(selection[0]) if selection else None
+
+        def _delete_selected():
+            entry = _selected_entry()
+            if entry is None:
+                return
+            if not messagebox.askyesno(
+                self.t("terminology.confirm_delete_title"), self.t("terminology.confirm_delete_body"), parent=win
+            ):
+                return
+            self._terminology_store.save(e for e in entries_by_id.values() if e.id != entry.id)
+            _refresh()
+
+        def _import():
+            path = filedialog.askopenfilename(
+                parent=win, filetypes=[("Terminology", "*.csv *.json"), ("CSV", "*.csv"), ("JSON", "*.json"), ("All files", "*.*")]
+            )
+            if not path:
+                return
+            try:
+                added, updated = self._terminology_store.import_file(path)
+                _refresh()
+                messagebox.showinfo(
+                    self.t("terminology.title"), self.t("terminology.import_success", added=added, updated=updated), parent=win
+                )
+            except Exception as exc:
+                messagebox.showerror(
+                    self.t("terminology.title"), self.t("terminology.import_error", error=exc), parent=win
+                )
+
+        def _export():
+            path = filedialog.asksaveasfilename(
+                parent=win, defaultextension=".csv", initialfile="verbilo_terminology.csv",
+                filetypes=[("CSV", "*.csv"), ("JSON", "*.json")],
+            )
+            if not path:
+                return
+            try:
+                count = self._terminology_store.export_file(path)
+                messagebox.showinfo(
+                    self.t("terminology.title"), self.t("terminology.export_success", count=count), parent=win
+                )
+            except Exception as exc:
+                messagebox.showerror(
+                    self.t("terminology.title"), self.t("terminology.export_error", error=exc), parent=win
+                )
+
+        actions = ctk.CTkFrame(win, fg_color="transparent")
+        actions.grid(row=3, column=0, sticky="ew", padx=theme.PADDING, pady=(0, theme.PADDING))
+        theme.make_button(actions, self.t("terminology.add"), command=lambda: _edit_entry(None), style="primary", height=28).pack(side=tk.LEFT, padx=(0, 6))
+        theme.make_button(actions, self.t("terminology.edit"), command=lambda: _edit_entry(_selected_entry()) if _selected_entry() else None, style="secondary", height=28).pack(side=tk.LEFT, padx=(0, 6))
+        theme.make_button(actions, self.t("terminology.delete"), command=_delete_selected, style="secondary", height=28).pack(side=tk.LEFT, padx=(0, 12))
+        theme.make_button(actions, self.t("terminology.import"), command=_import, style="secondary", height=28).pack(side=tk.LEFT, padx=(0, 6))
+        theme.make_button(actions, self.t("terminology.export"), command=_export, style="secondary", height=28).pack(side=tk.LEFT)
+        theme.make_button(actions, self.t("terminology.close"), command=win.destroy, style="ghost", height=28).pack(side=tk.RIGHT)
+        tree.bind("<Double-1>", lambda _event: _edit_entry(_selected_entry()) if _selected_entry() else None)
+        _refresh()
+        center_window(win, 900, 560, parent=self.root)
+
+    def _open_translation_memory_manager(self, path: str | None = None, *, parent=None):
+        p = theme.get()
+        parent_window = parent or self.root
+        try:
+            memory = TranslationMemory(path or default_translation_memory_path(), timeout=0.75)
+        except Exception as exc:
+            messagebox.showerror(
+                self.t("settings.section.translation_memory"),
+                self.t("settings.error.translation_memory", error=exc), parent=parent_window,
+            )
+            try:
+                if parent is not None:
+                    parent.grab_set()
+            except Exception:
+                pass
+            return
+
+        win = ctk.CTkToplevel(parent_window)
+        apply_window_icon(win)
+        win.title(self.t("tm_manager.title"))
+        win.transient(parent_window)
+        win.grab_set()
+        win.configure(fg_color=p.bg_main)
+        win.geometry("920x560")
+        win.minsize(760, 440)
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=1)
+
+        top = ctk.CTkFrame(win, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=theme.PADDING, pady=(theme.PADDING, 8))
+        top.grid_columnconfigure(0, weight=1)
+        search_entry = theme.make_entry(top, placeholder_text=self.t("tm_manager.search"))
+        search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        card = theme.make_card(win)
+        card.grid(row=1, column=0, sticky="nsew", padx=theme.PADDING, pady=(0, 8))
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_rowconfigure(0, weight=1)
+        columns = ("source", "translation", "languages", "uses")
+        tree = ttk.Treeview(card, columns=columns, show="headings", selectmode="browse")
+        _install_tree_hover(tree, p.bg_heading)
+        for key, label, width, stretch in (
+            ("source", self.t("tm_manager.column.source"), 300, True),
+            ("translation", self.t("tm_manager.column.translation"), 300, True),
+            ("languages", self.t("tm_manager.column.languages"), 100, False),
+            ("uses", self.t("tm_manager.column.uses"), 70, False),
+        ):
+            tree.heading(key, text=label)
+            tree.column(key, width=width, stretch=stretch, anchor="center" if not stretch else "w")
+        scroll = ttk.Scrollbar(card, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.grid(row=0, column=0, sticky="nsew", padx=(12, 0), pady=12)
+        scroll.grid(row=0, column=1, sticky="ns", padx=(0, 12), pady=12)
+        info = theme.make_label(win, "", level="tiny")
+        info.grid(row=2, column=0, sticky="w", padx=theme.PADDING, pady=(0, 4))
+
+        def _refresh():
+            try:
+                rows = memory.search(search_entry.get().strip(), limit=500)
+                for iid in tree.get_children():
+                    tree.delete(iid)
+                for entry in rows:
+                    tree.insert(
+                        "", tk.END, iid=entry.key,
+                        values=(entry.source_text, entry.translation, f"{entry.source_lang} → {entry.target_lang}", entry.use_count),
+                    )
+                from ..utils.io import format_bytes
+                stats = memory.stats()
+                info.configure(
+                    text=self.t(
+                        "tm_manager.showing", shown=f"{len(rows):,}",
+                        total=f"{stats['entries']:,}", size=format_bytes(stats["bytes"]),
+                    ),
+                    text_color=p.text_muted,
+                )
+            except Exception as exc:
+                info.configure(text=self.t("settings.error.translation_memory", error=exc), text_color=p.status_error)
+
+        def _delete():
+            if self._running:
+                messagebox.showwarning(
+                    self.t("tm_manager.title"), self.t("settings.translation_memory.running_note"), parent=win
+                )
+                return
+            selection = tree.selection()
+            if not selection:
+                return
+            if not messagebox.askyesno(
+                self.t("tm_manager.confirm_delete_title"), self.t("tm_manager.confirm_delete_body"), parent=win
+            ):
+                return
+            try:
+                memory.delete_many([selection[0]])
+                _refresh()
+            except Exception as exc:
+                messagebox.showerror(
+                    self.t("tm_manager.title"), self.t("settings.error.translation_memory", error=exc), parent=win
+                )
+
+        theme.make_button(top, self.t("tm_manager.refresh"), command=_refresh, style="secondary", height=28).grid(row=0, column=1)
+        search_entry.bind("<Return>", lambda _event: _refresh())
+        bottom = ctk.CTkFrame(win, fg_color="transparent")
+        bottom.grid(row=3, column=0, sticky="ew", padx=theme.PADDING, pady=(0, theme.PADDING))
+        delete_btn = theme.make_button(bottom, self.t("tm_manager.delete"), command=_delete, style="secondary", height=28)
+        delete_btn.pack(side=tk.LEFT)
+        if self._running:
+            self._set_button_disabled(delete_btn, True)
+        theme.make_button(bottom, self.t("tm_manager.close"), command=lambda: _close(), style="ghost", height=28).pack(side=tk.RIGHT)
+
+        def _close():
+            try:
+                win.destroy()
+            finally:
+                try:
+                    if parent is not None and parent.winfo_exists():
+                        parent.grab_set()
+                except Exception:
+                    pass
+        win.protocol("WM_DELETE_WINDOW", _close)
+        _refresh()
+        center_window(win, 920, 560, parent=parent_window)
 
     # --- update check ---
 
@@ -3337,16 +3924,71 @@ class App:
 
     # --- file management ---
 
+    def _path_key(self, path: str) -> str:
+        try:
+            return os.path.normcase(str(Path(path).expanduser().resolve()))
+        except Exception:
+            return os.path.normcase(os.path.abspath(os.path.expanduser(str(path))))
+
+    def _add_paths(self, paths, *, announce: bool = True) -> int:
+        """Add files/directories from picker, startup defaults, or drag-and-drop.
+
+        Directories use the same non-recursive supported-file discovery as the
+        existing Select Folder action. Paths are normalised before deduping so
+        Windows case differences and relative/absolute aliases cannot duplicate
+        a row.
+        """
+        if getattr(self, "_running", False):
+            try:
+                self._log(self.t("content.file_list_locked"))
+            except Exception:
+                pass
+            return 0
+        existing = {self._path_key(path) for path in self.files}
+        added = 0
+        for raw in paths or ():
+            if not raw:
+                continue
+            candidate = Path(str(raw)).expanduser()
+            candidates = list_supported_files(str(candidate)) if candidate.is_dir() else [str(candidate)]
+            for item in candidates:
+                p = Path(item).expanduser()
+                if not p.is_file() or p.suffix.lower() not in SUPPORTED_EXTS:
+                    continue
+                try:
+                    resolved = str(p.resolve())
+                except Exception:
+                    resolved = str(p.absolute())
+                key = self._path_key(resolved)
+                if key in existing:
+                    continue
+                self._add_file_to_table(resolved)
+                existing.add(key)
+                added += 1
+        if announce and added:
+            try:
+                self._log(self.t("content.drop_added", count=added))
+            except Exception:
+                pass
+        return added
+
+    def _install_drag_and_drop(self):
+        try:
+            return install_file_drop(
+                self.root, self.file_table,
+                lambda items: self._add_paths(items),
+            )
+        except Exception:
+            logger.debug("Drag-and-drop setup failed", exc_info=True)
+            return None
+
     def _add_files(self):
-        from ..gui.helpers import SUPPORTED_EXTS
         init = self._initialdir_for_input()
-        
         all_patterns = tuple(f"*{ext}" for ext in SUPPORTED_EXTS)
-        
+
         def ext_to_label(ext: str) -> str:
-            name = ext.lstrip(".").upper()
-            return f"{name} Files"
-        
+            return f"{ext.lstrip('.').upper()} Files"
+
         filetypes = [("All Supported Files", all_patterns)]
         seen = set()
         for ext in SUPPORTED_EXTS:
@@ -3354,12 +3996,12 @@ class App:
                 seen.add(ext)
                 filetypes.append((ext_to_label(ext), (f"*{ext}",)))
         filetypes.append(("All Files", ("*.*",)))
-        
+
         paths = filedialog.askopenfilenames(
             title="Select Files", parent=self.root, initialdir=init, filetypes=filetypes,
         )
-
-
+        if paths:
+            self._add_paths(paths, announce=False)
 
     def _select_folder(self):
         init = self._initialdir_for_input()
@@ -3373,18 +4015,15 @@ class App:
             messagebox.showinfo(
                 self.t("message.no_files_title"),
                 self.t("message.no_files_found_body", path=d),
+                parent=self.root,
             )
             return
-        
-        from pathlib import Path as _Path
-        existing = {str(_Path(p).resolve()) for p in self.files}
-        for f in found:
-            resolved = str(_Path(f).resolve())
-            if resolved not in existing:
-                self._add_file_to_table(resolved)
-                existing.add(resolved)
+        self._add_paths(found, announce=False)
 
     def _clear_files(self):
+        # Freeze the job list while a worker owns its start-time snapshot.
+        if getattr(self, "_running", False):
+            return
         # removes selected file, or clears all if nothing selected
         selected = self.file_table.selection()
         if selected:
@@ -3771,8 +4410,37 @@ class App:
             except Exception:
                 pass
 
+        terminology_snapshot = self._terminology_store.snapshot(source_lang, lang)
+        if self._terminology_store.last_error:
+            messagebox.showwarning(
+                self.t("terminology.load_error_title"),
+                self.t("terminology.load_error_body", error=self._terminology_store.last_error),
+            )
+            return
+
+        tm_enabled = bool(self.cfg.get("translation_memory_enabled", False))
+        tm_path = str(self.cfg.get("translation_memory_path") or "").strip()
+        if tm_enabled:
+            try:
+                TranslationMemory(tm_path or default_translation_memory_path(), timeout=0.75).count()
+            except Exception as exc:
+                messagebox.showwarning(
+                    self.t("settings.section.translation_memory"),
+                    self.t("settings.error.translation_memory", error=exc),
+                )
+                return
+
         try:
-            self._log(f"Starting: engine={engine!r}, source={source_lang!r}, target={lang!r}, detector={detector!r}")
+            self._log(
+                f"Starting: engine={engine!r}, source={source_lang!r}, target={lang!r}, "
+                f"detector={detector!r}, terminology={len(terminology_snapshot.mapping)}, "
+                f"translation_memory={tm_enabled}"
+            )
+            if terminology_snapshot.conflicts:
+                self._log(
+                    "Ignored ambiguous auto-source terminology: "
+                    + ", ".join(terminology_snapshot.conflicts)
+                )
         except Exception:
             pass
 
@@ -3780,6 +4448,8 @@ class App:
         self._running = True
         self._set_button_disabled(self.start_btn, True)
         self._set_button_disabled(self.cancel_btn, False)
+        for button in (self.add_files_btn, self.select_folder_btn, self.clear_files_btn):
+            self._set_button_disabled(button, True)
 
         self._update_all_statuses("pending")
         self.total_files = len(self.files)
@@ -3788,6 +4458,13 @@ class App:
         self._set_progress(0.0)
         self._update_progress_label(self.t("progress.starting"))
         self._current_file_name = ""
+        self._last_run_report = None
+        self._last_run_cancelled = False
+        try:
+            self._set_button_disabled(self.report_btn, True)
+            self.report_btn.grid_remove()
+        except Exception:
+            pass
 
         self.worker.start(
             self.files, lang, output, None,
@@ -3807,6 +4484,12 @@ class App:
             deepl_api_key=deepl_api_key,
             local_model_dir=local_model_dir,
             ollama_config=ollama_config,
+            terminology=terminology_snapshot.mapping,
+            translation_memory_enabled=tm_enabled,
+            translation_memory_path=tm_path or None,
+            report_cb=lambda report: self._log_queue.put(("__report__", report)),
+            terminology_conflicts=terminology_snapshot.conflicts,
+            terminology_entries=terminology_snapshot.matched_entries,
         )
 
     def _cancel(self):
@@ -3897,12 +4580,14 @@ class App:
             return
 
         try:
-            if msg == "__worker_done__":
+            if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == "__report__":
+                self._handle_run_report(msg[1])
+            elif msg == "__worker_done__":
                 if self._running:
                     self._finish_run()
             else:
                 self.log.configure(state="normal")
-                self.log.insert("end", msg + "\n")
+                self.log.insert("end", str(msg) + "\n")
                 self.log.see("end")
                 self.log.configure(state="disabled")
         except Exception:
@@ -3910,12 +4595,170 @@ class App:
 
         self.root.after_idle(self._poll_log_queue)
 
+
+    def _handle_run_report(self, report: dict):
+        self._last_run_report = report if isinstance(report, dict) else None
+        if self._last_run_report is None:
+            return
+        totals = self._last_run_report.get("totals", {}) or {}
+        warning_count = int(self._last_run_report.get("warning_count", 0) or 0)
+        if warning_count:
+            self._update_progress_label(
+                self.t("report.completed_with_warnings", count=warning_count)
+            )
+        else:
+            self._update_progress_label(self.t("report.completed"))
+        try:
+            self._log(
+                "Translation report: "
+                f"{totals.get('files_finished', 0)} finished, "
+                f"{totals.get('files_failed', 0)} failed; "
+                f"{totals.get('translated_units', 0)} translated units, "
+                f"{totals.get('skipped_units', 0)} skipped, "
+                f"{totals.get('tm_hits', 0)} TM hits, "
+                f"{warning_count} warning(s)"
+            )
+        except Exception:
+            pass
+
+        self._sync_report_button_visibility()
+
+    def _sync_report_button_visibility(self) -> None:
+        """Show the report affordance only after a non-cancelled run is over."""
+        button = getattr(self, "report_btn", None)
+        if button is None:
+            return
+        available = (
+            not getattr(self, "_running", False)
+            and not getattr(self, "_last_run_cancelled", False)
+            and isinstance(getattr(self, "_last_run_report", None), dict)
+        )
+        try:
+            if available:
+                self._set_button_disabled(button, False)
+                button.grid()
+            else:
+                self._set_button_disabled(button, True)
+                button.grid_remove()
+        except Exception:
+            pass
+
+    def _open_translation_report(self):
+        report = self._last_run_report
+        if not report:
+            messagebox.showinfo(self.t("report.title"), self.t("report.no_report"), parent=self.root)
+            return
+        p = theme.get()
+        totals = report.get("totals", {}) or {}
+        win = ctk.CTkToplevel(self.root)
+        apply_window_icon(win)
+        win.title(self.t("report.title"))
+        win.transient(self.root)
+        win.grab_set()
+        win.configure(fg_color=p.bg_main)
+        win.geometry("880x600")
+        win.minsize(720, 480)
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=1)
+
+        summary = theme.make_card(win)
+        summary.grid(row=0, column=0, sticky="ew", padx=theme.PADDING, pady=(theme.PADDING, 8))
+        summary.grid_columnconfigure(0, weight=1)
+        theme.make_label(summary, self.t("report.title"), level="heading").grid(row=0, column=0, sticky="w", padx=12, pady=(10, 6))
+        lines = [
+            self.t(
+                "report.summary.files",
+                finished=totals.get("files_finished", 0), failed=totals.get("files_failed", 0),
+                skipped=totals.get("files_skipped", 0), cancelled=totals.get("files_cancelled", 0),
+            ),
+            self.t(
+                "report.summary.units",
+                units=totals.get("units", 0), translated=totals.get("translated_units", 0),
+                skipped=totals.get("skipped_units", 0),
+            ),
+            self.t(
+                "report.summary.selective",
+                target=totals.get("target_language_skips", 0), nonling=totals.get("nonlinguistic_skips", 0),
+                other=totals.get("non_source_skips", 0),
+            ),
+            self.t(
+                "report.summary.cache",
+                hits=totals.get("persistent_cache_hits", 0),
+                writes=totals.get("persistent_cache_writes", 0),
+                errors=totals.get("persistent_cache_errors", 0),
+            ),
+            self.t(
+                "report.summary.tm",
+                hits=totals.get("tm_hits", 0), writes=totals.get("tm_writes", 0),
+                errors=totals.get("tm_errors", 0),
+            ),
+            self.t(
+                "report.summary.terminology",
+                entries=report.get("terminology_entries", 0), mismatches=totals.get("terminology_mismatches", 0),
+            ),
+            self.t(
+                "report.summary.quality",
+                fallbacks=totals.get("fallback_items", 0), retries=totals.get("retry_items", 0),
+                warnings=totals.get("constraint_warnings", 0), failed=totals.get("failed_items", 0),
+            ),
+        ]
+        for row, text in enumerate(lines, start=1):
+            theme.make_label(summary, text, level="small").grid(row=row, column=0, sticky="w", padx=12, pady=(0, 3))
+        conflicts = report.get("terminology_conflicts", []) or []
+        if conflicts:
+            theme.make_label(
+                summary, self.t("report.terminology_conflicts", terms=", ".join(conflicts)),
+                level="tiny", text_color=p.status_warning,
+            ).grid(row=len(lines) + 1, column=0, sticky="w", padx=12, pady=(3, 10))
+        else:
+            summary.grid_configure(pady=(theme.PADDING, 8))
+
+        card = theme.make_card(win)
+        card.grid(row=1, column=0, sticky="nsew", padx=theme.PADDING, pady=(0, 8))
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_rowconfigure(0, weight=1)
+        tree = ttk.Treeview(card, columns=("status", "time", "details"), show="tree headings")
+        _install_tree_hover(tree, p.bg_heading)
+        tree.heading("#0", text=self.t("table.file"))
+        tree.heading("status", text=self.t("table.status"))
+        tree.heading("time", text=self.t("table.time"))
+        tree.heading("details", text=self.t("report.column.details"))
+        tree.column("#0", width=250, stretch=True)
+        tree.column("status", width=90, stretch=False, anchor="center")
+        tree.column("time", width=90, stretch=False, anchor="center")
+        tree.column("details", width=330, stretch=True)
+        scroll = ttk.Scrollbar(card, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.grid(row=0, column=0, sticky="nsew", padx=(12, 0), pady=12)
+        scroll.grid(row=0, column=1, sticky="ns", padx=(0, 12), pady=12)
+        for item in report.get("files", []) or []:
+            metrics = item.get("metrics", {}) or {}
+            details = (
+                f"translated {metrics.get('translated_units', 0)}, "
+                f"skipped {metrics.get('skipped_units', 0)}, TM {metrics.get('tm_hits', 0)} hit(s)"
+            )
+            if item.get("error"):
+                details = str(item.get("error"))
+            tree.insert(
+                "", tk.END, text=Path(str(item.get("path", ""))).name,
+                values=(
+                    str(item.get("status", "")), self._format_elapsed_time(float(item.get("elapsed_seconds", 0) or 0)), details,
+                ),
+            )
+        bottom = ctk.CTkFrame(win, fg_color="transparent")
+        bottom.grid(row=2, column=0, sticky="e", padx=theme.PADDING, pady=(0, theme.PADDING))
+        theme.make_button(bottom, self.t("terminology.close"), command=win.destroy, style="secondary", height=28).pack(side=tk.RIGHT)
+        center_window(win, 880, 600, parent=self.root)
+
     def _finish_run(self, cancelled: bool = False):
         if not self._running:
             return
         self._running = False
+        self._last_run_cancelled = bool(cancelled)
         self._set_button_disabled(self.start_btn, False)
         self._set_button_disabled(self.cancel_btn, True)
+        for button in (self.add_files_btn, self.select_folder_btn, self.clear_files_btn):
+            self._set_button_disabled(button, False)
         try:
             engine_key = self._engine_key_for_display(self.engine_var.get())
             self._update_usage_label(engine_key)
@@ -3926,6 +4769,7 @@ class App:
             self._update_progress_label(
                 self.t("progress.cancelled", percent=int(pct * 100)),
             )
+        self._sync_report_button_visibility()
 
     def _apply_debug_mode(self):
         # Apply the current debug mode immediately so logging reflects changes
@@ -4068,12 +4912,13 @@ def main():
         logger.exception("Failed to install GUI logging handler")
 
     def _show():
-        root.wm_attributes("-alpha", 1)
         try:
-            center_window(root)
+            root.deiconify()
+            root.update_idletasks()
+            center_window(root, theme.WINDOW_WIDTH, theme.WINDOW_HEIGHT)
         except Exception:
             pass
-        root.deiconify()
+        root.wm_attributes("-alpha", 1)
 
     root.after(10, _show)
     root.mainloop()

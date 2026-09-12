@@ -3,7 +3,7 @@ import time
 import logging
 import re
 from pathlib import Path
-from typing import Callable, Iterable, Union, Optional, Any
+from typing import Callable, Iterable, Union, Optional, Any, Mapping
 import tkinter as tk
 import traceback
 from urllib.parse import urlparse
@@ -65,38 +65,68 @@ def list_supported_files(path: str) -> list[str]:
     return files
 
 def center_window(window, width=None, height=None, parent=None):
-    # Center `window` on screen (parent=None) or over `parent`
+    """Center a Tk/CustomTkinter window using its *actual rendered* size.
+
+    CustomTkinter scales geometry widths/heights but leaves x/y coordinates in
+    physical screen pixels.  Mixing logical dimensions with physical positions
+    causes visibly off-centre dialogs on scaled displays.  Apply any requested
+    size first, let Tk report the rendered pixel size, then position separately.
+    """
+    if width is not None and height is not None:
+        window.geometry(f"{int(width)}x{int(height)}")
+
     window.update_idletasks()
 
-    if width is not None and height is not None:
-        # logical -> physical for centering math only
-        try:
-            sf = window._get_window_scaling()
-        except AttributeError:
-            sf = 1.0
-        sf = sf if sf > 0 else 1.0
-        phys_w = round(width * sf)
-        phys_h = round(height * sf)
-    else:
-        phys_w = window.winfo_width()
-        phys_h = window.winfo_height()
+    win_w = max(int(window.winfo_width()), int(window.winfo_reqwidth()), 1)
+    win_h = max(int(window.winfo_height()), int(window.winfo_reqheight()), 1)
 
+    centered_on_parent = False
     if parent is not None:
-        parent.update_idletasks()
-        x = parent.winfo_rootx() + (parent.winfo_width()  - phys_w) // 2
-        y = parent.winfo_rooty() + (parent.winfo_height() - phys_h) // 2
-    else:
-        x = (window.winfo_screenwidth()  - phys_w) // 2
-        y = (window.winfo_screenheight() - phys_h) // 2
+        try:
+            parent.update_idletasks()
+            parent_w = max(int(parent.winfo_width()), 1)
+            parent_h = max(int(parent.winfo_height()), 1)
+            x = int(parent.winfo_rootx()) + (parent_w - win_w) // 2
+            y = int(parent.winfo_rooty()) + (parent_h - win_h) // 2
+            centered_on_parent = True
+        except Exception:
+            parent = None
 
-    x = max(0, x)
-    y = max(0, y)
+    if parent is None:
+        # vroot* respects virtual desktop origins where Tk exposes them.  This
+        # avoids the old max(0, ...) behaviour which broke centring on monitors
+        # positioned to the left/above the primary display.
+        try:
+            vx = int(window.winfo_vrootx())
+            vy = int(window.winfo_vrooty())
+            vw = int(window.winfo_vrootwidth())
+            vh = int(window.winfo_vrootheight())
+            if vw <= 1 or vh <= 1:
+                raise ValueError
+        except Exception:
+            vx = vy = 0
+            vw = int(window.winfo_screenwidth())
+            vh = int(window.winfo_screenheight())
+        x = vx + (vw - win_w) // 2
+        y = vy + (vh - win_h) // 2
 
-    if width is not None and height is not None:
-        window.geometry(f"{width}x{height}+{x}+{y}")
-    else:
-        # position-only: CTk._apply_geometry_scaling passes +x+y unchanged
-        window.geometry(f"+{x}+{y}")
+    # Keep the title bar reachable, but preserve negative coordinates on a
+    # multi-monitor virtual desktop instead of forcing everything onto screen 0.
+    if not centered_on_parent:
+        try:
+            vx = int(window.winfo_vrootx())
+            vy = int(window.winfo_vrooty())
+            vw = int(window.winfo_vrootwidth())
+            vh = int(window.winfo_vrootheight())
+            if vw > 1 and vh > 1:
+                x = min(max(x, vx), max(vx, vx + vw - win_w))
+                y = min(max(y, vy), max(vy, vy + vh - win_h))
+        except Exception:
+            pass
+
+    # Position-only geometry is important for CTk: it does not rescale x/y.
+    window.geometry(f"+{int(x)}+{int(y)}")
+    window.update_idletasks()
 
 
 # runs translation in a background thread; call start() to begin, stop() to cancel
@@ -137,6 +167,12 @@ class Worker:
         google_sa_json: str = "",
         local_model_dir: str = "",
         ollama_config: Optional[dict[str, Any]] = None,
+        terminology: Mapping[str, str] | None = None,
+        translation_memory_enabled: bool = False,
+        translation_memory_path: str | None = None,
+        report_cb: Callable[[dict[str, Any]], None] | None = None,
+        terminology_conflicts: Iterable[str] = (),
+        terminology_entries: int = 0,
     ):
         if self._thread and self._thread.is_alive():
             raise RuntimeError("Worker already running")
@@ -151,7 +187,9 @@ class Worker:
                 engine, proxies, google_api_key, baidu_appid, baidu_appkey,
                 azure_key, azure_region, deepl_api_key,
                 baidu_tier, google_project_id, google_sa_json,
-                local_model_dir, ollama_config,
+                local_model_dir, ollama_config, dict(terminology or {}),
+                bool(translation_memory_enabled), translation_memory_path, report_cb,
+                tuple(str(item) for item in terminology_conflicts), int(terminology_entries or 0),
             ),
             daemon=True,
         )
@@ -164,10 +202,17 @@ class Worker:
              engine, proxies, google_api_key, baidu_appid, baidu_appkey,
              azure_key="", azure_region="", deepl_api_key="",
              baidu_tier="standard", google_project_id="", google_sa_json="",
-             local_model_dir="", ollama_config=None):
+             local_model_dir="", ollama_config=None, terminology=None,
+             translation_memory_enabled=False, translation_memory_path=None, report_cb=None,
+             terminology_conflicts=(), terminology_entries=0):
         import os
 
         normalized_ollama_config = _normalize_ollama_config(ollama_config)
+        from ..reporting import TranslationBatchReport, TranslationFileReport
+        batch_report = TranslationBatchReport(
+            terminology_conflicts=tuple(terminology_conflicts or ()),
+            terminology_entries=int(terminology_entries or 0),
+        )
         pdf_advisor = None
         ollama_translator = None
 
@@ -233,6 +278,11 @@ class Worker:
                 break
             name = Path(f).name
             t0 = time.perf_counter()
+            file_report = TranslationFileReport(path=str(f), status="started")
+            batch_report.files.append(file_report)
+
+            def _capture_metrics(metrics, _report=file_report):
+                _report.add_metrics(metrics)
 
             base = fi / file_count
             weight = 1.0 / file_count
@@ -293,19 +343,28 @@ class Worker:
                     advisor=advisor,
                     semantic_translator=semantic_translator,
                     translator_override=primary_translator,
+                    terminology=dict(terminology or {}),
+                    translation_memory=bool(translation_memory_enabled),
+                    translation_memory_path=translation_memory_path or None,
+                    metrics_callback=_capture_metrics,
                 )
                 elapsed = time.perf_counter() - t0
+                file_report.elapsed_seconds = elapsed
+                file_report.output_path = None if out in (None, "skipped-ocr") else str(out)
 
                 # Check cancellation right after translate_file returns
                 if self._stop.is_set():
+                    file_report.status = "cancelled"
                     progress_cb(f, "cancelled", None)
                     log_cb(f"Cancelled during {name}")
                     break
 
                 if out == "skipped-ocr":
+                    file_report.status = "skipped"
                     progress_cb(f, "finished", elapsed)
                     log_cb(f"Skipped {name} (scanned/image PDF requiring OCR)")
                 else:
+                    file_report.status = "finished"
                     progress_cb(f, "progress", base + weight)
                     progress_cb(f, "finished", elapsed)
                     try:
@@ -316,14 +375,25 @@ class Worker:
                     except Exception:
                         log_cb(f"Finished {name}")
             except CancelledError:
+                file_report.status = "cancelled"
+                file_report.elapsed_seconds = time.perf_counter() - t0
                 progress_cb(f, "cancelled", None)
                 log_cb(f"Cancelled during {name}")
                 break
             except Exception as e:
                 elapsed = time.perf_counter() - t0
+                file_report.status = "error"
+                file_report.elapsed_seconds = elapsed
+                file_report.error = str(e)
                 progress_cb(f, "error", elapsed)
                 tb = traceback.format_exc()
                 log_cb(redact_sensitive_text(f"Error translating {name}: {e}\n{tb}"))
+
+        if report_cb is not None:
+            try:
+                report_cb(batch_report.to_dict())
+            except Exception:
+                logging.debug("GUI report callback failed", exc_info=True)
 
         # Signal that the worker loop has exited
         log_cb("__worker_done__")
