@@ -64,18 +64,42 @@ def list_supported_files(path: str) -> list[str]:
             files.append(str(f))
     return files
 
-def center_window(window, width=None, height=None, parent=None):
-    """Center a Tk/CustomTkinter window using its *actual rendered* size.
+def center_window(window, width=None, height=None, parent=None, *, margin: float = 0.94):
+    """Center a Tk/CustomTkinter window using its rendered size.
 
-    CustomTkinter scales geometry widths/heights but leaves x/y coordinates in
-    physical screen pixels.  Mixing logical dimensions with physical positions
-    causes visibly off-centre dialogs on scaled displays.  Apply any requested
-    size first, let Tk report the rendered pixel size, then position separately.
+    Requested dimensions are also bounded to the visible virtual desktop.  This
+    keeps large dialogs usable on small/high-DPI displays while preserving the
+    existing parent-relative centring and negative multi-monitor coordinates.
     """
-    if width is not None and height is not None:
-        window.geometry(f"{int(width)}x{int(height)}")
+    requested_width = int(width) if width is not None else None
+    requested_height = int(height) if height is not None else None
+    if requested_width is not None and requested_height is not None:
+        window.geometry(f"{requested_width}x{requested_height}")
 
     window.update_idletasks()
+
+    # Bound an explicitly-sized dialog after CTk has applied its own scaling.
+    # Scaling based on the *measured* rendered size avoids guessing the current
+    # CTk/Tk DPI factor.
+    if requested_width is not None and requested_height is not None:
+        try:
+            vw = int(window.winfo_vrootwidth())
+            vh = int(window.winfo_vrootheight())
+            if vw <= 1 or vh <= 1:
+                raise ValueError
+        except Exception:
+            vw = int(window.winfo_screenwidth())
+            vh = int(window.winfo_screenheight())
+        max_w = max(320, int(vw * float(margin)))
+        max_h = max(240, int(vh * float(margin)))
+        rendered_w = max(int(window.winfo_width()), int(window.winfo_reqwidth()), 1)
+        rendered_h = max(int(window.winfo_height()), int(window.winfo_reqheight()), 1)
+        shrink = min(1.0, max_w / rendered_w, max_h / rendered_h)
+        if shrink < 0.999:
+            requested_width = max(320, int(requested_width * shrink))
+            requested_height = max(240, int(requested_height * shrink))
+            window.geometry(f"{requested_width}x{requested_height}")
+            window.update_idletasks()
 
     win_w = max(int(window.winfo_width()), int(window.winfo_reqwidth()), 1)
     win_h = max(int(window.winfo_height()), int(window.winfo_reqheight()), 1)
@@ -93,9 +117,6 @@ def center_window(window, width=None, height=None, parent=None):
             parent = None
 
     if parent is None:
-        # vroot* respects virtual desktop origins where Tk exposes them.  This
-        # avoids the old max(0, ...) behaviour which broke centring on monitors
-        # positioned to the left/above the primary display.
         try:
             vx = int(window.winfo_vrootx())
             vy = int(window.winfo_vrooty())
@@ -110,8 +131,9 @@ def center_window(window, width=None, height=None, parent=None):
         x = vx + (vw - win_w) // 2
         y = vy + (vh - win_h) // 2
 
-    # Keep the title bar reachable, but preserve negative coordinates on a
-    # multi-monitor virtual desktop instead of forcing everything onto screen 0.
+    # Preserve parent-relative negative coordinates on multi-monitor desktops.
+    # For screen-centred windows clamp to the available virtual desktop so the
+    # title bar and resize handles remain reachable.
     if not centered_on_parent:
         try:
             vx = int(window.winfo_vrootx())
@@ -124,7 +146,6 @@ def center_window(window, width=None, height=None, parent=None):
         except Exception:
             pass
 
-    # Position-only geometry is important for CTk: it does not rescale x/y.
     window.geometry(f"+{int(x)}+{int(y)}")
     window.update_idletasks()
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import platform
 import sys
+import tkinter as tk
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING, Literal
 
@@ -181,6 +182,107 @@ def get() -> Palette:
     return DARK if _current_mode == "Dark" else LIGHT
 
 
+class ToolTip:
+    """Small delayed tooltip that works with Tk and CustomTkinter widgets.
+
+    Tooltips are deliberately informational only: they never take focus and are
+    destroyed as soon as the pointer/focus leaves the owning control.
+    """
+
+    def __init__(self, widget: Any, text: str, *, delay_ms: int = 450) -> None:
+        self.widget = widget
+        self.text = str(text or "")
+        self.delay_ms = max(0, int(delay_ms))
+        self._after_id = None
+        self._window = None
+        try:
+            widget.bind("<Enter>", self._schedule, "+")
+            widget.bind("<Leave>", self._hide, "+")
+            widget.bind("<FocusIn>", self._schedule, "+")
+            widget.bind("<FocusOut>", self._hide, "+")
+            widget.bind("<ButtonPress>", self._hide, "+")
+            widget.bind("<Destroy>", self._hide, "+")
+        except Exception:
+            pass
+
+    def _schedule(self, _event=None) -> None:
+        self._cancel_pending()
+        if not self.text:
+            return
+        try:
+            self._after_id = self.widget.after(self.delay_ms, self._show)
+        except Exception:
+            self._after_id = None
+
+    def _cancel_pending(self) -> None:
+        if self._after_id is None:
+            return
+        try:
+            self.widget.after_cancel(self._after_id)
+        except Exception:
+            pass
+        self._after_id = None
+
+    def _show(self) -> None:
+        self._after_id = None
+        if self._window is not None or not self.text:
+            return
+        try:
+            if str(self.widget.cget("state")) == "disabled":
+                return
+        except Exception:
+            pass
+        try:
+            x = int(self.widget.winfo_rootx()) + 12
+            y = int(self.widget.winfo_rooty()) + int(self.widget.winfo_height()) + 6
+            top = tk.Toplevel(self.widget)
+            top.wm_overrideredirect(True)
+            try:
+                top.wm_attributes("-topmost", True)
+            except Exception:
+                pass
+            p = get()
+            label = tk.Label(
+                top, text=self.text, justify="left", relief="solid", borderwidth=1,
+                background=p.bg_popup, foreground=p.text_primary,
+                font=(FONT_FAMILY, FONT_TINY[1]), padx=7, pady=4,
+                wraplength=360,
+            )
+            label.pack()
+            top.update_idletasks()
+            try:
+                sw = int(top.winfo_screenwidth())
+                sh = int(top.winfo_screenheight())
+                tw = int(top.winfo_reqwidth())
+                th = int(top.winfo_reqheight())
+                x = min(max(4, x), max(4, sw - tw - 4))
+                y = min(max(4, y), max(4, sh - th - 4))
+            except Exception:
+                pass
+            top.geometry(f"+{x}+{y}")
+            self._window = top
+        except Exception:
+            self._window = None
+
+    def _hide(self, _event=None) -> None:
+        self._cancel_pending()
+        if self._window is not None:
+            try:
+                self._window.destroy()
+            except Exception:
+                pass
+            self._window = None
+
+
+def attach_tooltip(widget: Any, text: str, *, delay_ms: int = 450) -> ToolTip:
+    tip = ToolTip(widget, text, delay_ms=delay_ms)
+    try:
+        setattr(widget, "_verbilo_tooltip", tip)
+    except Exception:
+        pass
+    return tip
+
+
 #  Widget factory helpers
 def make_card(parent: Any, **overrides: Any) -> Any:
     # Themed card frame.
@@ -220,6 +322,7 @@ def make_button(
 
         # Allow callers to override `disabledforeground`; default to style mapping
         disabled_fg = overrides.pop("disabledforeground", disabled_color)
+        overrides.setdefault("cursor", "hand2")
         btn = _tk.Button(parent, text=text, command=command, disabledforeground=disabled_fg, **overrides)
         try:
             setattr(btn, "_verbilo_style", style)
@@ -255,6 +358,7 @@ def make_button(
         )
 
     kw.update(overrides)
+    kw.setdefault("cursor", "hand2")
 
     # Ensure CTkButton shows a readable disabled text color by default (style-aware)
     if style == "primary":

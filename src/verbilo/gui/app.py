@@ -24,6 +24,7 @@ from .helpers import Worker, list_supported_files, center_window, GuiLoggingHand
 from .dnd import install_file_drop
 from .config import load_config, save_config
 from .icons import get_icon, get_photo_image, get_app_icon, apply_window_icon
+from .dropdowns import SelectDropdown as _SelectDropdown, SearchableDropdown as _SearchableDropdown
 from .i18n import DEFAULT_UI_LOCALE, get_supported_ui_locales, load_ui_localizer, resolve_ui_locale
 from ..terminology import TerminologyEntry, TerminologyStore
 from ..translation_memory import TranslationMemory, default_translation_memory_path
@@ -364,599 +365,120 @@ def _install_tree_hover(tree, hover_color: str) -> None:
     tree.bind("<Leave>", lambda _event: _set_row(None), "+")
 
 
-class SimpleComboBox:
-    # Non-searchable dropdown — same visual style as SearchableComboBox but read-only
-
-    _POPUP_ROWS = 8
-
-    def __init__(self, parent, values, variable, command=None, **kw):
-        p = theme.get()
-        self._parent = parent
-        self._all_values = list(values)
-        self._variable = variable
-        self._last_valid = variable.get() or (values[0] if values else "")
-        self._popup = None
-        self._suppress_open = False
-        self._command = command
-
-        # Outer frame — identical styling to SearchableComboBox
-        self._frame = ctk.CTkFrame(
-            parent,
-            fg_color=p.bg_input,
-            corner_radius=theme.BUTTON_CORNER_RADIUS,
-            border_width=0,
-            border_color=p.bg_input,
-        ) if ctk else tk.Frame(parent, bd=0, highlightthickness=0)
-        self._frame.grid_columnconfigure(0, weight=1)
-
-        _font = ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]) if ctk else None
-
-        # Read-only label displaying the current value
-        self._label_var = tk.StringVar(value=self._last_valid)
-        if ctk:
-            self._label = ctk.CTkLabel(
-                self._frame,
-                textvariable=self._label_var,
-                font=_font,
-                text_color=p.text_secondary,
-                anchor="w",
-                fg_color="transparent",
-                height=32,
-            )
-        else:
-            self._label = tk.Label(
-                self._frame,
-                textvariable=self._label_var,
-                anchor="w",
-                bg=p.bg_input,
-                fg=p.text_secondary,
-            )
-        self._label.grid(row=0, column=0, sticky="ew", padx=(10, 0))
-
-        # Arrow button — identical to SearchableComboBox
-        arrow_img = get_icon("chevron-down", size=14)
-        btn_kw = dict(
-            master=self._frame,
-            width=28, height=28,
-            fg_color="transparent",
-            hover_color=p.bg_heading,
-            corner_radius=4,
-            command=self._on_arrow,
-            border_width=0,
-        )
-        if arrow_img and ctk:
-            self._btn = ctk.CTkButton(text="", image=arrow_img, **btn_kw)
-        elif ctk:
-            self._btn = ctk.CTkButton(
-                text="\u25BC",
-                font=ctk.CTkFont(family=theme.FONT_FAMILY, size=10),
-                text_color=p.text_muted, **btn_kw,
-            )
-        else:
-            self._btn = tk.Button(
-                self._frame,
-                text="\u25BC",
-                command=self._on_arrow,
-                bd=0, relief="flat", highlightthickness=0,
-                background=p.bg_input,
-                activebackground=p.bg_input,
-                takefocus=0,
-            )
-        try:
-            self._btn.configure(takefocus=False)
-        except Exception:
-            pass
-        self._btn.grid(row=0, column=1, padx=(0, 2), pady=2)
-
-        # Click on the label area also toggles the popup
-        self._label.bind("<Button-1>", lambda _e: self._on_arrow())
-
-        # Close popup when user clicks anywhere outside
-        self._frame.after_idle(self._bind_root_click)
-
-    # -- Geometry passthrough ------------------------------------------
-
-    def grid(self, **kw):  self._frame.grid(**kw)
-    def pack(self, **kw):  self._frame.pack(**kw)
-    def place(self, **kw): self._frame.place(**kw)
-
-    # -- Public API ----------------------------------------------------
-
-    def get(self):
-        return self._last_valid
-
-    def set(self, value):
-        if value in self._all_values:
-            self._last_valid = value
-            self._label_var.set(value)
-            self._variable.set(value)
-
-    def configure(self, **kw):
-        # Accept state= so callers can disable/enable just like a normal widget
-        state = kw.get("state")
-        if state == "disabled":
-            try:
-                self._btn.configure(state="disabled")
-                self._label.configure(state="disabled")
-            except Exception:
-                pass
-        elif state == "normal":
-            try:
-                self._btn.configure(state="normal")
-                self._label.configure(state="normal")
-            except Exception:
-                pass
-
-    # -- Arrow / popup toggle ------------------------------------------
-
-    def _on_arrow(self):
-        if self._popup and self._popup.winfo_exists():
-            self._close()
-        else:
-            self._open()
-
-    # -- Root click detection ------------------------------------------
-
-    def _bind_root_click(self):
-        try:
-            self._frame.winfo_toplevel().bind("<Button-1>", self._root_click, "+")
-        except Exception:
-            pass
-
-    def _root_click(self, event):
-        if not (self._popup and self._popup.winfo_exists()):
-            return
-        for container in (self._frame, self._popup):
-            w = event.widget
-            while w is not None:
-                if w is container:
-                    return
-                w = getattr(w, "master", None)
-        self._close()
-
-    # -- Popup ---------------------------------------------------------
-
-    def _open(self):
-        if self._suppress_open:
-            return
-        if self._popup and self._popup.winfo_exists():
-            return
-
-        p = theme.get()
-        self._popup = tk.Toplevel(self._frame)
-        self._popup.wm_overrideredirect(True)
-        self._popup.wm_attributes("-topmost", True)
-
-        outer = tk.Frame(self._popup, bg=p.bg_popup, bd=0, highlightthickness=0)
-        outer.pack(fill="both", expand=True)
-
-        self._listbox = tk.Listbox(
-            outer,
-            height=min(self._POPUP_ROWS, len(self._all_values)),
-            font=(theme.FONT_FAMILY, theme.FONT_BODY[1]),
-            activestyle="none",
-            selectbackground=p.accent,
-            selectforeground=p.text_on_accent,
-            bg=p.bg_popup, fg=p.text_secondary,
-            relief="flat", borderwidth=0, highlightthickness=0,
-        )
-        self._listbox.pack(fill="both", expand=True, padx=4, pady=4)
-
-        for item in self._all_values:
-            self._listbox.insert(tk.END, item)
-
-        if self._last_valid in self._all_values:
-            idx = self._all_values.index(self._last_valid)
-            self._listbox.selection_set(idx)
-            self._listbox.see(idx)
-
-        self._listbox.bind("<ButtonRelease-1>", self._on_select)
-        self._listbox.bind("<Return>",          self._on_select)
-        self._listbox.bind("<Escape>",          lambda _e: self._close())
-        self._listbox.bind("<FocusOut>",        lambda _e: self._frame.after(100, self._check_focus))
-
-        self._position_popup()
-
-    def _position_popup(self):
-        self._frame.update_idletasks()
-        x = self._frame.winfo_rootx()
-        y = self._frame.winfo_rooty() + self._frame.winfo_height() + 2
-        w = self._frame.winfo_width()
-        rows = min(self._POPUP_ROWS, max(1, len(self._all_values)))
-        row_px = theme.scale(theme.FONT_BODY[1] + 10)
-        h = rows * row_px + 8
-        self._popup.geometry(f"{w}x{h}+{x}+{y}")
-
-    def _on_select(self, _event=None):
-        if not hasattr(self, "_listbox"):
-            return
-        sel = self._listbox.curselection()
-        if not sel:
-            return
-        value = self._listbox.get(sel[0])
-        self._last_valid = value
-        self._label_var.set(value)
-        self._variable.set(value)
-        self._close(suppress_ms=150)
-        if self._command:
-            try:
-                self._command(value)
-            except Exception:
-                pass
-
-    def _check_focus(self):
-        # Close only if focus has truly left both the frame and the popup
-        try:
-            focused = self._frame.focus_get()
-            if focused and self._popup and self._popup.winfo_exists():
-                if focused.winfo_toplevel() is self._popup:
-                    return
-        except Exception:
-            pass
-        self._close()
-
-    def _close(self, suppress_ms=0):
-        if self._popup and self._popup.winfo_exists():
-            self._popup.destroy()
-        self._popup = None
-        if suppress_ms:
-            self._suppress_open = True
-            self._frame.after(suppress_ms, lambda: setattr(self, "_suppress_open", False))
-
-class SearchableComboBox:
-    _POPUP_ROWS = 8  # max visible rows before scrolling
-
-    def __init__(self, parent, values, variable, **kw):
-        p = theme.get()
-        self._parent = parent
-        self._all_values = list(values)
-        self._variable = variable
-        self._last_valid = variable.get() or (values[0] if values else "")
-        self._popup = None
-        self._suppress_open = False
-
-        # Styled outer frame
-        self._frame = ctk.CTkFrame(
-            parent,
-            fg_color=p.bg_input,
-            corner_radius=theme.BUTTON_CORNER_RADIUS,
-            border_width=0,
-            border_color=p.bg_input,
-        ) if ctk else tk.Frame(parent, bd=0, highlightthickness=0)
-        self._frame.grid_columnconfigure(0, weight=1)
-
-        _font = ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_BODY[1]) if ctk else None
-
-        # Entry (display + search input)
-        self._var = tk.StringVar(value=self._last_valid)
-        self._entry = ctk.CTkEntry(
-            self._frame,
-            textvariable=self._var,
-            fg_color="transparent",
-            border_width=0,
-            font=_font,
-            text_color=p.text_secondary,
-            height=32,
-        ) if ctk else tk.Entry(self._frame, textvariable=self._var)
-        self._entry.grid(row=0, column=0, sticky="ew", padx=(6, 0))
-
-        # Arrow button (borderless, non-focusable to avoid outline)
-        arrow_img = get_icon("chevron-down", size=14)
-        btn_kw = dict(
-            master=self._frame,
-            width=28, height=28,
-            fg_color="transparent",
-            hover_color=p.bg_heading,
-            corner_radius=4,
-            command=self._on_arrow,
-            border_width=0,
-        )
-        if arrow_img and ctk:
-            self._btn = ctk.CTkButton(text="", image=arrow_img, **btn_kw)
-        elif ctk:
-            self._btn = ctk.CTkButton(
-                text="\u25BC",
-                font=ctk.CTkFont(family=theme.FONT_FAMILY, size=10),
-                text_color=p.text_muted, **btn_kw,
-            )
-        else:
-            self._btn = tk.Button(
-                self._frame,
-                text="\u25BC",
-                command=self._on_arrow,
-                bd=0,
-                relief="flat",
-                highlightthickness=0,
-                background=p.bg_input,
-                activebackground=p.bg_input,
-                takefocus=0,
-            )
-
-        # Ensure button doesn't draw focus highlight
-        try:
-            self._btn.configure(takefocus=False)
-        except Exception:
-            pass
-
-        self._btn.grid(row=0, column=1, padx=(0, 2), pady=2)
-
-        # Get the inner tk.Entry for select_range / low-level bindings
-        self._tk_entry = self._entry
-        if ctk and isinstance(self._entry, ctk.CTkEntry):
-            for child in self._entry.winfo_children():
-                if isinstance(child, tk.Entry):
-                    self._tk_entry = child
-                    break
-
-        self._tk_entry.bind("<FocusIn>",    self._on_focus_in)
-        self._tk_entry.bind("<Button-1>",   self._on_click, "+")
-        self._tk_entry.bind("<KeyRelease>", self._on_key)
-        self._tk_entry.bind("<FocusOut>",   self._on_focus_out)
-        self._tk_entry.bind("<Return>",     self._on_enter)
-        self._tk_entry.bind("<Escape>",     self._on_escape)
-        self._tk_entry.bind("<Down>",       self._focus_list)
-
-        # Root-level click to close on non-focusable area clicks
-        self._frame.after_idle(self._bind_root_click)
-
-    # -- Geometry passthrough ------------------------------------------
-
-    def grid(self, **kw):  self._frame.grid(**kw)
-    def pack(self, **kw):  self._frame.pack(**kw)
-    def place(self, **kw): self._frame.place(**kw)
-
-    # -- Public API ----------------------------------------------------
-
-    def get(self):
-        return self._last_valid
-
-    def set(self, value):
-        self._last_valid = value
-        self._var.set(value)
-        self._variable.set(value)
-
-    def update_values(self, values: list[str]) -> None:
-        # Replace the option list; revert selection if current value no longer exists.
-        self._all_values = list(values)
-        if self._last_valid not in self._all_values:
-            fallback = self._all_values[0] if self._all_values else ""
-            self.set(fallback)
-        if self._popup and self._popup.winfo_exists():
-            self._close()
-        # Suppress the focus-in open that fires when a dialog closes and focus
-        # returns to this entry after a programmatic refresh.
-        self._suppress_open = True
-        self._frame.after(300, lambda: setattr(self, "_suppress_open", False))
-    
-
-    def refresh_colors(self):
+def _configure_app_table_styles(p) -> None:
+    """Configure the shared table style used by the queue and manager dialogs."""
+    style = ttk.Style()
+    try:
+        style.theme_use("clam")
+    except Exception:
         pass
 
-    # -- Entry event handlers ------------------------------------------
+    body_font = (theme.FONT_FAMILY, theme.FONT_BODY[1])
+    heading_font = (theme.FONT_FAMILY, theme.FONT_SMALL[1], "bold")
 
-    def _on_focus_in(self, _event=None):
-        if self._suppress_open:
-            return
-        widget = getattr(_event, "widget", None) or self._tk_entry
-        def _do():
-            try:
-                self._select_all()
-                self._open()
-            except Exception:
-                pass
-        try:
-            widget.after_idle(_do)
-        except Exception:
-            _do()
+    style.configure(
+        "FileTable.Treeview",
+        rowheight=32,
+        font=body_font,
+        background=p.bg_card,
+        foreground=p.text_secondary,
+        fieldbackground=p.bg_card,
+        borderwidth=0,
+        relief="flat",
+        bordercolor=p.bg_card,
+        lightcolor=p.bg_card,
+        darkcolor=p.bg_card,
+    )
+    style.configure(
+        "FileTable.Treeview.Heading",
+        font=heading_font,
+        background=p.bg_heading,
+        foreground=p.text_muted,
+        borderwidth=0,
+        relief="flat",
+        padding=(8, 6),
+    )
+    style.map(
+        "FileTable.Treeview",
+        background=[
+            ("selected", p.accent),
+            ("active", p.bg_card),
+            ("!active", p.bg_card),
+            ("focus", p.bg_card),
+        ],
+        foreground=[
+            ("selected", p.text_on_accent),
+            ("active", p.text_secondary),
+            ("!active", p.text_secondary),
+        ],
+        bordercolor=[
+            ("active", p.bg_card),
+            ("focus", p.bg_card),
+            ("!active", p.bg_card),
+        ],
+        lightcolor=[
+            ("active", p.bg_card),
+            ("focus", p.bg_card),
+            ("!active", p.bg_card),
+        ],
+        darkcolor=[
+            ("active", p.bg_card),
+            ("focus", p.bg_card),
+            ("!active", p.bg_card),
+        ],
+    )
+    style.map(
+        "FileTable.Treeview.Heading",
+        background=[("active", p.bg_input)],
+    )
+    style.configure(
+        "Slim.Vertical.TScrollbar",
+        gripcount=0,
+        background=p.bg_card,
+        darkcolor=p.bg_card,
+        lightcolor=p.bg_card,
+        troughcolor=p.bg_card,
+        bordercolor=p.bg_card,
+        arrowcolor=p.text_muted,
+        relief="flat",
+        borderwidth=0,
+        arrowsize=12,
+        width=10,
+    )
+    style.map(
+        "Slim.Vertical.TScrollbar",
+        background=[
+            ("active", p.border),
+            ("!active", p.divider),
+            ("disabled", p.bg_card),
+        ],
+        arrowcolor=[("disabled", p.bg_card)],
+    )
 
-    def _on_click(self, _event=None):
-        if self._suppress_open:
-            return
-        widget = getattr(_event, "widget", None) or self._tk_entry
-        try:
-            widget.focus_set()
-        except Exception:
-            pass
-        def _do():
-            try:
-                self._select_all()
-                self._open()
-            except Exception:
-                pass
-        try:
-            widget.after_idle(_do)
-        except Exception:
-            _do()
 
-    def _on_key(self, event=None):
-        # Live filter and open/refresh popup on each keystroke.
-        if event and event.keysym in (
-            "Shift_L", "Shift_R", "Control_L", "Control_R",
-            "Alt_L", "Alt_R", "Caps_Lock", "Return", "Escape",
-            "Up", "Down", "Left", "Right", "Tab",
-        ):
-            return
-        query = self._var.get().lower()
-        filtered = [v for v in self._all_values if query in v.lower()] if query else self._all_values
-        display = filtered if filtered else self._all_values
-        if self._popup and self._popup.winfo_exists():
-            self._populate(display)
-        else:
-            self._open(display)
+def _style_app_table(tree, p) -> None:
+    """Apply the main queue table look to any application Treeview."""
+    _configure_app_table_styles(p)
+    tree.configure(style="FileTable.Treeview")
+    tree.tag_configure("even", background=p.bg_row_even)
+    tree.tag_configure("odd", background=p.bg_row_odd)
+    _install_tree_hover(tree, p.bg_heading)
 
-    def _on_focus_out(self, _event=None):
-        # Delay so a listbox click can land before validation.
-        self._frame.after(150, self._validate_or_revert)
 
-    def _on_enter(self, _event=None):
-        if self._popup and self._popup.winfo_exists() and hasattr(self, "_listbox"):
-            sel = self._listbox.curselection()
-            if sel:
-                self._confirm(self._listbox.get(sel[0]))
-            else:
-                self._validate_or_revert()
-        else:
-            self._validate_or_revert()
+def _restripe_tree(tree) -> None:
+    """Refresh alternating row tags without disturbing semantic/hover tags."""
+    for index, iid in enumerate(tree.get_children()):
+        tags = [tag for tag in tree.item(iid, "tags") if tag not in ("even", "odd")]
+        tags.insert(0, "even" if index % 2 == 0 else "odd")
+        tree.item(iid, tags=tuple(tags))
 
-    def _on_escape(self, _event=None):
-        self._revert()
 
-    def _focus_list(self, _event=None):
-        if self._popup and self._popup.winfo_exists() and hasattr(self, "_listbox"):
-            self._listbox.focus_set()
-            if not self._listbox.curselection() and self._listbox.size():
-                self._listbox.selection_set(0)
-                self._listbox.activate(0)
+class SimpleComboBox(_SelectDropdown):
+    """Backward-compatible name for the shared read-only dropdown control."""
 
-    def _on_arrow(self):
-        if self._popup and self._popup.winfo_exists():
-            self._revert()
-        else:
-            self._open()
-            self._select_all()
 
-    # -- Root click detection ------------------------------------------
-
-    def _bind_root_click(self):
-        try:
-            self._frame.winfo_toplevel().bind("<Button-1>", self._root_click, "+")
-        except Exception:
-            pass
-
-    def _root_click(self, event):
-        if not (self._popup and self._popup.winfo_exists()):
-            return
-        # If click is inside our frame OR popup -> leave open
-        for container in (self._frame, self._popup):
-            w = event.widget
-            while w is not None:
-                if w is container:
-                    return
-                w = getattr(w, "master", None)
-        self._revert()
-
-    # -- Popup ---------------------------------------------------------
-
-    def _open(self, items=None):
-        if items is None:
-            items = self._all_values
-        if self._popup and self._popup.winfo_exists():
-            self._populate(items)
-            return
-
-        p = theme.get()
-        self._popup = tk.Toplevel(self._frame)
-        self._popup.wm_overrideredirect(True)
-        self._popup.wm_attributes("-topmost", True)
-
-        outer = tk.Frame(
-            self._popup, bg=p.bg_popup,
-            bd=0, highlightthickness=0,
-        )
-        outer.pack(fill="both", expand=True)
-
-        scrollbar = tk.Scrollbar(outer, orient="vertical")
-        self._listbox = tk.Listbox(
-            outer,
-            yscrollcommand=scrollbar.set,
-            height=self._POPUP_ROWS,
-            font=(theme.FONT_FAMILY, theme.FONT_BODY[1]),
-            activestyle="none",
-            selectbackground=p.accent,
-            selectforeground=p.text_on_accent,
-            bg=p.bg_popup, fg=p.text_secondary,
-            relief="flat", borderwidth=0, highlightthickness=0,
-        )
-        scrollbar.config(command=self._listbox.yview)
-        self._listbox.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
-        scrollbar.pack(side="right", fill="y", pady=4, padx=(0, 2))
-
-        self._listbox.bind("<ButtonRelease-1>", self._on_list_select)
-        self._listbox.bind("<Return>",          self._on_list_select)
-        self._listbox.bind("<Escape>",          self._on_escape)
-        self._listbox.bind("<FocusOut>",        self._on_focus_out)
-
-        self._populate(items)
-
-    def _populate(self, items):
-        self._listbox.delete(0, tk.END)
-        for item in items:
-            self._listbox.insert(tk.END, item)
-        if self._last_valid in items:
-            idx = items.index(self._last_valid)
-            self._listbox.selection_set(idx)
-            self._listbox.see(idx)
-        self._position_popup()
-
-    def _position_popup(self):
-        self._frame.update_idletasks()
-        x = self._frame.winfo_rootx()
-        y = self._frame.winfo_rooty() + self._frame.winfo_height() + 2
-        w = self._frame.winfo_width()
-        rows = min(self._POPUP_ROWS, max(1, self._listbox.size()))
-        row_px = theme.scale(theme.FONT_BODY[1] + 10)
-        h = rows * row_px + 8
-        self._popup.geometry(f"{w}x{h}+{x}+{y}")
-
-    # -- Selection / validation ----------------------------------------
-
-    def _on_list_select(self, _event=None):
-        if hasattr(self, "_listbox"):
-            sel = self._listbox.curselection()
-            if sel:
-                self._confirm(self._listbox.get(sel[0]))
-
-    def _confirm(self, value):
-        self._last_valid = value
-        self._var.set(value)
-        self._variable.set(value)
-        self._close(suppress_ms=150)
-        try:
-            self._frame.master.focus_set()
-        except Exception:
-            pass
-
-    def _validate_or_revert(self):
-        # Don't act if focus moved into the popup
-        try:
-            focused = self._frame.focus_get()
-            if focused and self._popup and self._popup.winfo_exists():
-                try:
-                    if focused.winfo_toplevel() is self._popup:
-                        return
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        current = self._var.get().strip()
-        if current in self._all_values:
-            self._last_valid = current
-            self._variable.set(current)
-            self._close()
-        else:
-            self._revert()
-
-    def _revert(self):
-        self._var.set(self._last_valid)
-        self._variable.set(self._last_valid)
-        self._close(suppress_ms=150)
-
-    def _close(self, suppress_ms=0):
-        if self._popup and self._popup.winfo_exists():
-            self._popup.destroy()
-        self._popup = None
-        if suppress_ms:
-            self._suppress_open = True
-            self._frame.after(suppress_ms, lambda: setattr(self, "_suppress_open", False))
-
-    # -- Helpers -------------------------------------------------------
-
-    def _select_all(self):
-        try:
-            self._tk_entry.select_range(0, tk.END)
-            self._tk_entry.icursor(tk.END)
-        except Exception:
-            pass
+class SearchableComboBox(_SearchableDropdown):
+    """Backward-compatible name for the shared searchable dropdown control."""
 
 
 # --- main app ---
@@ -981,6 +503,13 @@ class App:
         self._terminology_store = TerminologyStore()
         self._last_run_report: dict | None = None
         self._last_run_cancelled = False
+        self._closing = False
+
+        # Language-list refreshes can be requested from dropdown callbacks.
+        # Keep them out of the originating popup event and prevent trace-driven
+        # nested refreshes while source/target values are being synchronized.
+        self._language_refresh_after_id = None
+        self._refreshing_language_dropdowns = False
 
         # Thread-safe log queue: worker threads put messages here; main thread drains it
         self._log_queue: queue.SimpleQueue = queue.SimpleQueue()
@@ -997,7 +526,13 @@ class App:
         theme.set_mode(saved_mode)
 
         self._build_ui()
+        self._install_keyboard_shortcuts()
         self._drop_registration = self._install_drag_and_drop()
+        self._sync_file_empty_state()
+        try:
+            self.root.protocol("WM_DELETE_WINDOW", self._request_close)
+        except Exception:
+            pass
 
         def _reapply_icon():
             try:
@@ -1055,6 +590,119 @@ class App:
         if status_key is None:
             return status
         return self.t(status_key)
+
+    def _install_keyboard_shortcuts(self) -> None:
+        """Install non-destructive application shortcuts without stealing text input."""
+        bindings = {
+            "<Control-o>": self._add_files,
+            "<Control-Shift-o>": self._select_folder,
+            "<Control-comma>": self._open_settings,
+            "<Control-g>": self._open_terminology_manager,
+            "<Control-Return>": self._start,
+            "<F1>": self._open_about,
+            # macOS equivalents; harmless on other Tk platforms.
+            "<Command-o>": self._add_files,
+            "<Command-Shift-o>": self._select_folder,
+            "<Command-comma>": self._open_settings,
+            "<Command-g>": self._open_terminology_manager,
+            "<Command-Return>": self._start,
+        }
+        for sequence, callback in bindings.items():
+            def _invoke(_event=None, _callback=callback, _sequence=sequence):
+                try:
+                    _callback()
+                except Exception:
+                    logger.exception("Keyboard shortcut failed: %s", _sequence)
+                return "break"
+            try:
+                self.root.bind(sequence, _invoke, "+")
+            except Exception:
+                pass
+
+    def _bind_modal_keys(self, window, close_callback, accept_callback=None, initial_focus=None) -> None:
+        """Give modal dialogs predictable Escape/keyboard behavior and initial focus."""
+        def _close(_event=None):
+            close_callback()
+            return "break"
+
+        try:
+            window.bind("<Escape>", _close, "+")
+        except Exception:
+            pass
+        if accept_callback is not None:
+            def _accept(_event=None):
+                accept_callback()
+                return "break"
+            for sequence in ("<Control-Return>", "<Command-Return>"):
+                try:
+                    window.bind(sequence, _accept, "+")
+                except Exception:
+                    pass
+        if initial_focus is not None:
+            def _focus():
+                try:
+                    initial_focus.focus_set()
+                except Exception:
+                    pass
+            try:
+                window.after(80, _focus)
+            except Exception:
+                pass
+
+    def _destroy_root(self) -> None:
+        try:
+            registration = getattr(self, "_drop_registration", None)
+            if registration is not None:
+                registration.close()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def _request_close(self) -> None:
+        if getattr(self, "_closing", False):
+            return
+        if getattr(self, "_running", False):
+            try:
+                confirmed = messagebox.askyesno(
+                    self.t("app.exit_running_title"),
+                    self.t("app.exit_running_body"),
+                    parent=self.root,
+                )
+            except Exception:
+                confirmed = False
+            if not confirmed:
+                return
+            self._closing = True
+            try:
+                self.worker.stop()
+            except Exception:
+                pass
+            try:
+                self._update_progress_label(self.t("app.cancelling_exit"))
+                self._set_button_disabled(self.start_btn, True)
+                self._set_button_disabled(self.cancel_btn, True)
+            except Exception:
+                pass
+
+            def _wait_for_worker():
+                try:
+                    if self.worker.alive:
+                        self.root.after(50, _wait_for_worker)
+                        return
+                except Exception:
+                    pass
+                self._destroy_root()
+
+            try:
+                self.root.after(20, _wait_for_worker)
+            except Exception:
+                self._destroy_root()
+            return
+        self._closing = True
+        self._destroy_root()
 
     # --- directory helpers ---
 
@@ -1289,10 +937,11 @@ class App:
         self.output_entry.grid(row=0, column=0, sticky="ew", pady=(0, 0))
 
         browse_icon = get_icon("folder", size=16, on_accent=False)
-        theme.make_button(
+        self.output_browse_btn = theme.make_button(
             _out_frame, "", command=self._select_output, style="secondary",
             image=browse_icon, height=30, width=40,
-        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        )
+        self.output_browse_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
         # Divider
         theme.make_divider(self.sidebar).grid(
@@ -1324,24 +973,27 @@ class App:
         row += 1
 
         terminology_icon = get_icon("terminology", size=16)
-        theme.make_button(
+        self.terminology_btn = theme.make_button(
             self.sidebar, self.t("sidebar.terminology"), command=self._open_terminology_manager,
             style="ghost", anchor="w", image=terminology_icon,
-        ).grid(row=row, column=0, sticky="ew", padx=PAD, pady=(4, 2))
+        )
+        self.terminology_btn.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(4, 2))
         row += 1
 
         settings_icon = get_icon("settings", size=16)
-        theme.make_button(
+        self.settings_btn = theme.make_button(
             self.sidebar, self.t("sidebar.settings"), command=self._open_settings, style="ghost",
             anchor="w", image=settings_icon,
-        ).grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 2))
+        )
+        self.settings_btn.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, 2))
         row += 1
 
         info_icon = get_icon("info", size=16)
-        theme.make_button(
+        self.about_btn = theme.make_button(
             self.sidebar, self.t("sidebar.about"), command=self._open_about, style="ghost",
             anchor="w", image=info_icon,
-        ).grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, PAD))
+        )
+        self.about_btn.grid(row=row, column=0, sticky="ew", padx=PAD, pady=(0, PAD))
 
     # --- content area ---
 
@@ -1461,94 +1113,7 @@ class App:
 
     def _build_file_table(self, parent):
         p = theme.get()
-        style = ttk.Style()
-        style.theme_use("clam")
-
-        body_font = (theme.FONT_FAMILY, theme.FONT_BODY[1])
-        heading_font = (theme.FONT_FAMILY, theme.FONT_SMALL[1], "bold")
-
-        style.configure(
-            "FileTable.Treeview",
-            rowheight=32,
-            font=body_font,
-            background=p.bg_card,
-            foreground=p.text_secondary,
-            fieldbackground=p.bg_card,
-            borderwidth=0,
-            relief="flat",
-            # "clam" theme draws its border via these color keys even when
-            # borderwidth=0; setting them to the card background makes the
-            # outline invisible without removing any padding.
-            bordercolor=p.bg_card,
-            lightcolor=p.bg_card,
-            darkcolor=p.bg_card,
-        )
-        style.configure(
-            "FileTable.Treeview.Heading",
-            font=heading_font,
-            background=p.bg_heading,
-            foreground=p.text_muted,
-            borderwidth=0,
-            relief="flat",
-            padding=(8, 6),
-        )
-        style.map(
-            "FileTable.Treeview",
-            background=[
-                ("selected", p.accent),
-                ("active", p.bg_card),
-                ("!active", p.bg_card),
-                ("focus", p.bg_card),
-            ],
-            foreground=[
-                ("selected", p.text_on_accent),
-                ("active", p.text_secondary),
-                ("!active", p.text_secondary),
-            ],
-            bordercolor=[
-                ("active", p.bg_card),
-                ("focus", p.bg_card),
-                ("!active", p.bg_card),
-            ],
-            lightcolor=[
-                ("active", p.bg_card),
-                ("focus", p.bg_card),
-                ("!active", p.bg_card),
-            ],
-            darkcolor=[
-                ("active", p.bg_card),
-                ("focus", p.bg_card),
-                ("!active", p.bg_card),
-            ],
-        )
-        style.map(
-            "FileTable.Treeview.Heading",
-            background=[("active", p.bg_input)],
-        )
-        # Slim, styled scrollbar
-        style.configure(
-            "Slim.Vertical.TScrollbar",
-            gripcount=0,
-            background=p.bg_card,
-            darkcolor=p.bg_card,
-            lightcolor=p.bg_card,
-            troughcolor=p.bg_card,
-            bordercolor=p.bg_card,
-            arrowcolor=p.text_muted,
-            relief="flat",
-            borderwidth=0,
-            arrowsize=12,
-            width=10,
-        )
-        style.map(
-            "Slim.Vertical.TScrollbar",
-            background=[
-                ("active",   p.border),
-                ("!active",  p.divider),
-                ("disabled", p.bg_card),
-            ],
-            arrowcolor=[("disabled", p.bg_card)],
-        )
+        _configure_app_table_styles(p)
 
         # Load file-type icons for the treeview (PhotoImage for ttk)
         icon_color = p.text_muted
@@ -1576,16 +1141,9 @@ class App:
             columns=("status", "time"),
             show="headings",
             style="FileTable.Treeview",
-            selectmode="browse",
+            selectmode="extended",
+            takefocus=True,
         )
-        # Suppress the Tk-level focus-ring outline (drawn outside ttk style)
-        try:
-            self.file_table.configure(takefocus=False)
-            # highlightthickness is a raw Tk option not exposed by ttk but
-            # accessible via the underlying tk widget call
-            self.file_table.tk.call(str(self.file_table), "configure", "-highlightthickness", 0)
-        except Exception:
-            pass
         self.file_table.heading("status", text=self.t("table.status"), anchor="center")
         self.file_table.heading("time", text=self.t("table.time"), anchor="center")
 
@@ -1604,6 +1162,26 @@ class App:
 
         self.file_table.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 2))
+
+        self._file_empty_state = theme.make_label(
+            container, self.t("content.empty_queue"), level="small",
+            anchor="center", justify="center", text_color=p.text_muted,
+        )
+        self._file_empty_state.place(relx=0.5, rely=0.5, anchor="center")
+
+        def _delete_selected(_event=None):
+            self._remove_selected_files()
+            return "break"
+
+        def _select_all(_event=None):
+            self._select_all_queue_rows()
+            return "break"
+
+        self.file_table.bind("<Delete>", _delete_selected, "+")
+        self.file_table.bind("<Control-a>", _select_all, "+")
+        self.file_table.bind("<Control-A>", _select_all, "+")
+        self.file_table.bind("<Command-a>", _select_all, "+")
+        self.file_table.bind("<<TreeviewSelect>>", lambda _e: self._sync_clear_button_label(), "+")
 
         # Deselect when clicking on empty space in the table
         def _on_table_click(event):
@@ -1650,6 +1228,8 @@ class App:
         self.file_table.tag_configure("retrying", foreground=p.status_info)
         self.file_table.tag_configure("even", background=p.bg_row_even)
         self.file_table.tag_configure("odd",  background=p.bg_row_odd)
+        self._sync_file_empty_state()
+        self._sync_clear_button_label()
 
     def _get_file_icon(self, filepath: str):
         # Return the appropriate PhotoImage icon for a file extension.
@@ -1671,6 +1251,71 @@ class App:
 
     # --- table helpers ---
 
+    def _sync_file_empty_state(self) -> None:
+        label = getattr(self, "_file_empty_state", None)
+        table = getattr(self, "file_table", None)
+        if label is None or table is None:
+            return
+        try:
+            if table.get_children():
+                label.place_forget()
+            else:
+                label.place(relx=0.5, rely=0.5, anchor="center")
+                label.lift()
+        except Exception:
+            pass
+
+    def _sync_clear_button_label(self) -> None:
+        button = getattr(self, "clear_files_btn", None)
+        table = getattr(self, "file_table", None)
+        if button is None or table is None:
+            return
+        try:
+            key = "content.remove_selected" if table.selection() else "content.clear_all"
+            button.configure(text=self.t(key))
+        except Exception:
+            pass
+
+    def _select_all_queue_rows(self) -> None:
+        if getattr(self, "_running", False):
+            return
+        try:
+            rows = self.file_table.get_children()
+            if rows:
+                self.file_table.selection_set(rows)
+                self.file_table.focus(rows[0])
+                self._sync_clear_button_label()
+        except Exception:
+            pass
+
+    def _remove_selected_files(self) -> None:
+        """Remove only selected queue rows; never interpret no selection as clear-all."""
+        if getattr(self, "_running", False):
+            return
+        try:
+            selected = tuple(self.file_table.selection())
+        except Exception:
+            selected = ()
+        if not selected:
+            return
+        for iid in selected:
+            filepath = self._tree_ids.pop(iid, None)
+            if filepath:
+                self._file_to_iid.pop(filepath, None)
+                self._file_status.pop(filepath, None)
+                self._file_attempts.pop(filepath, None)
+                self._file_start_times.pop(filepath, None)
+                if filepath in self.files:
+                    self.files.remove(filepath)
+            try:
+                self.file_table.delete(iid)
+            except Exception:
+                pass
+        self._retag_rows()
+        self._sync_file_empty_state()
+        self._sync_clear_button_label()
+        self._sync_retry_button_visibility()
+
     def _add_file_to_table(self, filepath: str, status: str = "pending"):
         self.files.append(filepath)
         self._file_status[filepath] = status
@@ -1683,10 +1328,12 @@ class App:
         if icon:
             kw["image"] = icon
         iid = self.file_table.insert(
-            "", tk.END, text=f"  {name}", values=(self._status_text(status), ""), tags=(status, row_tag), **kw,
+            "", tk.END, text=name, values=(self._status_text(status), ""), tags=(status, row_tag), **kw,
         )
         self._tree_ids[iid] = filepath
         self._file_to_iid[filepath] = iid
+        self._sync_file_empty_state()
+        self._sync_clear_button_label()
 
     def _update_file_status(self, filepath: str, status: str, elapsed: float | None = None):
         self._file_status[filepath] = status
@@ -1729,13 +1376,15 @@ class App:
         win.configure(fg_color=p.bg_main)
 
         win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(0, weight=1)
 
         # Outer card wrapper — holds title + two-column body
         card = theme.make_card(win)
-        card.configure(width=theme.scale(820))
-        win.minsize(theme.scale(820), theme.scale(440))
+        card.configure(width=theme.scale(900))
+        win.minsize(theme.scale(900), theme.scale(650))
         card.grid(row=0, column=0, sticky="nsew", padx=PAD, pady=PAD)
         card.grid_columnconfigure(0, weight=1)
+        card.grid_rowconfigure(1, weight=1)
 
         # ── Title row ────────────────────────────────────────────────────
         settings_icon = get_icon("settings", size=20)
@@ -1749,10 +1398,10 @@ class App:
         body = ctk.CTkFrame(card, fg_color="transparent")
         body.grid(row=1, column=0, sticky="nsew", padx=PAD, pady=(0, PAD))
         # col 0 = left, col 1 = vertical divider (fixed width), col 2 = right
-        body.grid_columnconfigure(0, weight=0, minsize=theme.scale(260))
+        body.grid_columnconfigure(0, weight=0, minsize=theme.scale(320))
         body.grid_columnconfigure(1, weight=0, minsize=theme.scale(1))
-        body.grid_columnconfigure(2, weight=1)
-        body.grid_rowconfigure(0, weight=0)
+        body.grid_columnconfigure(2, weight=1, minsize=theme.scale(460))
+        body.grid_rowconfigure(0, weight=1)
 
         # Vertical divider — use a plain tk.Frame so the fixed 1-px width is respected
         p_now = theme.get()
@@ -1761,22 +1410,76 @@ class App:
         _vdiv.grid_propagate(False)
 
         # ── LEFT COLUMN: Folders + Appearance + Updates + Debug ──────────
-        left = ctk.CTkFrame(body, fg_color="transparent")
-        # Anchor left column to north-west and avoid vertical stretching
-        left.grid(row=0, column=0, sticky="nw")
-        
+        def _hide_settings_scrollbar(frame):
+            """Hide CTk's visual scrollbar without disabling wheel/trackpad scrolling."""
+            scrollbar = getattr(frame, "_scrollbar", None)
+            if scrollbar is None:
+                return
+            # CTkScrollableFrame keeps scrolling on its canvas; the scrollbar is
+            # only a visual/drag control, so removing it from the geometry manager
+            # preserves mouse-wheel and trackpad scrolling.
+            for forget in ("grid_remove", "grid_forget", "pack_forget", "place_forget"):
+                method = getattr(scrollbar, forget, None)
+                if method is None:
+                    continue
+                try:
+                    method()
+                    break
+                except Exception:
+                    continue
+
+        try:
+            left = ctk.CTkScrollableFrame(body, fg_color="transparent")
+            left.configure(width=theme.scale(320), height=theme.scale(390))
+            _hide_settings_scrollbar(left)
+        except Exception:
+            left = ctk.CTkFrame(body, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew")
         left.grid_columnconfigure(0, weight=1)
+
+        # A CTkScrollableFrame does not propagate its children's requested width
+        # the same way the old plain CTkFrame did. Keep the left pane readable and
+        # explicitly wrap its labels to the *actual* available width so translated
+        # UI strings do not get clipped at higher DPI or with longer locales.
+        _left_wrapped_labels: list[object] = []
+
+        def _left_settings_label(text: str, *, level: str = "body", **kwargs):
+            label = theme.make_label(left, text, level=level, **kwargs)
+            try:
+                label.configure(anchor="w", justify="left")
+            except Exception:
+                pass
+            _left_wrapped_labels.append(label)
+            return label
+
+        def _sync_left_settings_wrap(_event=None):
+            try:
+                available = int(left.winfo_width()) - theme.scale(24)
+            except Exception:
+                available = theme.scale(296)
+            wrap = max(theme.scale(220), available)
+            for label in tuple(_left_wrapped_labels):
+                try:
+                    if label.winfo_exists():
+                        label.configure(wraplength=wrap)
+                except Exception:
+                    pass
+
+        try:
+            left.bind("<Configure>", _sync_left_settings_wrap, add="+")
+        except Exception:
+            pass
 
         _lrow = 0
 
         # FOLDERS section
-        theme.make_label(left, self.t("settings.section.folders"), level="section").grid(
+        _left_settings_label(self.t("settings.section.folders"), level="section").grid(
             row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4),
         )
         _lrow += 1
 
         # Default input folder
-        theme.make_label(left, self.t("settings.default_input_folder"), level="small").grid(
+        _left_settings_label(self.t("settings.default_input_folder"), level="small").grid(
             row=_lrow, column=0, sticky="w", pady=(0, 2),
         )
         _lrow += 1
@@ -1807,7 +1510,7 @@ class App:
         _lrow += 1
 
         # Default output folder
-        theme.make_label(left, self.t("settings.default_output_folder"), level="small").grid(
+        _left_settings_label(self.t("settings.default_output_folder"), level="small").grid(
             row=_lrow, column=0, sticky="w", pady=(6, 4),
         )
         _lrow += 1
@@ -1841,7 +1544,7 @@ class App:
         _lrow += 1
 
         # APPEARANCE section
-        theme.make_label(left, self.t("settings.section.appearance"), level="section").grid(
+        _left_settings_label(self.t("settings.section.appearance"), level="section").grid(
             row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4),
         )
         _lrow += 1
@@ -1868,10 +1571,10 @@ class App:
 
         mode_switch_var.trace_add("write", _on_mode_switch)
 
-        theme.make_label(
-            left, self.t("settings.appearance.restart_required"),
+        _left_settings_label(
+            self.t("settings.appearance.restart_required"),
             level="tiny",
-        ).grid(row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        ).grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(0, 2))
         _lrow += 1
 
         # Divider
@@ -1879,7 +1582,7 @@ class App:
         _lrow += 1
 
         # LANGUAGE section
-        theme.make_label(left, self.t("settings.section.language"), level="section").grid(
+        _left_settings_label(self.t("settings.section.language"), level="section").grid(
             row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4),
         )
         _lrow += 1
@@ -1899,10 +1602,10 @@ class App:
         ).grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(0, 4))
         _lrow += 1
 
-        theme.make_label(
-            left, self.t("settings.language.restart_required"),
+        _left_settings_label(
+            self.t("settings.language.restart_required"),
             level="tiny",
-        ).grid(row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        ).grid(row=_lrow, column=0, columnspan=2, sticky="ew", pady=(0, 2))
         _lrow += 1
 
         # Divider
@@ -1910,7 +1613,7 @@ class App:
         _lrow += 1
 
         # UPDATES section
-        theme.make_label(left, self.t("settings.section.updates"), level="section").grid(
+        _left_settings_label(self.t("settings.section.updates"), level="section").grid(
             row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4),
         )
         _lrow += 1
@@ -1937,7 +1640,7 @@ class App:
         _lrow += 1
 
         # DEBUG section
-        theme.make_label(left, self.t("settings.section.debug"), level="section").grid(
+        _left_settings_label(self.t("settings.section.debug"), level="section").grid(
             row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4),
         )
         _lrow += 1
@@ -1964,7 +1667,7 @@ class App:
         _lrow += 1
 
         # LOCAL MODELS section
-        theme.make_label(left, self.t("settings.section.local_models"), level="section").grid(
+        _left_settings_label(self.t("settings.section.local_models"), level="section").grid(
             row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4),
         )
         _lrow += 1
@@ -1980,28 +1683,67 @@ class App:
         ).grid(row=_lrow, column=0, columnspan=2, sticky="w", pady=(0, 4))
         _lrow += 1
 
+        try:
+            left.after_idle(_sync_left_settings_wrap)
+        except Exception:
+            pass
+
         # ── RIGHT COLUMN: Network + API Keys ─────────────────────────────
         # Use a scrollable frame for the right column
         try:
             right = ctk.CTkScrollableFrame(body, fg_color="transparent")
             try:
-                right.configure(height=theme.scale(350))
+                right.configure(width=theme.scale(460), height=theme.scale(350))
             except Exception:
                 pass
+            _hide_settings_scrollbar(right)
         except Exception:
             right = ctk.CTkFrame(body, fg_color="transparent")
         right.grid(row=0, column=2, sticky="nsew")
         right.grid_columnconfigure(0, weight=1)
 
+        # Keep the API/network side intentionally wider than the left settings pane.
+        # CTkScrollableFrame does not reliably propagate child-requested width, so
+        # explanatory text must wrap against the rendered pane width rather than a
+        # fixed pixel value.
+        _right_wrapped_labels: list[object] = []
+
+        def _right_settings_label(text: str, *, level: str = "body", **kwargs):
+            label = theme.make_label(right, text, level=level, **kwargs)
+            try:
+                label.configure(anchor="w", justify="left")
+            except Exception:
+                pass
+            _right_wrapped_labels.append(label)
+            return label
+
+        def _sync_right_settings_wrap(_event=None):
+            try:
+                available = int(right.winfo_width()) - theme.scale(28)
+            except Exception:
+                available = theme.scale(430)
+            wrap = max(theme.scale(300), available)
+            for label in tuple(_right_wrapped_labels):
+                try:
+                    if label.winfo_exists():
+                        label.configure(wraplength=wrap)
+                except Exception:
+                    pass
+
+        try:
+            right.bind("<Configure>", _sync_right_settings_wrap, add="+")
+        except Exception:
+            pass
+
         _rrow = 0
 
         # NETWORK section
-        theme.make_label(right, self.t("settings.section.network"), level="section").grid(
+        _right_settings_label(self.t("settings.section.network"), level="section").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 6),
         )
         _rrow += 1
 
-        theme.make_label(right, self.t("settings.https_proxy"), level="small").grid(
+        _right_settings_label(self.t("settings.https_proxy"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 4),
         )
         _rrow += 1
@@ -2009,8 +1751,7 @@ class App:
         proxy_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 1))
         proxy_entry.insert(0, self.cfg.get("proxy_url", ""))
         _rrow += 1
-        theme.make_label(
-            right, self.t("settings.proxy_hint"),
+        _right_settings_label(self.t("settings.proxy_hint"),
             level="tiny",
         ).grid(row=_rrow, column=0, sticky="w", pady=(0, 8))
         _rrow += 1
@@ -2020,7 +1761,7 @@ class App:
         _rrow += 1
 
         # Ollama / Qwen section
-        theme.make_label(right, self.t("settings.section.ollama"), level="section").grid(
+        _right_settings_label(self.t("settings.section.ollama"), level="section").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 6),
         )
         _rrow += 1
@@ -2042,7 +1783,7 @@ class App:
         ollama_enabled_cb.grid(row=_rrow, column=0, sticky="w", pady=(0, 4))
         _rrow += 1
 
-        theme.make_label(right, self.t("settings.ollama_base_url"), level="small").grid(
+        _right_settings_label(self.t("settings.ollama_base_url"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 4),
         )
         _rrow += 1
@@ -2051,258 +1792,574 @@ class App:
         ollama_base_url_entry.insert(0, self.cfg.get("ollama_base_url", "http://127.0.0.1:11434"))
         _rrow += 1
 
-        ollama_url_hint_lbl = theme.make_label(
-            right, self.t("settings.ollama_base_url_hint"), level="tiny",
+        ollama_url_hint_lbl = _right_settings_label(self.t("settings.ollama_base_url_hint"), level="tiny",
         )
-        ollama_url_hint_lbl.configure(anchor="w", justify="left", wraplength=theme.scale(400))
+        ollama_url_hint_lbl.configure(anchor="w", justify="left")
         ollama_url_hint_lbl.grid(row=_rrow, column=0, sticky="ew", pady=(0, 6))
         _rrow += 1
 
-        theme.make_label(right, self.t("settings.ollama_model"), level="small").grid(
+        _right_settings_label(self.t("settings.ollama.runtime"), level="small").grid(
+            row=_rrow, column=0, sticky="w", pady=(0, 3),
+        )
+        _rrow += 1
+
+        ollama_runtime_row = ctk.CTkFrame(right, fg_color="transparent")
+        ollama_runtime_row.grid(row=_rrow, column=0, sticky="ew", pady=(0, 8))
+        ollama_runtime_row.grid_columnconfigure(1, weight=1)
+        ollama_runtime_dot = theme.make_label(
+            ollama_runtime_row, "●", level="small", text_color=p.text_muted,
+        )
+        ollama_runtime_dot.grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ollama_runtime_status_lbl = theme.make_label(
+            ollama_runtime_row, self.t("settings.ollama.runtime.checking"), level="small",
+        )
+        ollama_runtime_status_lbl.grid(row=0, column=1, sticky="w")
+        _rrow += 1
+
+        _right_settings_label(self.t("settings.ollama.model_heading"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 4),
         )
         _rrow += 1
 
-        _OLLAMA_MODEL_OPTIONS = ["qwen3.5:4b", "demonbyron/HY-MT1.5-1.8B", "translategemma:4b", "mistral:7b"]
+        _OLLAMA_MODEL_META = {
+            "qwen3.5:4b": (
+                self.t("settings.ollama.model.qwen"),
+                self.t("settings.ollama.model_desc.qwen"),
+            ),
+            "demonbyron/HY-MT1.5-1.8B": (
+                self.t("settings.ollama.model.hymt"),
+                self.t("settings.ollama.model_desc.hymt"),
+            ),
+            "translategemma:4b": (
+                self.t("settings.ollama.model.translategemma"),
+                self.t("settings.ollama.model_desc.translategemma"),
+            ),
+            "mistral:7b": (
+                self.t("settings.ollama.model.mistral"),
+                self.t("settings.ollama.model_desc.mistral"),
+            ),
+        }
+        _OLLAMA_DISPLAY_TO_ID = {display: model for model, (display, _desc) in _OLLAMA_MODEL_META.items()}
+        _OLLAMA_ID_TO_DISPLAY = {model: display for model, (display, _desc) in _OLLAMA_MODEL_META.items()}
         _saved_ollama_model = self.cfg.get("ollama_model", "qwen3.5:4b")
-        if _saved_ollama_model not in _OLLAMA_MODEL_OPTIONS:
-            _saved_ollama_model = _OLLAMA_MODEL_OPTIONS[0]
+        if _saved_ollama_model not in _OLLAMA_MODEL_META:
+            _saved_ollama_model = "qwen3.5:4b"
         ollama_model_var = ctk.StringVar(value=_saved_ollama_model)
+        ollama_model_display_var = ctk.StringVar(value=_OLLAMA_ID_TO_DISPLAY[_saved_ollama_model])
 
-        _ollama_model_frame = ctk.CTkFrame(right, fg_color="transparent")
-        _ollama_model_frame.grid(row=_rrow, column=0, sticky="w", pady=(0, 4))
+        ollama_model_box = SimpleComboBox(
+            right,
+            values=[meta[0] for meta in _OLLAMA_MODEL_META.values()],
+            variable=ollama_model_display_var,
+            command=lambda value: _on_ollama_model_selected(value),
+        )
+        ollama_model_box.grid(row=_rrow, column=0, sticky="ew", pady=(0, 4))
+        _rrow += 1
 
-        def _make_ollama_model_btn(parent, label, value):
-            def _select():
-                ollama_model_var.set(value)
-                _refresh_ollama_model_btns()
-                _check_model_availability(value, ollama_base_url_entry.get().strip())
-            btn = ctk.CTkButton(
-                parent, text=label, width=140, height=28,
-                corner_radius=theme.BUTTON_CORNER_RADIUS,
-                border_width=1,
-                font=ctk.CTkFont(family=theme.FONT_FAMILY, size=theme.FONT_SMALL[1]),
-                command=_select,
-            )
-            btn.pack(side=tk.LEFT, padx=(0, 6))
-            return btn
+        ollama_model_desc_lbl = _right_settings_label(
+            _OLLAMA_MODEL_META[_saved_ollama_model][1], level="tiny",
+        )
+        ollama_model_desc_lbl.grid(row=_rrow, column=0, sticky="ew", pady=(0, 8))
+        _rrow += 1
 
-        _ollama_row1 = ctk.CTkFrame(_ollama_model_frame, fg_color="transparent")
-        _ollama_row1.pack(fill="x", pady=(0, 4))
+        ollama_model_card = theme.make_card(right, fg_color=p.bg_main)
+        ollama_model_card.grid(row=_rrow, column=0, sticky="ew", pady=(0, 8))
+        ollama_model_card.grid_columnconfigure(0, weight=1)
 
-        _ollama_row2 = ctk.CTkFrame(_ollama_model_frame, fg_color="transparent")
-        _ollama_row2.pack(fill="x")
+        ollama_model_state_lbl = theme.make_label(
+            ollama_model_card, self.t("settings.ollama.state.checking"), level="section",
+        )
+        ollama_model_state_lbl.grid(row=0, column=0, sticky="w", padx=10, pady=(9, 1))
+        ollama_model_detail_lbl = theme.make_label(
+            ollama_model_card, "", level="tiny", text_color=p.text_muted,
+        )
+        ollama_model_detail_lbl.configure(anchor="w", justify="left")
+        _right_wrapped_labels.append(ollama_model_detail_lbl)
+        ollama_model_detail_lbl.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 7))
 
-        _ollama_model_btn_qwen       = _make_ollama_model_btn(_ollama_row1, "Qwen3.5 4B",        "qwen3.5:4b")
-        _ollama_model_btn_hymt       = _make_ollama_model_btn(_ollama_row1, "HY-MT 1.5 1.8B",    "demonbyron/HY-MT1.5-1.8B")
-        _ollama_model_btn_tgemma     = _make_ollama_model_btn(_ollama_row2, "TranslateGemma 4B", "translategemma:4b")
-        _ollama_model_btn_mistral    = _make_ollama_model_btn(_ollama_row2, "Mistral 7B",        "mistral:7b")
+        ollama_model_progress = ctk.CTkProgressBar(
+            ollama_model_card,
+            progress_color=p.accent,
+            fg_color=p.bg_card,
+            corner_radius=4,
+            height=7,
+        )
+        ollama_model_progress.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 7))
+        ollama_model_progress.set(0)
+        ollama_model_progress.grid_remove()
 
-        def _refresh_ollama_model_btns():
-            p_now = theme.get()
-            selected = ollama_model_var.get()
-            for btn, val in (
-                (_ollama_model_btn_qwen,     "qwen3.5:4b"),
-                (_ollama_model_btn_hymt,     "demonbyron/HY-MT1.5-1.8B"),
-                (_ollama_model_btn_tgemma,   "translategemma:4b"),
-                (_ollama_model_btn_mistral,  "mistral:7b"),
-            ):
-                if val == selected:
-                    btn.configure(
+        ollama_model_actions = ctk.CTkFrame(ollama_model_card, fg_color="transparent")
+        ollama_model_actions.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 9))
+        ollama_model_actions.grid_columnconfigure(2, weight=1)
+
+        ollama_running_note_lbl = theme.make_label(
+            ollama_model_card, self.t("settings.ollama.running_note"),
+            level="tiny", text_color=p.status_warning,
+        )
+        ollama_running_note_lbl.configure(anchor="w", justify="left")
+        _right_wrapped_labels.append(ollama_running_note_lbl)
+        ollama_running_note_lbl.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 8))
+        if not self._running:
+            ollama_running_note_lbl.grid_remove()
+
+        ollama_ui_state = {
+            "runtime": "checking",
+            "model": "checking",
+            "busy": False,
+            "operation": None,
+            "generation": 0,
+            "error": None,
+            "progress": None,
+            "stage": None,
+            "failed_action": None,
+            "owns_pull_lock": False,
+        }
+
+        def _selected_ollama_model() -> str:
+            return ollama_model_var.get() or "qwen3.5:4b"
+
+        def _selected_ollama_display() -> str:
+            model = _selected_ollama_model()
+            return _OLLAMA_ID_TO_DISPLAY.get(model, model)
+
+        def _ollama_proxies() -> dict | None:
+            proxy_url = proxy_entry.get().strip()
+            return {"https": proxy_url, "http": proxy_url} if proxy_url else None
+
+        def _ollama_base_url() -> str:
+            return ollama_base_url_entry.get().strip() or "http://127.0.0.1:11434"
+
+        def _set_ollama_runtime_visual(state: str):
+            mapping = {
+                "checking": ("settings.ollama.runtime.checking", p.text_muted),
+                "connected": ("settings.ollama.runtime.connected", p.status_success),
+                "stopped": ("settings.ollama.runtime.stopped", p.status_warning),
+                "not_installed": ("settings.ollama.runtime.not_installed", p.status_warning),
+                "unavailable": ("settings.ollama.runtime.unavailable", p.status_error),
+            }
+            key, color = mapping.get(state, mapping["unavailable"])
+            ollama_runtime_dot.configure(text_color=color)
+            ollama_runtime_status_lbl.configure(text=self.t(key), text_color=color)
+
+        def _ollama_stage_text(stage: str | None) -> str:
+            key = {
+                "manifest": "settings.ollama.progress.manifest",
+                "layers": "settings.ollama.progress.layers",
+                "verifying": "settings.ollama.progress.verifying",
+                "writing_manifest": "settings.ollama.progress.writing_manifest",
+                "cleanup": "settings.ollama.progress.cleanup",
+                "downloading": "settings.ollama.progress.downloading",
+            }.get(stage, "settings.ollama.progress.downloading")
+            return self.t(key)
+
+        def _set_action_button(button, *, text: str, command, style: str = "primary", visible: bool = True, enabled: bool = True):
+            try:
+                button.configure(text=text, command=command)
+                # Preserve the existing button widget while refreshing style-specific colours.
+                p_now = theme.get()
+                if style == "primary":
+                    button.configure(
                         fg_color=p_now.accent,
                         hover_color=p_now.accent_hover,
                         text_color=p_now.text_on_accent,
-                        border_color=p_now.accent_pressed,
+                        border_width=0,
                     )
-                else:
-                    btn.configure(
-                        fg_color="transparent",
-                        hover_color=p_now.bg_card,
+                elif style == "secondary":
+                    button.configure(
+                        fg_color=p_now.bg_input,
+                        hover_color=p_now.bg_heading,
                         text_color=p_now.text_secondary,
+                        border_width=1,
                         border_color=p_now.border,
                     )
+                else:
+                    button.configure(
+                        fg_color="transparent",
+                        hover_color=p_now.bg_heading,
+                        text_color=p_now.text_secondary,
+                        border_width=0,
+                    )
+                self._set_button_disabled(button, not enabled)
+                if visible:
+                    button.grid()
+                else:
+                    button.grid_remove()
+            except Exception:
+                pass
 
-        _refresh_ollama_model_btns()
-        _rrow += 1
+        def _render_ollama_model_state():
+            runtime = str(ollama_ui_state["runtime"])
+            model_state = str(ollama_ui_state["model"])
+            busy = bool(ollama_ui_state["busy"])
+            operation = ollama_ui_state["operation"]
+            translation_running = bool(self._running)
+            try:
+                if translation_running:
+                    ollama_running_note_lbl.grid()
+                else:
+                    ollama_running_note_lbl.grid_remove()
+            except Exception:
+                pass
+            error = ollama_ui_state.get("error")
+            progress = ollama_ui_state.get("progress")
+            stage = ollama_ui_state.get("stage")
+            display = _selected_ollama_display()
 
-        ollama_pull_row = ctk.CTkFrame(right, fg_color="transparent")
-        ollama_pull_row.grid(row=_rrow, column=0, sticky="w", pady=(0, 4))
+            _set_ollama_runtime_visual(runtime)
+            try:
+                self._set_button_disabled(ollama_refresh_btn, busy)
+            except Exception:
+                pass
+            try:
+                ollama_model_box.configure(state="disabled" if busy else "normal")
+                ollama_base_url_entry.configure(state="disabled" if busy else "normal")
+            except Exception:
+                pass
 
-        ollama_pull_status_lbl = theme.make_label(
-            right,
-            self.t("settings.ollama_pull.idle"),
-            level="tiny",
-            text_color=p.text_muted,
-        )
-        ollama_pull_status_lbl.configure(anchor="w", justify="left", wraplength=theme.scale(400))
+            if busy and operation == "download":
+                if stage == "verifying":
+                    title = self.t("settings.ollama.state.verifying")
+                else:
+                    title = self.t("settings.ollama.state.downloading", model=display)
+                ollama_model_state_lbl.configure(text=title, text_color=p.status_info)
+                stage_text = _ollama_stage_text(stage)
+                if isinstance(progress, int):
+                    detail = self.t("settings.ollama.progress.percent", stage=stage_text, percent=progress)
+                    ollama_model_progress.set(max(0.0, min(1.0, progress / 100.0)))
+                else:
+                    detail = stage_text
+                    ollama_model_progress.set(0.04)
+                ollama_model_detail_lbl.configure(text=detail, text_color=p.text_muted)
+                ollama_model_progress.grid()
+                _set_action_button(
+                    ollama_primary_action_btn,
+                    text=self.t("settings.ollama.action.cancel"),
+                    command=_cancel_ollama_download,
+                    style="secondary",
+                )
+                _set_action_button(ollama_remove_btn, text=self.t("settings.ollama.action.remove"), command=_remove_ollama_model_from_settings, visible=False)
+            elif busy and operation == "start":
+                ollama_model_state_lbl.configure(text=self.t("settings.ollama.state.starting"), text_color=p.status_info)
+                ollama_model_detail_lbl.configure(text=self.t("settings.ollama.runtime.checking"), text_color=p.text_muted)
+                ollama_model_progress.grid_remove()
+                _set_action_button(ollama_primary_action_btn, text=self.t("settings.ollama.action.start"), command=lambda: None, enabled=False)
+                _set_action_button(ollama_remove_btn, text=self.t("settings.ollama.action.remove"), command=_remove_ollama_model_from_settings, visible=False)
+            elif busy and operation == "remove":
+                ollama_model_state_lbl.configure(text=self.t("settings.ollama.state.removing", model=display), text_color=p.status_info)
+                ollama_model_detail_lbl.configure(text="", text_color=p.text_muted)
+                ollama_model_progress.grid_remove()
+                _set_action_button(ollama_primary_action_btn, text=self.t("settings.ollama.action.retry"), command=lambda: None, visible=False)
+                _set_action_button(ollama_remove_btn, text=self.t("settings.ollama.action.remove"), command=lambda: None, enabled=False)
+            else:
+                ollama_model_progress.grid_remove()
+                if error:
+                    ollama_model_state_lbl.configure(text=self.t("settings.ollama.state.error"), text_color=p.status_error)
+                    ollama_model_detail_lbl.configure(text=str(error), text_color=p.status_error)
+                    failed_action = ollama_ui_state.get("failed_action")
+                    retry_command = _start_ollama_runtime if failed_action == "start" else _pull_ollama_model_from_settings if failed_action == "download" else _refresh_ollama_status
+                    _set_action_button(ollama_primary_action_btn, text=self.t("settings.ollama.action.retry"), command=retry_command, style="primary")
+                    _set_action_button(ollama_remove_btn, text=self.t("settings.ollama.action.remove"), command=_remove_ollama_model_from_settings, visible=False)
+                elif runtime == "connected" and model_state == "installed":
+                    ollama_model_state_lbl.configure(text=self.t("settings.ollama.state.ready"), text_color=p.status_success)
+                    ollama_model_detail_lbl.configure(text=self.t("settings.ollama.state.ready_detail"), text_color=p.text_muted)
+                    _set_action_button(ollama_primary_action_btn, text=self.t("settings.ollama.action.download"), command=_pull_ollama_model_from_settings, visible=False)
+                    _set_action_button(
+                        ollama_remove_btn, text=self.t("settings.ollama.action.remove"),
+                        command=_remove_ollama_model_from_settings, style="secondary",
+                        visible=True, enabled=not translation_running,
+                    )
+                elif runtime == "connected" and model_state == "not_installed":
+                    ollama_model_state_lbl.configure(text=self.t("settings.ollama.state.not_downloaded"), text_color=p.status_warning)
+                    ollama_model_detail_lbl.configure(text=self.t("settings.ollama.state.not_downloaded_detail"), text_color=p.text_muted)
+                    _set_action_button(ollama_primary_action_btn, text=self.t("settings.ollama.action.download"), command=_pull_ollama_model_from_settings, style="primary")
+                    _set_action_button(ollama_remove_btn, text=self.t("settings.ollama.action.remove"), command=_remove_ollama_model_from_settings, visible=False)
+                elif runtime == "stopped":
+                    ollama_model_state_lbl.configure(text=self.t("settings.ollama.state.unknown"), text_color=p.status_warning)
+                    ollama_model_detail_lbl.configure(text=self.t("settings.ollama.state.unknown_detail"), text_color=p.text_muted)
+                    _set_action_button(ollama_primary_action_btn, text=self.t("settings.ollama.action.start"), command=_start_ollama_runtime, style="primary")
+                    _set_action_button(ollama_remove_btn, text=self.t("settings.ollama.action.remove"), command=_remove_ollama_model_from_settings, visible=False)
+                elif runtime == "not_installed":
+                    ollama_model_state_lbl.configure(text=self.t("settings.ollama.state.unknown"), text_color=p.status_warning)
+                    ollama_model_detail_lbl.configure(text=self.t("settings.ollama.runtime.not_installed"), text_color=p.text_muted)
+                    _set_action_button(ollama_primary_action_btn, text=self.t("settings.ollama.action.get"), command=lambda: webbrowser.open("https://ollama.com/download"), style="primary")
+                    _set_action_button(ollama_remove_btn, text=self.t("settings.ollama.action.remove"), command=_remove_ollama_model_from_settings, visible=False)
+                elif runtime == "unavailable":
+                    ollama_model_state_lbl.configure(text=self.t("settings.ollama.state.unknown"), text_color=p.status_error)
+                    ollama_model_detail_lbl.configure(text=self.t("settings.ollama.state.unknown_detail"), text_color=p.text_muted)
+                    _set_action_button(ollama_primary_action_btn, text=self.t("settings.ollama.action.retry"), command=_refresh_ollama_status, style="primary")
+                    _set_action_button(ollama_remove_btn, text=self.t("settings.ollama.action.remove"), command=_remove_ollama_model_from_settings, visible=False)
+                else:
+                    ollama_model_state_lbl.configure(text=self.t("settings.ollama.state.checking"), text_color=p.text_secondary)
+                    ollama_model_detail_lbl.configure(text="", text_color=p.text_muted)
+                    _set_action_button(ollama_primary_action_btn, text=self.t("settings.ollama.action.retry"), command=_refresh_ollama_status, visible=False)
+                    _set_action_button(ollama_remove_btn, text=self.t("settings.ollama.action.remove"), command=_remove_ollama_model_from_settings, visible=False)
 
-        ollama_pull_active = [False]
-
-        def _set_ollama_pull_status(message: str, *, color: str | None = None, running: bool | None = None):
+        def _apply_ollama_event(event):
             def _update():
                 if not win.winfo_exists():
                     return
-                ollama_pull_status_lbl.configure(text=message, text_color=color or p.text_muted)
-                if running is not None:
-                    ollama_pull_active[0] = running
-                    self._set_button_disabled(ollama_pull_btn, running)
-                    self._set_button_disabled(ollama_remove_btn, running)
-
+                kind = getattr(event, "kind", "")
+                if kind == "checking_runtime":
+                    ollama_ui_state["runtime"] = "checking"
+                elif kind in ("starting_runtime", "waiting_runtime"):
+                    ollama_ui_state["runtime"] = "stopped"
+                elif kind == "runtime_ready":
+                    ollama_ui_state["runtime"] = "connected"
+                elif kind == "downloading":
+                    ollama_ui_state["runtime"] = "connected"
+                    ollama_ui_state["model"] = "downloading"
+                    ollama_ui_state["progress"] = getattr(event, "progress", None)
+                    ollama_ui_state["stage"] = getattr(event, "stage", None)
+                elif kind == "verifying":
+                    ollama_ui_state["model"] = "downloading"
+                    ollama_ui_state["progress"] = getattr(event, "progress", 100)
+                    ollama_ui_state["stage"] = "verifying"
+                elif kind == "ready":
+                    ollama_ui_state["runtime"] = "connected"
+                    ollama_ui_state["model"] = "installed"
+                    ollama_ui_state["progress"] = 100
+                elif kind == "removed":
+                    ollama_ui_state["runtime"] = "connected"
+                    ollama_ui_state["model"] = "not_installed"
+                elif kind == "cancelled":
+                    ollama_ui_state["model"] = "not_installed"
+                _render_ollama_model_state()
             try:
                 self.root.after(0, _update)
             except Exception:
                 pass
 
-        def _check_model_availability(model_name: str, base_url: str) -> None:
-            """Background check: update status label with live model availability."""
-            if ollama_pull_active[0]:
+        def _refresh_ollama_status(_event=None):
+            if ollama_ui_state["busy"]:
                 return
+            ollama_ui_state["generation"] += 1
+            generation = ollama_ui_state["generation"]
+            ollama_ui_state.update({
+                "runtime": "checking",
+                "model": "checking",
+                "error": None,
+                "progress": None,
+                "stage": None,
+                "failed_action": None,
+            })
+            _render_ollama_model_state()
+            model_name = _selected_ollama_model()
+            base_url = _ollama_base_url()
+            proxies = _ollama_proxies()
 
             def _worker():
-                from ..translators.ollama import check_ollama_model_available
-                available = check_ollama_model_available(
-                    model_name,
-                    base_url or "http://127.0.0.1:11434",
-                )
-                if ollama_pull_active[0]:
+                from ..translators.ollama import inspect_ollama_model
+                inspection = inspect_ollama_model(model_name, base_url, proxies=proxies)
+
+                def _apply():
+                    if not win.winfo_exists() or generation != ollama_ui_state["generation"] or ollama_ui_state["busy"]:
+                        return
+                    ollama_ui_state["runtime"] = inspection.runtime
+                    ollama_ui_state["model"] = inspection.model_state
+                    ollama_ui_state["error"] = None
+                    _render_ollama_model_state()
+                try:
+                    self.root.after(0, _apply)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        def _on_ollama_model_selected(display_value: str):
+            if ollama_ui_state["busy"]:
+                return
+            model_name = _OLLAMA_DISPLAY_TO_ID.get(display_value)
+            if not model_name:
+                return
+            ollama_model_var.set(model_name)
+            ollama_model_desc_lbl.configure(text=_OLLAMA_MODEL_META[model_name][1])
+            _refresh_ollama_status()
+
+        def _finish_ollama_operation(*, error: Exception | str | None = None, failed_action: str | None = None, refresh: bool = False):
+            def _finish():
+                # Always release non-UI resources, even if Settings was closed
+                # while a download/removal thread was finishing.
+                ollama_ui_state["busy"] = False
+                ollama_ui_state["operation"] = None
+                ollama_ui_state["failed_action"] = failed_action if error else None
+                ollama_ui_state["error"] = str(error) if error else None
+                self._ollama_install_cancel = None
+                if ollama_ui_state.get("owns_pull_lock"):
+                    try:
+                        self._ollama_pull_lock.release()
+                    except Exception:
+                        pass
+                    ollama_ui_state["owns_pull_lock"] = False
+                try:
+                    exists = bool(win.winfo_exists())
+                except Exception:
+                    exists = False
+                if not exists:
                     return
-                if available:
-                    _set_ollama_pull_status(
-                        self.t("settings.ollama_model.available"),
-                        color=p.status_success,
-                    )
+                if refresh and error is None:
+                    _refresh_ollama_status()
                 else:
-                    _set_ollama_pull_status(
-                        self.t("settings.ollama_model.not_available"),
-                    )
+                    _render_ollama_model_state()
+            try:
+                self.root.after(0, _finish)
+            except Exception:
+                pass
+
+        def _start_ollama_runtime():
+            if ollama_ui_state["busy"]:
+                return
+            ollama_ui_state.update({"busy": True, "operation": "start", "error": None, "failed_action": None})
+            _render_ollama_model_state()
+            base_url = _ollama_base_url()
+            proxies = _ollama_proxies()
+
+            def _worker():
+                try:
+                    from ..translators.ollama import ensure_ollama_runtime
+                    ensure_ollama_runtime(base_url, proxies=proxies, event_callback=_apply_ollama_event)
+                except Exception as exc:
+                    logger.exception("Could not start Ollama runtime")
+                    _finish_ollama_operation(error=exc, failed_action="start")
+                    return
+                _finish_ollama_operation(refresh=True)
 
             threading.Thread(target=_worker, daemon=True).start()
 
         def _pull_ollama_model_from_settings():
-            if ollama_pull_active[0]:
+            if ollama_ui_state["busy"]:
                 return
             if not self._ollama_pull_lock.acquire(blocking=False):
-                _set_ollama_pull_status(self.t("settings.ollama_pull.already_running"))
+                ollama_ui_state["error"] = self.t("settings.ollama_pull.already_running")
+                ollama_ui_state["failed_action"] = "download"
+                _render_ollama_model_state()
                 return
 
-            model_name = ollama_model_var.get()
-            base_url = ollama_base_url_entry.get().strip() or "http://127.0.0.1:11434"
-            proxy_url = proxy_entry.get().strip()
-            proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else None
-
-            _set_ollama_pull_status(
-                self.t("settings.ollama_pull.running", model=model_name),
-                running=True,
-            )
-
+            ollama_ui_state["owns_pull_lock"] = True
+            model_name = _selected_ollama_model()
+            base_url = _ollama_base_url()
+            proxies = _ollama_proxies()
             cancel_event = threading.Event()
             self._ollama_install_cancel = cancel_event
+            ollama_ui_state.update({
+                "busy": True,
+                "operation": "download",
+                "runtime": "checking",
+                "model": "downloading",
+                "error": None,
+                "failed_action": None,
+                "progress": 0,
+                "stage": "manifest",
+            })
+            _render_ollama_model_state()
 
             def _worker():
                 try:
                     from ..translators.ollama import ollama_required_models, pull_ollama_models
-
                     pull_ollama_models(
                         ollama_required_models(model_name),
                         base_url=base_url,
                         proxies=proxies,
-                        status_callback=lambda message: _set_ollama_pull_status(message),
+                        event_callback=_apply_ollama_event,
                         cancel_event=cancel_event,
                     )
                 except Exception as exc:
-                    logger.exception("Ollama model pull failed")
-                    _set_ollama_pull_status(
-                        self.t("settings.ollama_pull.idle"),
-                        running=False,
-                    )
-                    self._ollama_install_cancel = None
-                    self._ollama_pull_lock.release()
+                    from ..utils import CancelledError
+                    if isinstance(exc, CancelledError) or cancel_event.is_set():
+                        _finish_ollama_operation(refresh=True)
+                        return
+                    logger.exception("Ollama model download failed")
+                    _finish_ollama_operation(error=exc, failed_action="download")
                     return
-
-                _set_ollama_pull_status(
-                    self.t("settings.ollama_pull.success", model=model_name),
-                    color=p.status_success,
-                    running=False,
-                )
-                self._ollama_install_cancel = None
-                self._ollama_pull_lock.release()
+                _finish_ollama_operation(refresh=True)
 
             threading.Thread(target=_worker, daemon=True).start()
 
-        ollama_pull_btn = theme.make_button(
-            ollama_pull_row,
-            self.t("settings.pull_ollama_model"),
-            command=_pull_ollama_model_from_settings,
-            style="secondary",
-            height=26,
-        )
-        ollama_pull_btn.pack(side=tk.LEFT)
+        def _cancel_ollama_download():
+            cancel_event = self._ollama_install_cancel
+            if cancel_event is None:
+                return
+            cancel_event.set()
+            ollama_model_state_lbl.configure(text=self.t("settings.ollama.cancel_requested"), text_color=p.status_warning)
+            self._set_button_disabled(ollama_primary_action_btn, True)
 
         def _remove_ollama_model_from_settings():
-            if ollama_pull_active[0]:
+            if ollama_ui_state["busy"] or self._running:
                 return
-
-            model_name = ollama_model_var.get()
-            base_url = ollama_base_url_entry.get().strip() or "http://127.0.0.1:11434"
-            proxy_url = proxy_entry.get().strip()
-            proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else None
-
-            _set_ollama_pull_status(
-                self.t("settings.ollama_remove.running", model=model_name),
-                running=True,
-            )
+            display = _selected_ollama_display()
+            if not messagebox.askyesno(
+                self.t("settings.ollama.remove_confirm_title"),
+                self.t("settings.ollama.remove_confirm_body", model=display),
+                parent=win,
+            ):
+                return
+            model_name = _selected_ollama_model()
+            base_url = _ollama_base_url()
+            proxies = _ollama_proxies()
+            ollama_ui_state.update({"busy": True, "operation": "remove", "error": None, "failed_action": None})
+            _render_ollama_model_state()
 
             def _worker():
                 try:
                     from ..translators.ollama import remove_ollama_model
-                    remove_ollama_model(model_name, base_url=base_url, proxies=proxies)
-                except Exception:
+                    remove_ollama_model(model_name, base_url=base_url, proxies=proxies, event_callback=_apply_ollama_event)
+                except Exception as exc:
                     logger.exception("Ollama model removal failed")
-                    _set_ollama_pull_status(
-                        self.t("settings.ollama_remove.error"),
-                        running=False,
-                    )
+                    _finish_ollama_operation(error=exc)
                     return
-
-                _set_ollama_pull_status(
-                    self.t("settings.ollama_remove.success", model=model_name),
-                    color=p.status_success,
-                    running=False,
-                )
+                _finish_ollama_operation(refresh=True)
 
             threading.Thread(target=_worker, daemon=True).start()
 
+        ollama_primary_action_btn = theme.make_button(
+            ollama_model_actions,
+            self.t("settings.ollama.action.retry"),
+            command=_refresh_ollama_status,
+            style="primary",
+            height=27,
+        )
+        ollama_primary_action_btn.grid(row=0, column=0, sticky="w", padx=(0, 6))
+
         ollama_remove_btn = theme.make_button(
-            ollama_pull_row,
-            self.t("settings.remove_ollama_model"),
+            ollama_model_actions,
+            self.t("settings.ollama.action.remove"),
             command=_remove_ollama_model_from_settings,
             style="secondary",
-            height=26,
+            height=27,
         )
-        ollama_remove_btn.pack(side=tk.LEFT, padx=(6, 0))
+        ollama_remove_btn.grid(row=0, column=1, sticky="w", padx=(0, 6))
+        ollama_remove_btn.grid_remove()
+
+        ollama_refresh_btn = theme.make_button(
+            ollama_model_actions,
+            self.t("settings.ollama.action.refresh"),
+            command=_refresh_ollama_status,
+            style="ghost",
+            height=27,
+        )
+        ollama_refresh_btn.grid(row=0, column=3, sticky="e")
+
         _rrow += 1
 
-        ollama_pull_status_lbl.grid(row=_rrow, column=0, sticky="ew", pady=(0, 8))
-        _rrow += 1
+        try:
+            ollama_base_url_entry.bind("<Return>", _refresh_ollama_status, add="+")
+            ollama_base_url_entry.bind("<FocusOut>", _refresh_ollama_status, add="+")
+        except Exception:
+            pass
 
-        # Kick off an immediate live model availability check
-        _check_model_availability(
-            ollama_model_var.get(),
-            ollama_base_url_entry.get().strip(),
-        )
+        _refresh_ollama_status()
 
         # Divider
         theme.make_divider(right).grid(row=_rrow, column=0, sticky="ew", pady=(4, 8))
         _rrow += 1
 
         # Google Cloud section
-        theme.make_label(right, self.t("settings.section.google_cloud"), level="section").grid(
+        _right_settings_label(self.t("settings.section.google_cloud"), level="section").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 6),
         )
         _rrow += 1
 
         # Google Cloud API key
-        theme.make_label(right, self.t("settings.google_cloud_api_key_v2"), level="small").grid(
+        _right_settings_label(self.t("settings.google_cloud_api_key_v2"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 4),
         )
         _rrow += 1
@@ -2312,8 +2369,7 @@ class App:
         google_key_entry.configure(show="•")
         _rrow += 1
 
-        lbl1 = theme.make_label(
-            right, self.t("settings.google_cloud_v2_hint"),
+        lbl1 = _right_settings_label(self.t("settings.google_cloud_v2_hint"),
             level="tiny",
         )
         lbl1.configure(anchor="w", justify="left")
@@ -2321,7 +2377,7 @@ class App:
         _rrow += 1
 
         # Google Cloud v3 Project ID
-        theme.make_label(right, self.t("settings.google_cloud_project_id_v3"), level="small").grid(
+        _right_settings_label(self.t("settings.google_cloud_project_id_v3"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 2),
         )
         _rrow += 1
@@ -2331,7 +2387,7 @@ class App:
         _rrow += 1
 
         # Google Cloud v3 Service Account JSON
-        theme.make_label(right, self.t("settings.google_cloud_sa_json_v3"), level="small").grid(
+        _right_settings_label(self.t("settings.google_cloud_sa_json_v3"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 2),
         )
         _rrow += 1
@@ -2339,8 +2395,7 @@ class App:
         google_sa_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 1))
         google_sa_entry.insert(0, self.cfg.get("google_sa_json", ""))
         _rrow += 1
-        lbl_v3 = theme.make_label(
-            right, self.t("settings.google_cloud_v3_hint"),
+        lbl_v3 = _right_settings_label(self.t("settings.google_cloud_v3_hint"),
             level="tiny",
         )
         lbl_v3.configure(anchor="w", justify="left")
@@ -2352,13 +2407,13 @@ class App:
         _rrow += 1
 
         # Baidu section
-        theme.make_label(right, self.t("settings.section.baidu"), level="section").grid(
+        _right_settings_label(self.t("settings.section.baidu"), level="section").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 6),
         )
         _rrow += 1
 
         # Baidu App ID
-        theme.make_label(right, self.t("settings.baidu_app_id"), level="small").grid(
+        _right_settings_label(self.t("settings.baidu_app_id"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 2),
         )
         _rrow += 1
@@ -2368,7 +2423,7 @@ class App:
         _rrow += 1
 
         # Baidu App Key
-        theme.make_label(right, self.t("settings.baidu_app_key"), level="small").grid(
+        _right_settings_label(self.t("settings.baidu_app_key"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 2),
         )
         _rrow += 1
@@ -2378,8 +2433,7 @@ class App:
         baidu_key_entry.configure(show="•")
         _rrow += 1
 
-        lbl = theme.make_label(
-            right, self.t("settings.baidu_hint"),
+        lbl = _right_settings_label(self.t("settings.baidu_hint"),
             level="tiny",
         )
         lbl.configure(anchor="w", justify="left")
@@ -2387,7 +2441,7 @@ class App:
         _rrow += 1
 
         # Baidu API tier selection
-        theme.make_label(right, self.t("settings.api_tier"), level="small").grid(
+        _right_settings_label(self.t("settings.api_tier"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 4),
         )
         _rrow += 1
@@ -2440,12 +2494,12 @@ class App:
         _rrow += 1
 
         # Azure section
-        theme.make_label(right, self.t("settings.section.azure"), level="section").grid(
+        _right_settings_label(self.t("settings.section.azure"), level="section").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 6),
         )
         _rrow += 1
 
-        theme.make_label(right, self.t("settings.azure_subscription_key"), level="small").grid(
+        _right_settings_label(self.t("settings.azure_subscription_key"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 2),
         )
         _rrow += 1
@@ -2455,7 +2509,7 @@ class App:
         azure_key_entry.configure(show="•")
         _rrow += 1
 
-        theme.make_label(right, self.t("settings.azure_region"), level="small").grid(
+        _right_settings_label(self.t("settings.azure_region"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 2),
         )
         _rrow += 1
@@ -2463,8 +2517,7 @@ class App:
         azure_region_entry.grid(row=_rrow, column=0, sticky="ew", pady=(0, 1))
         azure_region_entry.insert(0, self.cfg.get("azure_region", ""))
         _rrow += 1
-        lbl_az = theme.make_label(
-            right, self.t("settings.azure_hint"),
+        lbl_az = _right_settings_label(self.t("settings.azure_hint"),
             level="tiny",
         )
         lbl_az.configure(anchor="w", justify="left")
@@ -2476,12 +2529,12 @@ class App:
         _rrow += 1
 
         # DeepL section
-        theme.make_label(right, self.t("settings.section.deepl"), level="section").grid(
+        _right_settings_label(self.t("settings.section.deepl"), level="section").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 6),
         )
         _rrow += 1
 
-        theme.make_label(right, self.t("settings.deepl_api_key"), level="small").grid(
+        _right_settings_label(self.t("settings.deepl_api_key"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 2),
         )
         _rrow += 1
@@ -2490,8 +2543,7 @@ class App:
         deepl_key_entry.insert(0, self.cfg.get("deepl_api_key", ""))
         deepl_key_entry.configure(show="•")
         _rrow += 1
-        lbl_dl = theme.make_label(
-            right, self.t("settings.deepl_hint"),
+        lbl_dl = _right_settings_label(self.t("settings.deepl_hint"),
             level="tiny",
         )
         lbl_dl.configure(anchor="w", justify="left")
@@ -2503,7 +2555,7 @@ class App:
         _rrow += 1
 
         # Usage summary + cache controls
-        theme.make_label(right, self.t("settings.section.usage"), level="section").grid(
+        _right_settings_label(self.t("settings.section.usage"), level="section").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 4),
         )
         _rrow += 1
@@ -2523,20 +2575,18 @@ class App:
                 return ""
 
         usage_text = _get_usage_text()
-        usage_lbl = theme.make_label(right, usage_text or self.t("settings.no_usage_data"), level="tiny")
+        usage_lbl = _right_settings_label(usage_text or self.t("settings.no_usage_data"), level="tiny")
         usage_lbl.configure(anchor="w", justify="left")
         usage_lbl.grid(row=_rrow, column=0, sticky="w", pady=(0, 6))
         _rrow += 1
 
-        theme.make_label(
-            right, self.t("settings.backend_cache.title"), level="small",
+        _right_settings_label(self.t("settings.backend_cache.title"), level="small",
         ).grid(row=_rrow, column=0, sticky="w", pady=(0, 2))
         _rrow += 1
 
-        cache_hint = theme.make_label(
-            right, self.t("settings.backend_cache.hint"), level="tiny",
+        cache_hint = _right_settings_label(self.t("settings.backend_cache.hint"), level="tiny",
         )
-        cache_hint.configure(anchor="w", justify="left", wraplength=390)
+        cache_hint.configure(anchor="w", justify="left")
         cache_hint.grid(row=_rrow, column=0, sticky="ew", pady=(0, 5))
         _rrow += 1
 
@@ -2597,7 +2647,7 @@ class App:
         # worker starts, so edits here never mutate an in-flight job.
         theme.make_divider(right).grid(row=_rrow, column=0, sticky="ew", pady=(8, 8))
         _rrow += 1
-        theme.make_label(right, self.t("settings.section.translation_memory"), level="section").grid(
+        _right_settings_label(self.t("settings.section.translation_memory"), level="section").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 4),
         )
         _rrow += 1
@@ -2612,14 +2662,13 @@ class App:
         )
         tm_enabled_cb.grid(row=_rrow, column=0, sticky="w", pady=(0, 3))
         _rrow += 1
-        tm_explain = theme.make_label(
-            right, self.t("settings.translation_memory.hint"), level="tiny",
+        tm_explain = _right_settings_label(self.t("settings.translation_memory.hint"), level="tiny",
         )
-        tm_explain.configure(anchor="w", justify="left", wraplength=390)
+        tm_explain.configure(anchor="w", justify="left")
         tm_explain.grid(row=_rrow, column=0, sticky="ew", pady=(0, 6))
         _rrow += 1
 
-        theme.make_label(right, self.t("settings.translation_memory_path"), level="small").grid(
+        _right_settings_label(self.t("settings.translation_memory_path"), level="small").grid(
             row=_rrow, column=0, sticky="w", pady=(0, 2),
         )
         _rrow += 1
@@ -2651,8 +2700,7 @@ class App:
         ).grid(row=0, column=1, padx=(6, 0))
         _rrow += 1
 
-        theme.make_label(
-            right, self.t("settings.translation_memory_path_hint"), level="tiny",
+        _right_settings_label(self.t("settings.translation_memory_path_hint"), level="tiny",
         ).grid(row=_rrow, column=0, sticky="w", pady=(0, 4))
         _rrow += 1
 
@@ -2724,6 +2772,11 @@ class App:
         _update_tm_label()
         _rrow += 1
 
+        try:
+            right.after_idle(_sync_right_settings_wrap)
+        except Exception:
+            pass
+
         # ── Bottom row: error label + buttons ────────────────────────────
         bottom = ctk.CTkFrame(card, fg_color="transparent")
         bottom.grid(row=2, column=0, sticky="ew", padx=PAD, pady=(0, PAD//2))
@@ -2734,7 +2787,8 @@ class App:
             bottom, "", level="tiny",
             text_color=p.status_error,
         )
-        self._settings_error.grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self._settings_error.configure(anchor="w", justify="left", wraplength=760)
+        self._settings_error.grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
         # Button row
         btn_frame = ctk.CTkFrame(bottom, fg_color="transparent")
@@ -2819,15 +2873,16 @@ class App:
             side=tk.LEFT,
         )
 
-        # Title-bar X acts as Cancel (discard changes)
+        # Title-bar X / Escape act as Cancel; Ctrl+Enter saves.
         win.protocol("WM_DELETE_WINDOW", _on_settings_close)
+        self._bind_modal_keys(win, _on_settings_close, _save_and_close, in_entry)
         win.update_idletasks()
         def _show_settings():
             center_window(win, parent=self.root)
             win.wm_attributes("-alpha", 1)
         win.after(20, _show_settings)
         try:
-            win.resizable(False, False)
+            win.resizable(True, True)
         except Exception:
             pass
 
@@ -2837,6 +2892,7 @@ class App:
     def _open_terminology_manager(self):
         p = theme.get()
         win = ctk.CTkToplevel(self.root)
+        win.wm_attributes("-alpha", 0)
         apply_window_icon(win)
         win.title(self.t("terminology.title"))
         win.transient(self.root)
@@ -2863,8 +2919,11 @@ class App:
         card.grid_rowconfigure(0, weight=1)
 
         columns = ("enabled", "source_lang", "target_lang", "source", "target")
-        tree = ttk.Treeview(card, columns=columns, show="headings", selectmode="browse")
-        _install_tree_hover(tree, p.bg_heading)
+        tree = ttk.Treeview(
+            card, columns=columns, show="headings", selectmode="browse",
+            takefocus=True, style="FileTable.Treeview",
+        )
+        _style_app_table(tree, p)
         tree.heading("enabled", text=self.t("terminology.column.enabled"))
         tree.heading("source_lang", text=self.t("terminology.column.source_language"))
         tree.heading("target_lang", text=self.t("terminology.column.target_language"))
@@ -2875,7 +2934,10 @@ class App:
         tree.column("target_lang", width=85, stretch=False, anchor="center")
         tree.column("source", width=260, stretch=True)
         tree.column("target", width=260, stretch=True)
-        scrollbar = ttk.Scrollbar(card, orient=tk.VERTICAL, command=tree.yview)
+        scrollbar = ttk.Scrollbar(
+            card, orient=tk.VERTICAL, command=tree.yview,
+            style="Slim.Vertical.TScrollbar",
+        )
         tree.configure(yscrollcommand=scrollbar.set)
         tree.grid(row=0, column=0, sticky="nsew", padx=(12, 0), pady=12)
         scrollbar.grid(row=0, column=1, sticky="ns", padx=(0, 12), pady=12)
@@ -2896,10 +2958,14 @@ class App:
                     "", tk.END, iid=entry.id,
                     values=("✓" if entry.enabled else "", entry.source_lang, entry.target_lang, entry.source_text, entry.target_text),
                 )
+            _restripe_tree(tree)
             if self._terminology_store.last_error:
                 status.configure(text=self.t("terminology.import_error", error=self._terminology_store.last_error), text_color=p.status_error)
             else:
-                status.configure(text=f"{len(entries):,} entries", text_color=p.text_muted)
+                status.configure(
+                    text=self.t("terminology.entry_count", count=f"{len(entries):,}"),
+                    text_color=p.text_muted,
+                )
 
         language_options = _get_language_options(self.ui.locale)
         lang_display = [self._format_language_option(code, name) for code, name in language_options]
@@ -2908,6 +2974,7 @@ class App:
 
         def _edit_entry(existing: TerminologyEntry | None = None):
             dlg = ctk.CTkToplevel(win)
+            dlg.wm_attributes("-alpha", 0)
             apply_window_icon(dlg)
             dlg.title(self.t("terminology.edit") if existing else self.t("terminology.add"))
             dlg.transient(win)
@@ -3001,8 +3068,10 @@ class App:
             theme.make_button(buttons, self.t("settings.save"), command=_save, style="primary", height=28).pack(side=tk.LEFT, padx=(0, 6))
             theme.make_button(buttons, self.t("sidebar.cancel"), command=_close_edit, style="secondary", height=28).pack(side=tk.LEFT)
             dlg.protocol("WM_DELETE_WINDOW", _close_edit)
+            self._bind_modal_keys(dlg, _close_edit, _save, source_box)
             dlg.update_idletasks()
             center_window(dlg, parent=win)
+            dlg.wm_attributes("-alpha", 1)
 
         def _selected_entry() -> TerminologyEntry | None:
             selection = tree.selection()
@@ -3053,6 +3122,9 @@ class App:
                     self.t("terminology.title"), self.t("terminology.export_error", error=exc), parent=win
                 )
 
+        def _close_terms():
+            win.destroy()
+
         actions = ctk.CTkFrame(win, fg_color="transparent")
         actions.grid(row=3, column=0, sticky="ew", padx=theme.PADDING, pady=(0, theme.PADDING))
         theme.make_button(actions, self.t("terminology.add"), command=lambda: _edit_entry(None), style="primary", height=28).pack(side=tk.LEFT, padx=(0, 6))
@@ -3060,10 +3132,18 @@ class App:
         theme.make_button(actions, self.t("terminology.delete"), command=_delete_selected, style="secondary", height=28).pack(side=tk.LEFT, padx=(0, 12))
         theme.make_button(actions, self.t("terminology.import"), command=_import, style="secondary", height=28).pack(side=tk.LEFT, padx=(0, 6))
         theme.make_button(actions, self.t("terminology.export"), command=_export, style="secondary", height=28).pack(side=tk.LEFT)
-        theme.make_button(actions, self.t("terminology.close"), command=win.destroy, style="ghost", height=28).pack(side=tk.RIGHT)
+        theme.make_button(actions, self.t("terminology.close"), command=_close_terms, style="ghost", height=28).pack(side=tk.RIGHT)
         tree.bind("<Double-1>", lambda _event: _edit_entry(_selected_entry()) if _selected_entry() else None)
+        tree.bind("<Return>", lambda _event: (_edit_entry(_selected_entry()) if _selected_entry() else None, "break")[-1])
+        tree.bind("<Delete>", lambda _event: (_delete_selected(), "break")[-1])
+        win.bind("<Control-n>", lambda _event: (_edit_entry(None), "break")[-1], "+")
+        win.bind("<Command-n>", lambda _event: (_edit_entry(None), "break")[-1], "+")
+        win.bind("<Escape>", lambda _event: (_close_terms(), "break")[-1], "+")
+        self._bind_modal_keys(win, _close_terms, initial_focus=tree)
+        win.protocol("WM_DELETE_WINDOW", _close_terms)
         _refresh()
         center_window(win, 900, 560, parent=self.root)
+        win.wm_attributes("-alpha", 1)
 
     def _open_translation_memory_manager(self, path: str | None = None, *, parent=None):
         p = theme.get()
@@ -3083,6 +3163,7 @@ class App:
             return
 
         win = ctk.CTkToplevel(parent_window)
+        win.wm_attributes("-alpha", 0)
         apply_window_icon(win)
         win.title(self.t("tm_manager.title"))
         win.transient(parent_window)
@@ -3104,8 +3185,11 @@ class App:
         card.grid_columnconfigure(0, weight=1)
         card.grid_rowconfigure(0, weight=1)
         columns = ("source", "translation", "languages", "uses")
-        tree = ttk.Treeview(card, columns=columns, show="headings", selectmode="browse")
-        _install_tree_hover(tree, p.bg_heading)
+        tree = ttk.Treeview(
+            card, columns=columns, show="headings", selectmode="extended",
+            takefocus=True, style="FileTable.Treeview",
+        )
+        _style_app_table(tree, p)
         for key, label, width, stretch in (
             ("source", self.t("tm_manager.column.source"), 300, True),
             ("translation", self.t("tm_manager.column.translation"), 300, True),
@@ -3114,7 +3198,10 @@ class App:
         ):
             tree.heading(key, text=label)
             tree.column(key, width=width, stretch=stretch, anchor="center" if not stretch else "w")
-        scroll = ttk.Scrollbar(card, orient=tk.VERTICAL, command=tree.yview)
+        scroll = ttk.Scrollbar(
+            card, orient=tk.VERTICAL, command=tree.yview,
+            style="Slim.Vertical.TScrollbar",
+        )
         tree.configure(yscrollcommand=scroll.set)
         tree.grid(row=0, column=0, sticky="nsew", padx=(12, 0), pady=12)
         scroll.grid(row=0, column=1, sticky="ns", padx=(0, 12), pady=12)
@@ -3131,6 +3218,7 @@ class App:
                         "", tk.END, iid=entry.key,
                         values=(entry.source_text, entry.translation, f"{entry.source_lang} → {entry.target_lang}", entry.use_count),
                     )
+                _restripe_tree(tree)
                 from ..utils.io import format_bytes
                 stats = memory.stats()
                 info.configure(
@@ -3157,7 +3245,7 @@ class App:
             ):
                 return
             try:
-                memory.delete_many([selection[0]])
+                memory.delete_many(list(selection))
                 _refresh()
             except Exception as exc:
                 messagebox.showerror(
@@ -3165,7 +3253,7 @@ class App:
                 )
 
         theme.make_button(top, self.t("tm_manager.refresh"), command=_refresh, style="secondary", height=28).grid(row=0, column=1)
-        search_entry.bind("<Return>", lambda _event: _refresh())
+        search_entry.bind("<Return>", lambda _event: (_refresh(), "break")[-1])
         bottom = ctk.CTkFrame(win, fg_color="transparent")
         bottom.grid(row=3, column=0, sticky="ew", padx=theme.PADDING, pady=(0, theme.PADDING))
         delete_btn = theme.make_button(bottom, self.t("tm_manager.delete"), command=_delete, style="secondary", height=28)
@@ -3184,8 +3272,16 @@ class App:
                 except Exception:
                     pass
         win.protocol("WM_DELETE_WINDOW", _close)
+        self._bind_modal_keys(win, _close, initial_focus=search_entry)
+        win.bind("<Control-f>", lambda _event: (search_entry.focus_set(), "break")[-1], "+")
+        win.bind("<Command-f>", lambda _event: (search_entry.focus_set(), "break")[-1], "+")
+        win.bind("<F5>", lambda _event: (_refresh(), "break")[-1], "+")
+        tree.bind("<Delete>", lambda _event: (_delete(), "break")[-1], "+")
+        tree.bind("<Control-a>", lambda _event: (tree.selection_set(tree.get_children()), "break")[-1], "+")
+        tree.bind("<Command-a>", lambda _event: (tree.selection_set(tree.get_children()), "break")[-1], "+")
         _refresh()
         center_window(win, 920, 560, parent=parent_window)
+        win.wm_attributes("-alpha", 1)
 
     # --- update check ---
 
@@ -3258,6 +3354,7 @@ class App:
                           height=32).pack(side=tk.LEFT)
 
         dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        self._bind_modal_keys(dlg, dlg.destroy)
         dlg.update_idletasks()
         def _show_update():
             center_window(dlg, parent=self.root)
@@ -3931,6 +4028,7 @@ class App:
                           height=28).pack(side=tk.LEFT, padx=(0, theme.scale(8)))
 
         win.protocol("WM_DELETE_WINDOW", win.destroy)
+        self._bind_modal_keys(win, win.destroy, initial_focus=check_btn)
         win.update_idletasks()
         def _show_about():
             center_window(win, parent=self.root)
@@ -3994,7 +4092,7 @@ class App:
     def _install_drag_and_drop(self):
         try:
             return install_file_drop(
-                self.root, self.file_table,
+                self.root, self.root,
                 lambda items: self._add_paths(items),
             )
         except Exception:
@@ -4008,16 +4106,20 @@ class App:
         def ext_to_label(ext: str) -> str:
             return f"{ext.lstrip('.').upper()} Files"
 
-        filetypes = [("All Supported Files", all_patterns)]
+        _translate = getattr(self, "t", None)
+        _all_supported = _translate("file_dialog.all_supported") if callable(_translate) else "All Supported Files"
+        _all_files = _translate("file_dialog.all_files") if callable(_translate) else "All Files"
+        _select_title = _translate("file_dialog.select_files") if callable(_translate) else "Select Files"
+        filetypes = [(_all_supported, all_patterns)]
         seen = set()
         for ext in SUPPORTED_EXTS:
             if ext not in seen:
                 seen.add(ext)
                 filetypes.append((ext_to_label(ext), (f"*{ext}",)))
-        filetypes.append(("All Files", ("*.*",)))
+        filetypes.append((_all_files, ("*.*",)))
 
         paths = filedialog.askopenfilenames(
-            title="Select Files", parent=self.root, initialdir=init, filetypes=filetypes,
+            title=_select_title, parent=self.root, initialdir=init, filetypes=filetypes,
         )
         if paths:
             self._add_paths(paths, announce=False)
@@ -4046,17 +4148,7 @@ class App:
         # removes selected file, or clears all if nothing selected
         selected = self.file_table.selection()
         if selected:
-            iid = selected[0]
-            filepath = self._tree_ids.pop(iid, None)
-            if filepath:
-                self._file_to_iid.pop(filepath, None)
-                self._file_status.pop(filepath, None)
-                self._file_attempts.pop(filepath, None)
-                if filepath in self.files:
-                    self.files.remove(filepath)
-            self.file_table.delete(iid)
-            self._retag_rows()
-            self._sync_retry_button_visibility()
+            self._remove_selected_files()
         else:
             self.files.clear()
             self._tree_ids.clear()
@@ -4078,6 +4170,8 @@ class App:
                 self.log.configure(state="disabled")
             except Exception:
                 pass
+            self._sync_file_empty_state()
+            self._sync_clear_button_label()
 
     def _select_output(self):
         init = self._initialdir_for_output()
@@ -4088,22 +4182,58 @@ class App:
             self.output_entry.delete(0, tk.END)
             self.output_entry.insert(0, _try_make_relative(d))
 
+    def _schedule_language_dropdown_refresh(self) -> None:
+        """Refresh language choices after the current Tk event finishes.
+
+        Dropdown commands run from inside a popup ButtonRelease handler.  Rebuilding
+        other dropdowns synchronously from that handler can leave Windows/Tk focus
+        ownership attached to the popup that is about to be destroyed.  Deferring
+        the refresh by one event-loop turn makes the engine/detector selection fully
+        finish first.
+        """
+
+        pending = getattr(self, "_language_refresh_after_id", None)
+        if pending is not None:
+            try:
+                self.root.after_cancel(pending)
+            except Exception:
+                pass
+
+        def _apply() -> None:
+            self._language_refresh_after_id = None
+            if getattr(self, "_closing", False):
+                return
+            self._refresh_language_dropdowns()
+
+        try:
+            self._language_refresh_after_id = self.root.after_idle(_apply)
+        except Exception:
+            self._language_refresh_after_id = None
+            _apply()
+
     def _on_detector_changed(self, *_) -> None:
-        # Repopulate the source language dropdown to only show languages
-        # the newly selected detector can actually identify.
-        # Called by trace_add (args ignored) OR by CTkOptionMenu command=.
-        self._refresh_language_dropdowns()
+        # Repopulate after the detector dropdown has completely finished its own
+        # selection event; do not rebuild searchable entries from inside it.
+        self._schedule_language_dropdown_refresh()
 
     def _on_engine_changed(self, *_) -> None:
-        # Repopulate language dropdowns when the translation engine changes.
-        self._refresh_language_dropdowns()
         engine_key = self._engine_key_for_display(self.engine_var.get())
         self.cfg["translation_engine"] = engine_key
         save_config(self.cfg)
         self._log(f"Translation engine changed to: {engine_key!r}")
         self._update_usage_label(engine_key)
 
+        # Same rule as the detector: let the engine popup close and focus settle
+        # before source/target searchable dropdowns are repopulated.
+        self._schedule_language_dropdown_refresh()
+
     def _on_source_lang_changed(self, *_) -> None:
+        # update_values() may legitimately change source_lang_var while an engine
+        # refresh is already rebuilding both lists.  Its trace must not start a
+        # second target refresh inside the first one.
+        if getattr(self, "_refreshing_language_dropdowns", False):
+            return
+
         # Only local engine uses source-based target filtering.
         engine_key = self._engine_key_for_display(self.engine_var.get())
         if engine_key != "local":
@@ -4161,6 +4291,16 @@ class App:
             pass
 
     def _refresh_language_dropdowns(self) -> None:
+        """Refresh source/target choices as one non-reentrant UI transaction."""
+        if getattr(self, "_refreshing_language_dropdowns", False):
+            return
+        self._refreshing_language_dropdowns = True
+        try:
+            self._refresh_language_dropdowns_impl()
+        finally:
+            self._refreshing_language_dropdowns = False
+
+    def _refresh_language_dropdowns_impl(self) -> None:
         # Recompute source and target language lists based on current engine + detector
         detector = (self.detector_var.get() or "fasttext").strip().lower()
         engine_key = self._engine_key_for_display(self.engine_var.get())
@@ -4764,6 +4904,7 @@ class App:
         p = theme.get()
         totals = report.get("totals", {}) or {}
         win = ctk.CTkToplevel(self.root)
+        win.wm_attributes("-alpha", 0)
         apply_window_icon(win)
         win.title(self.t("report.title"))
         win.transient(self.root)
@@ -4847,8 +4988,11 @@ class App:
         card.grid(row=1, column=0, sticky="nsew", padx=theme.PADDING, pady=(0, 8))
         card.grid_columnconfigure(0, weight=1)
         card.grid_rowconfigure(0, weight=1)
-        tree = ttk.Treeview(card, columns=("status", "time", "details"), show="tree headings")
-        _install_tree_hover(tree, p.bg_heading)
+        tree = ttk.Treeview(
+            card, columns=("status", "time", "details"), show="tree headings",
+            selectmode="browse", takefocus=True, style="FileTable.Treeview",
+        )
+        _style_app_table(tree, p)
         tree.heading("#0", text=self.t("table.file"))
         tree.heading("status", text=self.t("table.status"))
         tree.heading("time", text=self.t("table.time"))
@@ -4857,10 +5001,20 @@ class App:
         tree.column("status", width=90, stretch=False, anchor="center")
         tree.column("time", width=90, stretch=False, anchor="center")
         tree.column("details", width=330, stretch=True)
-        scroll = ttk.Scrollbar(card, orient=tk.VERTICAL, command=tree.yview)
+        scroll = ttk.Scrollbar(
+            card, orient=tk.VERTICAL, command=tree.yview,
+            style="Slim.Vertical.TScrollbar",
+        )
         tree.configure(yscrollcommand=scroll.set)
         tree.grid(row=0, column=0, sticky="nsew", padx=(12, 0), pady=12)
         scroll.grid(row=0, column=1, sticky="ns", padx=(0, 12), pady=12)
+        tree.tag_configure("finished", foreground=p.status_success)
+        tree.tag_configure("error", foreground=p.status_error)
+        tree.tag_configure("cancelled", foreground=p.status_warning)
+        tree.tag_configure("skipped", foreground=p.status_warning)
+        tree.tag_configure("pending", foreground=p.status_pending)
+        tree.tag_configure("started", foreground=p.status_info)
+        tree.tag_configure("retrying", foreground=p.status_info)
         for item in report.get("files", []) or []:
             metrics = item.get("metrics", {}) or {}
             visual_warnings = (
@@ -4868,24 +5022,50 @@ class App:
                 + int(metrics.get("visual_compression_warnings", 0) or 0)
             )
             attempt = max(1, int(item.get("attempt", 1) or 1))
-            details = (
-                (f"attempt {attempt} · " if attempt > 1 else "")
-                + f"translated {metrics.get('translated_units', 0)}, "
-                f"skipped {metrics.get('skipped_units', 0)}, TM {metrics.get('tm_hits', 0)} hit(s), "
-                f"visual warnings {visual_warnings}"
+            attempt_prefix = self.t("report.row.attempt", attempt=attempt) if attempt > 1 else ""
+            details = self.t(
+                "report.row.details",
+                attempt=attempt_prefix,
+                translated=metrics.get("translated_units", 0),
+                skipped=metrics.get("skipped_units", 0),
+                tm=metrics.get("tm_hits", 0),
+                warnings=visual_warnings,
             )
             if item.get("error"):
                 details = str(item.get("error"))
+            item_status = str(item.get("status", ""))
             tree.insert(
                 "", tk.END, text=Path(str(item.get("path", ""))).name,
                 values=(
-                    str(item.get("status", "")), self._format_elapsed_time(float(item.get("elapsed_seconds", 0) or 0)), details,
+                    self._status_text(str(item.get("status", ""))), self._format_elapsed_time(float(item.get("elapsed_seconds", 0) or 0)), details,
                 ),
+                tags=(item_status,) if item_status else (),
             )
+        _restripe_tree(tree)
+        summary_text = "\n".join(lines + ([self.t("report.terminology_conflicts", terms=", ".join(conflicts))] if conflicts else []))
+
+        def _copy_summary():
+            try:
+                win.clipboard_clear()
+                win.clipboard_append(summary_text)
+                copy_btn.configure(text=self.t("report.copied"))
+                win.after(1200, lambda: copy_btn.configure(text=self.t("report.copy_summary")) if win.winfo_exists() else None)
+            except Exception:
+                pass
+
+        def _close_report():
+            win.destroy()
+
         bottom = ctk.CTkFrame(win, fg_color="transparent")
-        bottom.grid(row=2, column=0, sticky="e", padx=theme.PADDING, pady=(0, theme.PADDING))
-        theme.make_button(bottom, self.t("terminology.close"), command=win.destroy, style="secondary", height=28).pack(side=tk.RIGHT)
+        bottom.grid(row=2, column=0, sticky="ew", padx=theme.PADDING, pady=(0, theme.PADDING))
+        bottom.grid_columnconfigure(0, weight=1)
+        copy_btn = theme.make_button(bottom, self.t("report.copy_summary"), command=_copy_summary, style="ghost", height=28)
+        copy_btn.grid(row=0, column=0, sticky="w")
+        theme.make_button(bottom, self.t("terminology.close"), command=_close_report, style="secondary", height=28).grid(row=0, column=1, sticky="e")
+        win.protocol("WM_DELETE_WINDOW", _close_report)
+        self._bind_modal_keys(win, _close_report, initial_focus=tree)
         center_window(win, 880, 600, parent=self.root)
+        win.wm_attributes("-alpha", 1)
 
     def _finish_run(self, cancelled: bool = False):
         if not self._running:

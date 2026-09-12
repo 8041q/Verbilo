@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "verbilo"
-version = "1.12.1"
+version = "1.13"
 description = "Translate .docx, .pdf, and .xlsx files while preserving formatting."
 authors = ["crt_ (8041q)"]
 packages = [{ include = "verbilo", from = "src" }]
@@ -14,7 +14,7 @@ repository = "https://github.com/8041q/Verbilo"
 homepage = "https://github.com/8041q/Verbilo"
 
 [tool.verbilo]
-build_date = "2026-05-13"
+build_date = "2026-09-12"
 
 [tool.poetry.dependencies]
 python = ">=3.12,<3.13"
