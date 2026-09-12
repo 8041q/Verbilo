@@ -33,6 +33,7 @@ from ..advisors import NullAdvisor
 from ..utils import CancelledError
 from ..semantic import TranslationConstraints, TranslationService, TranslationUnit as SemanticTranslationUnit
 from ..progress import ProgressReporter, ProgressUpdate
+from ..output_validation import OutputValidationMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -1565,6 +1566,7 @@ def _translate_pdf_open_document(
     progress.update("analyzing", 0, max(src.page_count + 1, 1))
 
     errors = 0
+    visual_metrics = OutputValidationMetrics()
 
     # Progress: num_pages (extract) + 1 (classify) + 1 (translate) + num_pages (redact)
     _n_pages = src.page_count
@@ -1706,6 +1708,8 @@ def _translate_pdf_open_document(
         translation_memory=translation_memory,
         translation_cache=translation_cache,
     )
+    visual_metrics.layout_retry_candidates += int(layout_retry_stats.get("candidates", 0) or 0)
+    visual_metrics.layout_retry_accepted += int(layout_retry_stats.get("accepted", 0) or 0)
     if layout_retry_stats["candidates"]:
         logger.info(
             "PDF layout preflight found %d at-risk block(s), retried %d and accepted %d improved fit(s)",
@@ -1791,11 +1795,14 @@ def _translate_pdf_open_document(
                     )
                     placed_rects[bi] = orig_rect
                     if result[0] < 0:
+                        visual_metrics.visual_overflow_warnings += 1
                         logger.debug(
                             "literal insert_htmlbox overflow page %d block %d rect=%s",
                             page_num + 1, bi, orig_rect,
                         )
                     elif result[1] < preferred_scale:
+                        if result[1] < 0.72:
+                            visual_metrics.visual_compression_warnings += 1
                         logger.debug(
                             "literal insert_htmlbox compressed page %d block %d scale=%.3f preferred=%.3f rect=%s",
                             page_num + 1, bi, result[1], preferred_scale, orig_rect,
@@ -1826,11 +1833,14 @@ def _translate_pdf_open_document(
                     )
                     placed_rects[bi] = plan["rect"]
                     if result[0] < 0:
+                        visual_metrics.visual_overflow_warnings += 1
                         logger.debug(
                             "insert_htmlbox overflow page %d block %d rect=%s",
                             page_num + 1, bi, plan["rect"],
                         )
                     elif result[1] < preferred_scale:
+                        if result[1] < 0.72:
+                            visual_metrics.visual_compression_warnings += 1
                         logger.debug(
                             "insert_htmlbox compressed page %d block %d variant=%s scale=%.3f probe=%.3f spare=%.2f preferred=%.3f rect=%s",
                             page_num + 1, bi, plan["variant_name"], result[1],
@@ -1877,6 +1887,8 @@ def _translate_pdf_open_document(
     progress.update("saving", 0, 1)
     src.save(str(output_path), garbage=4, deflate=True, clean=True)
     progress.complete()
+    if metrics_callback is not None:
+        metrics_callback(visual_metrics)
 
     if errors:
         message = (

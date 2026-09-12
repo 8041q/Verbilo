@@ -15,6 +15,7 @@ from .utils import CancelledError
 from .translation_memory import TranslationMemory, default_translation_memory_path
 from .translators.cache import get_cache
 from .progress import ProgressUpdate
+from .output_validation import OutputIntegrityError, validate_output_integrity
 
 __all__ = ["translate_file", "CancelledError"]
 
@@ -165,6 +166,19 @@ def translate_file(
                 return "skipped-ocr"
         if cancel_event is not None and cancel_event.is_set():
             raise CancelledError("Translation cancelled before publishing output")
+
+        # Validate the staged artifact before it becomes visible at the final
+        # path. Structural failures abort publication; visual-risk diagnostics
+        # are emitted separately by layout-aware converters.
+        try:
+            validation_metrics = validate_output_integrity(p, staged_output, suffix)
+        except OutputIntegrityError as exc:
+            if metrics_callback is not None:
+                metrics_callback(exc.metrics)
+            raise
+        if metrics_callback is not None:
+            metrics_callback(validation_metrics)
+
         if overwrite:
             os.replace(staged_output, final_output)
         else:

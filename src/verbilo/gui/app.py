@@ -967,6 +967,9 @@ class App:
         self.root = root
         self.worker = Worker()
         self.files: list[str] = []
+        self._file_status: dict[str, str] = {}
+        self._file_attempts: dict[str, int] = {}
+        self._active_run_files: tuple[str, ...] = ()
         self.cfg = load_config() or {}
         self.ui = load_ui_localizer(self.cfg.get("ui_locale"))
         self.t = self.ui.t
@@ -1045,6 +1048,8 @@ class App:
             "finished": "table.status.finished",
             "error": "table.status.error",
             "cancelled": "table.status.cancelled",
+            "skipped": "table.status.skipped",
+            "retrying": "table.status.retrying",
             "translating": "table.status.translating",
         }.get(status)
         if status_key is None:
@@ -1395,6 +1400,7 @@ class App:
         progress_card.grid(row=2, column=0, sticky="ew", pady=(0, PAD))
         progress_card.grid_columnconfigure(0, weight=1)
         progress_card.grid_columnconfigure(1, weight=0)
+        progress_card.grid_columnconfigure(2, weight=0)
 
         self.progress_label = theme.make_label(
             progress_card, self.t("content.ready"), level="small",
@@ -1406,10 +1412,17 @@ class App:
             progress_card, self.t("report.view"), command=self._open_translation_report,
             style="ghost", height=24, state="disabled",
         )
-        self.report_btn.grid(row=0, column=1, sticky="e", padx=(4, PAD), pady=(6, 2))
+        self.report_btn.grid(row=0, column=1, sticky="e", padx=(4, 4), pady=(6, 2))
         # A report is a post-run artifact. Keep the button completely out of the
         # layout until a completed run has produced one.
         self.report_btn.grid_remove()
+
+        self.retry_failed_btn = theme.make_button(
+            progress_card, self.t("queue.retry_failed"), command=self._retry_failed,
+            style="ghost", height=24, state="disabled",
+        )
+        self.retry_failed_btn.grid(row=0, column=2, sticky="e", padx=(4, PAD), pady=(6, 2))
+        self.retry_failed_btn.grid_remove()
 
         self.progress = ctk.CTkProgressBar(
             progress_card,
@@ -1418,7 +1431,7 @@ class App:
             corner_radius=4,
             height=8,
         )
-        self.progress.grid(row=1, column=0, columnspan=2, sticky="ew", padx=PAD, pady=(0, 10))
+        self.progress.grid(row=1, column=0, columnspan=3, sticky="ew", padx=PAD, pady=(0, 10))
         self._set_progress(0.0)
 
         # Log card
@@ -1633,6 +1646,8 @@ class App:
         self.file_table.tag_configure("finished",  foreground=p.status_success)
         self.file_table.tag_configure("error",     foreground=p.status_error)
         self.file_table.tag_configure("cancelled", foreground=p.status_warning)
+        self.file_table.tag_configure("skipped", foreground=p.status_warning)
+        self.file_table.tag_configure("retrying", foreground=p.status_info)
         self.file_table.tag_configure("even", background=p.bg_row_even)
         self.file_table.tag_configure("odd",  background=p.bg_row_odd)
 
@@ -1658,6 +1673,8 @@ class App:
 
     def _add_file_to_table(self, filepath: str, status: str = "pending"):
         self.files.append(filepath)
+        self._file_status[filepath] = status
+        self._file_attempts.setdefault(filepath, 0)
         name = os.path.basename(filepath)
         idx = len(self.files) - 1
         row_tag = "even" if idx % 2 == 0 else "odd"
@@ -1672,6 +1689,7 @@ class App:
         self._file_to_iid[filepath] = iid
 
     def _update_file_status(self, filepath: str, status: str, elapsed: float | None = None):
+        self._file_status[filepath] = status
         iid = self._file_to_iid.get(filepath)
         if iid is None:
             return
@@ -1683,6 +1701,7 @@ class App:
 
     def _update_all_statuses(self, status: str):
         for filepath, iid in self._file_to_iid.items():
+            self._file_status[filepath] = status
             name = os.path.basename(filepath)
             idx = list(self._file_to_iid.keys()).index(filepath)
             row_tag = "even" if idx % 2 == 0 else "odd"
@@ -4031,14 +4050,20 @@ class App:
             filepath = self._tree_ids.pop(iid, None)
             if filepath:
                 self._file_to_iid.pop(filepath, None)
+                self._file_status.pop(filepath, None)
+                self._file_attempts.pop(filepath, None)
                 if filepath in self.files:
                     self.files.remove(filepath)
             self.file_table.delete(iid)
             self._retag_rows()
+            self._sync_retry_button_visibility()
         else:
             self.files.clear()
             self._tree_ids.clear()
             self._file_to_iid.clear()
+            self._file_status.clear()
+            self._file_attempts.clear()
+            self._active_run_files = ()
             self._file_start_times.clear()
             for iid in self.file_table.get_children():
                 self.file_table.delete(iid)
@@ -4046,6 +4071,7 @@ class App:
             self.total_files = 0
             self._set_progress(0.0)
             self._update_progress_label(self.t("content.ready"))
+            self._sync_retry_button_visibility()
             try:
                 self.log.configure(state="normal")
                 self.log.delete("1.0", "end")
@@ -4237,8 +4263,37 @@ class App:
 
     # --- start / cancel ---
 
-    def _start(self):
+    def _start(self, run_files: list[str] | tuple[str, ...] | None = None):
         if self._running:
+            return
+
+        if not self.files:
+            messagebox.showwarning(
+                self.t("message.no_files_title"),
+                self.t("message.no_files_selected_body"),
+                parent=self.root,
+            )
+            return
+
+        if run_files is None:
+            files_to_run = self._pending_files()
+        else:
+            requested = set(run_files)
+            files_to_run = [path for path in self.files if path in requested]
+
+        if not files_to_run:
+            if any(self._file_status.get(path) in {"error", "cancelled"} for path in self.files):
+                messagebox.showinfo(
+                    self.t("queue.nothing_pending_title"),
+                    self.t("queue.nothing_pending_retry"),
+                    parent=self.root,
+                )
+            else:
+                messagebox.showinfo(
+                    self.t("queue.nothing_pending_title"),
+                    self.t("queue.nothing_pending_body"),
+                    parent=self.root,
+                )
             return
 
         # Resolve target language
@@ -4249,9 +4304,6 @@ class App:
             lang = self._lang_map.get(typed)
         if not lang:
             messagebox.showwarning(self.t("message.missing_language_title"), self.t("message.missing_language_body"))
-            return
-        if not self.files:
-            messagebox.showwarning(self.t("message.no_files_title"), self.t("message.no_files_selected_body"))
             return
 
         # Resolve source language
@@ -4451,8 +4503,11 @@ class App:
         for button in (self.add_files_btn, self.select_folder_btn, self.clear_files_btn):
             self._set_button_disabled(button, True)
 
-        self._update_all_statuses("pending")
-        self.total_files = len(self.files)
+        self._active_run_files = tuple(files_to_run)
+        for path in self._active_run_files:
+            self._file_attempts[path] = int(self._file_attempts.get(path, 0)) + 1
+            self._update_file_status(path, "pending")
+        self.total_files = len(self._active_run_files)
         self.completed_files = 0
         self._file_start_times.clear()
         self._set_progress(0.0)
@@ -4463,11 +4518,13 @@ class App:
         try:
             self._set_button_disabled(self.report_btn, True)
             self.report_btn.grid_remove()
+            self._set_button_disabled(self.retry_failed_btn, True)
+            self.retry_failed_btn.grid_remove()
         except Exception:
             pass
 
         self.worker.start(
-            self.files, lang, output, None,
+            self._active_run_files, lang, output, None,
             self._progress_cb, self._log,
             source_lang=source_lang,
             detector=detector,
@@ -4490,7 +4547,29 @@ class App:
             report_cb=lambda report: self._log_queue.put(("__report__", report)),
             terminology_conflicts=terminology_snapshot.conflicts,
             terminology_entries=terminology_snapshot.matched_entries,
+            attempt_numbers={path: self._file_attempts.get(path, 1) for path in self._active_run_files},
         )
+
+    def _pending_files(self) -> list[str]:
+        return [
+            path for path in self.files
+            if self._file_status.get(path, "pending") == "pending"
+        ]
+
+    def _retryable_files(self) -> list[str]:
+        return [
+            path for path in self.files
+            if self._file_status.get(path) in {"error", "cancelled"}
+        ]
+
+    def _retry_failed(self):
+        if self._running:
+            return
+        retryable = self._retryable_files()
+        if not retryable:
+            self._sync_retry_button_visibility()
+            return
+        self._start(retryable)
 
     def _cancel(self):
         if not self._running:
@@ -4506,7 +4585,8 @@ class App:
             import time as _time
             if status == "started":
                 self._file_start_times[filepath] = _time.perf_counter()
-                self._update_file_status(filepath, "started")
+                display_status = "retrying" if self._file_attempts.get(filepath, 1) > 1 else "started"
+                self._update_file_status(filepath, display_status)
                 self._current_file_name = Path(filepath).name
                 self._update_progress_label(
                     self.t("progress.translating_file", name=self._current_file_name)
@@ -4548,7 +4628,7 @@ class App:
                     self._finish_run()
             elif status == "cancelled":
                 self._update_file_status(filepath, "cancelled")
-                for f in self.files:
+                for f in self._active_run_files:
                     iid = self._file_to_iid.get(f)
                     if iid:
                         vals = self.file_table.item(iid, "values")
@@ -4584,7 +4664,7 @@ class App:
                 self._handle_run_report(msg[1])
             elif msg == "__worker_done__":
                 if self._running:
-                    self._finish_run()
+                    self._finish_run(cancelled=self.worker.last_run_cancelled)
             else:
                 self.log.configure(state="normal")
                 self.log.insert("end", str(msg) + "\n")
@@ -4601,6 +4681,23 @@ class App:
         if self._last_run_report is None:
             return
         totals = self._last_run_report.get("totals", {}) or {}
+        # The report is authoritative for terminal job states. This covers
+        # cancellation before a per-file callback reached Tk and other races
+        # between worker callbacks and the report queue.
+        terminal_statuses = {"finished", "error", "cancelled", "skipped"}
+        for item in self._last_run_report.get("files", []) or []:
+            path = str(item.get("path", ""))
+            status = str(item.get("status", ""))
+            if path in self._file_to_iid and status in terminal_statuses:
+                self._update_file_status(
+                    path, status, float(item.get("elapsed_seconds", 0) or 0),
+                )
+                try:
+                    self._file_attempts[path] = max(
+                        self._file_attempts.get(path, 0), int(item.get("attempt", 1) or 1),
+                    )
+                except Exception:
+                    pass
         warning_count = int(self._last_run_report.get("warning_count", 0) or 0)
         if warning_count:
             self._update_progress_label(
@@ -4622,6 +4719,22 @@ class App:
             pass
 
         self._sync_report_button_visibility()
+        self._sync_retry_button_visibility()
+
+    def _sync_retry_button_visibility(self) -> None:
+        button = getattr(self, "retry_failed_btn", None)
+        if button is None:
+            return
+        available = (not getattr(self, "_running", False)) and bool(self._retryable_files())
+        try:
+            if available:
+                self._set_button_disabled(button, False)
+                button.grid()
+            else:
+                self._set_button_disabled(button, True)
+                button.grid_remove()
+        except Exception:
+            pass
 
     def _sync_report_button_visibility(self) -> None:
         """Show the report affordance only after a non-cancelled run is over."""
@@ -4706,6 +4819,18 @@ class App:
                 fallbacks=totals.get("fallback_items", 0), retries=totals.get("retry_items", 0),
                 warnings=totals.get("constraint_warnings", 0), failed=totals.get("failed_items", 0),
             ),
+            self.t(
+                "report.summary.visual",
+                checks=totals.get("output_validation_checks", 0),
+                failures=totals.get("output_validation_failures", 0),
+                retry_candidates=totals.get("layout_retry_candidates", 0),
+                retry_accepted=totals.get("layout_retry_accepted", 0),
+                autofit=totals.get("pptx_autofit_adjustments", 0),
+                visual_warnings=(
+                    totals.get("visual_overflow_warnings", 0)
+                    + totals.get("visual_compression_warnings", 0)
+                ),
+            ),
         ]
         for row, text in enumerate(lines, start=1):
             theme.make_label(summary, text, level="small").grid(row=row, column=0, sticky="w", padx=12, pady=(0, 3))
@@ -4738,9 +4863,16 @@ class App:
         scroll.grid(row=0, column=1, sticky="ns", padx=(0, 12), pady=12)
         for item in report.get("files", []) or []:
             metrics = item.get("metrics", {}) or {}
+            visual_warnings = (
+                int(metrics.get("visual_overflow_warnings", 0) or 0)
+                + int(metrics.get("visual_compression_warnings", 0) or 0)
+            )
+            attempt = max(1, int(item.get("attempt", 1) or 1))
             details = (
-                f"translated {metrics.get('translated_units', 0)}, "
-                f"skipped {metrics.get('skipped_units', 0)}, TM {metrics.get('tm_hits', 0)} hit(s)"
+                (f"attempt {attempt} · " if attempt > 1 else "")
+                + f"translated {metrics.get('translated_units', 0)}, "
+                f"skipped {metrics.get('skipped_units', 0)}, TM {metrics.get('tm_hits', 0)} hit(s), "
+                f"visual warnings {visual_warnings}"
             )
             if item.get("error"):
                 details = str(item.get("error"))
@@ -4775,6 +4907,8 @@ class App:
                 self.t("progress.cancelled", percent=int(pct * 100)),
             )
         self._sync_report_button_visibility()
+        self._sync_retry_button_visibility()
+        self._active_run_files = ()
 
     def _apply_debug_mode(self):
         # Apply the current debug mode immediately so logging reflects changes

@@ -14,6 +14,7 @@ from lxml import etree
 
 from ..semantic import TranslationConstraints, TranslationContext, TranslationService, TranslationUnit
 from ..progress import ProgressReporter, ProgressUpdate
+from ..output_validation import OutputValidationMetrics
 from ..utils import CancelledError
 
 logger = logging.getLogger(__name__)
@@ -301,6 +302,16 @@ def _supports_layout_guidance(translator: Any) -> bool:
     )
 
 
+def _uses_shape_autofit(container: etree._Element) -> bool:
+    txbody = (
+        container.find(_A_TXBODY)
+        if container.tag == _P_SP
+        else container.find(_A_DRAWING_TXBODY)
+    )
+    bodypr = txbody.find(_A_BODYPR) if txbody is not None else None
+    return bodypr is not None and bodypr.find(_A_SPAUTOFIT) is not None
+
+
 def _apply_normal_autofit(container: etree._Element, scale: float) -> bool:
     txbody = (
         container.find(_A_TXBODY)
@@ -558,6 +569,7 @@ def translate_pptx(
     )
 
     translated_texts = list(result.texts)
+    visual_metrics = OutputValidationMetrics()
     retry_indices: list[int] = []
     retry_units: list[TranslationUnit] = []
 
@@ -584,6 +596,8 @@ def translate_pptx(
             )
         )
 
+    visual_metrics.layout_retry_candidates = len(retry_units)
+    accepted_retries = 0
     if retry_units and _supports_layout_guidance(translator):
         layout_total = len(retry_units) + len(units)
         progress.update("layout", 0, layout_total, detail=f"{len(retry_units)} compact retry unit(s)")
@@ -596,7 +610,6 @@ def translate_pptx(
             cancel_event=cancel_event,
             progress_callback=lambda done, total: progress.update("layout", done, layout_total),
         )
-        accepted_retries = 0
         for source_idx, candidate in zip(retry_indices, retry_result.texts):
             if candidate is None:
                 continue
@@ -609,6 +622,7 @@ def translate_pptx(
             if _constraint_load(str(candidate), constraints) + 0.02 < _constraint_load(str(current), constraints):
                 translated_texts[source_idx] = candidate
                 accepted_retries += 1
+        visual_metrics.layout_retry_accepted = accepted_retries
         logger.info(
             "PPTX layout retry examined %d unit(s) and accepted %d shorter fit(s)",
             len(retry_units),
@@ -648,12 +662,20 @@ def translate_pptx(
         load = max(float(state["char_load"]), float(state["line_load"]))
         if load <= 1.0:
             continue
+        # If even the minimum allowed font scale cannot compensate for the
+        # estimated load, keep the output but surface it as a visual-risk warning.
+        if (
+            load * (_AUTOFIT_MIN_SCALE ** 2) > 1.0
+            and not _uses_shape_autofit(state["container"])
+        ):
+            visual_metrics.visual_overflow_warnings += 1
         scale = max(_AUTOFIT_MIN_SCALE, min(1.0, 1.0 / math.sqrt(load)))
         if scale >= _AUTOFIT_TRIGGER_SCALE:
             continue
         container = state["container"]
         if _apply_normal_autofit(container, scale):
             autofit_applied += 1
+    visual_metrics.pptx_autofit_adjustments = autofit_applied
     if autofit_applied:
         logger.info("PPTX applied bounded autofit to %d slide shape(s)", autofit_applied)
 
@@ -692,6 +714,8 @@ def translate_pptx(
     progress.update("saving", 0, 1)
     _rebuild_package(input_path, output_path, patches)
     progress.complete()
+    if metrics_callback is not None:
+        metrics_callback(visual_metrics)
 
     if errors:
         message = f"Translation completed with {errors} failed PPTX text units; originals were preserved"

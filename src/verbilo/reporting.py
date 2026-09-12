@@ -13,6 +13,10 @@ _METRIC_FIELDS = (
     "nonlinguistic_skips", "target_language_skips", "non_source_skips", "explicit_skips",
     "detected_units", "tm_hits", "tm_misses", "tm_writes", "tm_rejected", "tm_errors",
     "consistency_families", "consistency_reuses",
+    "output_validation_checks", "output_validation_failures",
+    "layout_retry_candidates", "layout_retry_accepted",
+    "pptx_autofit_adjustments", "visual_overflow_warnings",
+    "visual_compression_warnings",
 )
 
 
@@ -24,6 +28,7 @@ class TranslationFileReport:
     output_path: str | None = None
     metrics: dict[str, int] = field(default_factory=dict)
     error: str | None = None
+    attempt: int = 1
 
     def add_metrics(self, metrics: Any) -> None:
         for name in _METRIC_FIELDS:
@@ -49,6 +54,7 @@ class TranslationBatchReport:
         result["files_failed"] = sum(1 for f in self.files if f.status == "error")
         result["files_cancelled"] = sum(1 for f in self.files if f.status == "cancelled")
         result["files_skipped"] = sum(1 for f in self.files if f.status == "skipped")
+        result["files_pending"] = sum(1 for f in self.files if f.status == "pending")
         return result
 
     @property
@@ -59,6 +65,8 @@ class TranslationBatchReport:
             + t.get("terminology_mismatches", 0)
             + t.get("source_echo_rejections", 0)
             + t.get("constraint_warnings", 0)
+            + t.get("visual_overflow_warnings", 0)
+            + t.get("visual_compression_warnings", 0)
             + t.get("persistent_cache_rejected", 0)
             + t.get("persistent_cache_errors", 0)
             + t.get("tm_rejected", 0)

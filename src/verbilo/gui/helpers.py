@@ -135,6 +135,7 @@ class Worker:
     def __init__(self):
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._last_run_cancelled = False
 
     @property
     def cancelled(self) -> bool:
@@ -143,6 +144,10 @@ class Worker:
     @property
     def alive(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def last_run_cancelled(self) -> bool:
+        return bool(self._last_run_cancelled)
 
     def start(
         self,
@@ -173,12 +178,14 @@ class Worker:
         report_cb: Callable[[dict[str, Any]], None] | None = None,
         terminology_conflicts: Iterable[str] = (),
         terminology_entries: int = 0,
+        attempt_numbers: Mapping[str, int] | None = None,
     ):
         if self._thread and self._thread.is_alive():
             raise RuntimeError("Worker already running")
         if not target_lang or not isinstance(target_lang, str) or not target_lang.strip():
             raise ValueError("target_lang must be a non-empty language code (e.g. 'en')")
         self._stop.clear()
+        self._last_run_cancelled = False
         self._thread = threading.Thread(
             target=self._run,
             args=(
@@ -190,6 +197,7 @@ class Worker:
                 local_model_dir, ollama_config, dict(terminology or {}),
                 bool(translation_memory_enabled), translation_memory_path, report_cb,
                 tuple(str(item) for item in terminology_conflicts), int(terminology_entries or 0),
+                dict(attempt_numbers or {}),
             ),
             daemon=True,
         )
@@ -204,7 +212,7 @@ class Worker:
              baidu_tier="standard", google_project_id="", google_sa_json="",
              local_model_dir="", ollama_config=None, terminology=None,
              translation_memory_enabled=False, translation_memory_path=None, report_cb=None,
-             terminology_conflicts=(), terminology_entries=0):
+             terminology_conflicts=(), terminology_entries=0, attempt_numbers=None):
         import os
 
         normalized_ollama_config = _normalize_ollama_config(ollama_config)
@@ -213,8 +221,20 @@ class Worker:
             terminology_conflicts=tuple(terminology_conflicts or ()),
             terminology_entries=int(terminology_entries or 0),
         )
+        attempt_numbers = dict(attempt_numbers or {})
+        reports_by_path: dict[str, TranslationFileReport] = {}
+        for path in files:
+            report = TranslationFileReport(
+                path=str(path),
+                status="pending",
+                attempt=max(1, int(attempt_numbers.get(str(path), 1) or 1)),
+            )
+            batch_report.files.append(report)
+            reports_by_path[str(path)] = report
+
         pdf_advisor = None
         ollama_translator = None
+        batch_cancelled = False
 
         def _get_ollama_translator():
             nonlocal ollama_translator
@@ -274,12 +294,13 @@ class Worker:
 
         for fi, f in enumerate(files):
             if self._stop.is_set():
+                batch_cancelled = True
                 log_cb("Cancelled by user")
                 break
             name = Path(f).name
             t0 = time.perf_counter()
-            file_report = TranslationFileReport(path=str(f), status="started")
-            batch_report.files.append(file_report)
+            file_report = reports_by_path[str(f)]
+            file_report.status = "started"
 
             def _capture_metrics(metrics, _report=file_report):
                 _report.add_metrics(metrics)
@@ -354,6 +375,7 @@ class Worker:
 
                 # Check cancellation right after translate_file returns
                 if self._stop.is_set():
+                    batch_cancelled = True
                     file_report.status = "cancelled"
                     progress_cb(f, "cancelled", None)
                     log_cb(f"Cancelled during {name}")
@@ -375,6 +397,7 @@ class Worker:
                     except Exception:
                         log_cb(f"Finished {name}")
             except CancelledError:
+                batch_cancelled = True
                 file_report.status = "cancelled"
                 file_report.elapsed_seconds = time.perf_counter() - t0
                 progress_cb(f, "cancelled", None)
@@ -388,6 +411,13 @@ class Worker:
                 progress_cb(f, "error", elapsed)
                 tb = traceback.format_exc()
                 log_cb(redact_sensitive_text(f"Error translating {name}: {e}\n{tb}"))
+
+        if batch_cancelled or self._stop.is_set():
+            for pending_report in batch_report.files:
+                if pending_report.status == "pending":
+                    pending_report.status = "cancelled"
+
+        self._last_run_cancelled = bool(batch_cancelled or self._stop.is_set())
 
         if report_cb is not None:
             try:
